@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+
+# Local build outputs
+/bin/
+/dist/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local state during dev
+*.db
+*.log
