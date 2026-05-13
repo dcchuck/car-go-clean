@@ -9,14 +9,14 @@ pub struct Lock {
 
 impl Lock {
     pub fn release(self) -> Result<()> {
-        self.file.unlock()?;
+        FileExt::unlock(&self.file)?;
         Ok(())
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -27,6 +27,7 @@ pub fn try_acquire(path: impl AsRef<Path>) -> Result<Lock> {
     }
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)

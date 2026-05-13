@@ -49,21 +49,27 @@ excludes = ["foo"]
     assert_eq!(cfg.scan_interval, Duration::from_secs(2 * 60 * 60));
     assert_eq!(cfg.log_level, "debug");
     assert_eq!(cfg.excludes, vec!["foo"]);
-    assert!(cfg.project_dirs[0].starts_with(&std::env::var("HOME").unwrap()));
+    assert!(cfg.project_dirs[0].starts_with(std::env::var("HOME").unwrap()));
 }
 
 #[test]
 fn validate_rejects_bad_intervals_and_log_levels() {
-    let mut cfg = Config::default();
-    cfg.clean_interval = Duration::ZERO;
+    let cfg = Config {
+        clean_interval: Duration::ZERO,
+        ..Default::default()
+    };
     assert!(cfg.validate().is_err());
 
-    let mut cfg = Config::default();
-    cfg.scan_interval = Duration::ZERO;
+    let cfg = Config {
+        scan_interval: Duration::ZERO,
+        ..Default::default()
+    };
     assert!(cfg.validate().is_err());
 
-    let mut cfg = Config::default();
-    cfg.log_level = "verbose".to_string();
+    let cfg = Config {
+        log_level: "verbose".to_string(),
+        ..Default::default()
+    };
     assert!(cfg.validate().is_err());
 
     assert!(Config::default().validate().is_ok());
