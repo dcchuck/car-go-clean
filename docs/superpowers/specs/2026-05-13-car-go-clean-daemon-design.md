@@ -207,7 +207,10 @@ select {
 - `slog` (stdlib) writing to both stderr (captured by launchd/systemd) and
   to a rotating file at `~/.local/state/car-go-clean/car-go-clean.log` via
   `lumberjack`.
-- Error-level entries are mirrored into the `errors` table by the daemon.
+- `logging` itself never writes to SQLite. The daemon is the only writer
+  to the `errors` table; it inserts a row at the points it catches an
+  error (`runScan`, `runCleanCycle`, config reload). This keeps error
+  ownership in one place and avoids double-writes.
 
 ### `cmd/car-go-clean` — CLI dispatch
 
@@ -317,10 +320,12 @@ manually if they prefer.
   pattern of a `Cargo.toml` that is *not* a real workspace root but sits
   above other `Cargo.toml` files. We accept this trade-off: cleaning
   there is a no-op in the worst case.
-- **Concurrent writers.** Only the daemon writes. CLIs that mutate (`scan`,
-  `run`) refuse to proceed if a daemon-held lock is detected (a single
-  advisory lock file in the state dir). This keeps the design simple
-  without forbidding ad-hoc CLI use when no daemon is running.
+- **Concurrent writers.** Only one process at a time mutates state. The
+  daemon and the mutating CLI commands (`scan`, `run`) acquire an
+  advisory `flock` on `~/.local/state/car-go-clean/daemon.lock` for the
+  duration of their cycle. CLI mutators that can't acquire the lock exit
+  with a clear "daemon is running" message. Read-only commands (`status`,
+  `stats`, `health`, `logs`, `config`, `version`) do not take the lock.
 
 ## Success Criteria
 
