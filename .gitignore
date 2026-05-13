@@ -1,0 +1,14 @@
+# Build artifacts
+/dist/
+/bin/
+*.test
+*.out
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local state during dev
+*.db
+*.log
