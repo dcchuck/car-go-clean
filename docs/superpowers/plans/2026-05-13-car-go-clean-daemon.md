@@ -3577,13 +3577,16 @@ git commit -m "feat(cli): add config and status subcommands"
 
 - [ ] **Step 1: Implement a shared builder for daemon deps**
 
-Append to `cmd/car-go-clean/root.go`:
+In `cmd/car-go-clean/root.go`, **replace the existing single `import "github.com/spf13/cobra"` line with the merged import block below**, then append the two builder functions at the bottom of the file:
+
 ```go
 import (
     "context"
     "fmt"
     "log/slog"
     "path/filepath"
+
+    "github.com/spf13/cobra"
 
     "github.com/dcchuck/car-go-clean/internal/cache"
     "github.com/dcchuck/car-go-clean/internal/cleaner"
