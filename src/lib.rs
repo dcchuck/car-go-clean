@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod cache;
 pub mod cleaner;
 pub mod cli;
@@ -5,5 +6,6 @@ pub mod config;
 pub mod daemon;
 pub mod lockfile;
 pub mod logging;
+pub mod safety;
 pub mod scanner;
 pub mod store;

@@ -1,0 +1,267 @@
+use crate::activity::{path_is_within, ActivitySignal};
+
+use anyhow::Result;
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectClass {
+    Workspace,
+    ManagedCache,
+    ContainerStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanDecision {
+    Cleanable,
+    Skipped(SkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    NoTarget,
+    ActiveRecentWrite { newest_age_secs: u64 },
+    ActiveProcess,
+    ManagedCache,
+    ContainerStorage,
+    ScanError,
+    TargetReadError,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SafetyOptions {
+    pub target_quiet_period: Duration,
+    pub include_managed_cache: bool,
+    pub include_active: bool,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectReview {
+    pub path: PathBuf,
+    pub class: ProjectClass,
+    pub target_path: PathBuf,
+    pub target_bytes: u64,
+    pub decision: CleanDecision,
+}
+
+pub fn classify_project(path: &Path) -> ProjectClass {
+    let path = path.to_string_lossy();
+
+    if path.contains(".bun/install/cache")
+        || path.contains("go/pkg/mod")
+        || path.contains(".cargo/registry/src")
+        || path.contains(".cargo/git/checkouts")
+    {
+        ProjectClass::ManagedCache
+    } else if path.contains("OrbStack/docker") {
+        ProjectClass::ContainerStorage
+    } else {
+        ProjectClass::Workspace
+    }
+}
+
+pub fn review_project(
+    project: &Path,
+    scan_error_paths: &[PathBuf],
+    activity: &[ActivitySignal],
+    now: SystemTime,
+    opts: &SafetyOptions,
+) -> Result<ProjectReview> {
+    let class = classify_project(project);
+    let target_path = project.join("target");
+
+    if !target_path.is_dir() {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            0,
+            CleanDecision::Skipped(SkipReason::NoTarget),
+        ));
+    }
+
+    let target_bytes = match directory_size(&target_path) {
+        Ok(bytes) => bytes,
+        Err(_) if opts.force => 0,
+        Err(_) => {
+            return Ok(review(
+                project,
+                class,
+                target_path,
+                0,
+                CleanDecision::Skipped(SkipReason::TargetReadError),
+            ));
+        }
+    };
+
+    if !opts.force && !opts.include_managed_cache {
+        match class {
+            ProjectClass::ManagedCache => {
+                return Ok(review(
+                    project,
+                    class,
+                    target_path,
+                    target_bytes,
+                    CleanDecision::Skipped(SkipReason::ManagedCache),
+                ));
+            }
+            ProjectClass::ContainerStorage => {
+                return Ok(review(
+                    project,
+                    class,
+                    target_path,
+                    target_bytes,
+                    CleanDecision::Skipped(SkipReason::ContainerStorage),
+                ));
+            }
+            ProjectClass::Workspace => {}
+        }
+    }
+
+    if !opts.force && has_related_scan_error(project, &target_path, scan_error_paths) {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            target_bytes,
+            CleanDecision::Skipped(SkipReason::ScanError),
+        ));
+    }
+
+    if !opts.force && !opts.include_active && has_project_activity(project, activity) {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            target_bytes,
+            CleanDecision::Skipped(SkipReason::ActiveProcess),
+        ));
+    }
+
+    if !opts.force {
+        let newest_mtime = match newest_file_mtime(&target_path) {
+            Ok(mtime) => mtime,
+            Err(_) => {
+                return Ok(review(
+                    project,
+                    class,
+                    target_path,
+                    target_bytes,
+                    CleanDecision::Skipped(SkipReason::TargetReadError),
+                ));
+            }
+        };
+
+        if let Some(mtime) = newest_mtime {
+            let newest_age = now.duration_since(mtime).unwrap_or_default();
+            if newest_age < opts.target_quiet_period {
+                return Ok(review(
+                    project,
+                    class,
+                    target_path,
+                    target_bytes,
+                    CleanDecision::Skipped(SkipReason::ActiveRecentWrite {
+                        newest_age_secs: newest_age.as_secs(),
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok(review(
+        project,
+        class,
+        target_path,
+        target_bytes,
+        CleanDecision::Cleanable,
+    ))
+}
+
+fn review(
+    project: &Path,
+    class: ProjectClass,
+    target_path: PathBuf,
+    target_bytes: u64,
+    decision: CleanDecision,
+) -> ProjectReview {
+    ProjectReview {
+        path: project.to_path_buf(),
+        class,
+        target_path,
+        target_bytes,
+        decision,
+    }
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0;
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        if metadata.is_dir() {
+            total += directory_size(&entry.path())?;
+        } else if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+
+    Ok(total)
+}
+
+fn newest_file_mtime(path: &Path) -> Result<Option<SystemTime>> {
+    let mut newest = None;
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        if metadata.is_dir() {
+            newest = newest_time(newest, newest_file_mtime(&entry.path())?);
+        } else if metadata.is_file() {
+            newest = newest_time(newest, Some(metadata.modified()?));
+        }
+    }
+
+    Ok(newest)
+}
+
+fn newest_time(left: Option<SystemTime>, right: Option<SystemTime>) -> Option<SystemTime> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn has_related_scan_error(
+    project: &Path,
+    target_path: &Path,
+    scan_error_paths: &[PathBuf],
+) -> bool {
+    scan_error_paths.iter().any(|scan_error_path| {
+        path_is_within(scan_error_path, project) || path_is_within(scan_error_path, target_path)
+    })
+}
+
+fn has_project_activity(project: &Path, activity: &[ActivitySignal]) -> bool {
+    activity
+        .iter()
+        .any(|signal| path_is_within(&signal.project_path, project))
+}
