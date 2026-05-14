@@ -140,11 +140,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .iter()
             .map(|project| PathBuf::from(&project.path))
             .collect();
-        let scan_errors = self.store.scan_error_paths_since(SystemTime::UNIX_EPOCH)?;
+        let scan_error_since = started
+            .checked_sub(self.opts.scan_interval)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
         let mut projects_cleaned = 0;
+        let mut cleaner_skipped = 0;
         let mut bytes_recovered = 0;
         let mut errors_count = 0;
 
@@ -158,7 +162,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
 
             match self.cleaner.clean(&project.path) {
-                Ok(result) if result.skipped => {}
+                Ok(result) if result.skipped => {
+                    cleaner_skipped += 1;
+                }
                 Ok(result) => {
                     projects_cleaned += 1;
                     bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
@@ -189,7 +195,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
         }
 
-        let skipped = review_summary(&reviews).skipped_projects as i64;
+        let skipped = review_summary(&reviews).skipped_projects as i64 + cleaner_skipped;
         self.store.finish_run(
             run_id,
             SystemTime::now(),

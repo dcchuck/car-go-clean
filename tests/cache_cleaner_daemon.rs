@@ -10,7 +10,7 @@ use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::daemon::{Daemon, DaemonOptions, ShutdownFlag};
 use car_go_clean::safety::SafetyOptions;
 use car_go_clean::scanner::{Scanner, ScannerOptions};
-use car_go_clean::store::Store;
+use car_go_clean::store::{ErrorRecord, Store};
 
 fn write_file(path: &Path, body: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -173,6 +173,111 @@ fn daemon_run_cycle_skips_recent_targets_by_default() {
     assert_eq!(result.cleaned, 0);
     assert_eq!(result.skipped, 1);
     assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_run_cycle_skips_symlinked_target_even_with_force_compatibility() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    let real_target = root.path().join("real-target");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&real_target.join("blob.bin"), &[0; 2048]);
+    symlink(&real_target, project.join("target")).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&project, std::time::SystemTime::now())
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        cleaner,
+        DaemonOptions::default(),
+    );
+
+    daemon.run_cycle().unwrap();
+
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&project, std::time::SystemTime::now())
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: std::time::SystemTime::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap(),
+            category: "scan".to_string(),
+            path: Some(project.join("target").to_string_lossy().into_owned()),
+            message: "transient scan error".to_string(),
+        })
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        cleaner,
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60),
+            scan_interval: Duration::from_secs(1),
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(result.skipped, 0);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
 }
 
 #[test]
