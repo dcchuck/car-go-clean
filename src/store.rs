@@ -305,6 +305,21 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn scan_error_paths_since(&self, since: SystemTime) -> Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT path FROM errors
+            WHERE ts >= ?1 AND category = 'scan' AND path IS NOT NULL
+            ORDER BY path
+            ",
+        )?;
+        let rows = stmt.query_map([to_epoch(since)?], |row| {
+            let path: String = row.get(0)?;
+            Ok(PathBuf::from(path))
+        })?;
+        collect_rows(rows)
+    }
+
     pub fn total_bytes_recovered(&self, since: SystemTime) -> Result<i64> {
         let total = self.conn.query_row(
             "

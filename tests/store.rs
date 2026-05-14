@@ -97,3 +97,37 @@ fn records_runs_clean_events_errors_and_stats() {
     assert_eq!(top[0].path, "/a");
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
 }
+
+#[test]
+fn scan_error_paths_since_returns_only_scan_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = std::time::SystemTime::now();
+
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "scan".to_string(),
+            path: Some("/tmp/blocked".to_string()),
+            message: "Permission denied".to_string(),
+        })
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "clean".to_string(),
+            path: Some("/tmp/project".to_string()),
+            message: "cargo failed".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        store
+            .scan_error_paths_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap(),
+        vec![std::path::PathBuf::from("/tmp/blocked")]
+    );
+}

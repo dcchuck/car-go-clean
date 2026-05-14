@@ -6,7 +6,8 @@ use car_go_clean::activity::{
     activity_signals_for_process, path_is_within, process_matches_project, ActivitySignal,
 };
 use car_go_clean::safety::{
-    classify_project, review_project, CleanDecision, ProjectClass, SafetyOptions, SkipReason,
+    classify_project, review_project, review_summary, CleanDecision, ProjectClass, ReviewSummary,
+    SafetyOptions, SkipReason,
 };
 
 fn write_file(path: &Path, body: &[u8]) {
@@ -73,7 +74,10 @@ fn path_matching_treats_project_and_target_descendants_as_active() {
         Path::new("/Users/me/src/app/target/debug/app"),
         project
     ));
-    assert!(!path_is_within(Path::new("/Users/me/src/application"), project));
+    assert!(!path_is_within(
+        Path::new("/Users/me/src/application"),
+        project
+    ));
 }
 
 #[test]
@@ -84,7 +88,11 @@ fn process_command_arguments_can_match_project_or_target_paths() {
         PathBuf::from("/Users/me/src/app"),
     ];
 
-    assert!(process_matches_project(Some(Path::new("/tmp")), &args, project));
+    assert!(process_matches_project(
+        Some(Path::new("/tmp")),
+        &args,
+        project
+    ));
 
     let args = vec![PathBuf::from("/Users/me/src/app/target/debug/server")];
     assert!(process_matches_project(None, &args, project));
@@ -216,4 +224,47 @@ fn active_process_is_skipped_unless_included() {
     opts.include_active = true;
     let review = review_project(project.path(), &[], &[signal], now, &opts).unwrap();
     assert_eq!(review.decision, CleanDecision::Cleanable);
+}
+
+#[test]
+fn review_summary_counts_cleanable_and_skip_reasons() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+    let old = SystemTime::now() + Duration::from_secs(3 * 60 * 60);
+    let cleanable = review_project(project.path(), &[], &[], old, &options()).unwrap();
+
+    let missing = tempfile::tempdir().unwrap();
+    let skipped = review_project(missing.path(), &[], &[], old, &options()).unwrap();
+
+    let summary = review_summary(&[cleanable, skipped]);
+
+    assert_eq!(summary.total_projects, 2);
+    assert_eq!(summary.cleanable_projects, 1);
+    assert_eq!(summary.skipped_projects, 1);
+    assert!(summary.cleanable_bytes >= 4096);
+    assert_eq!(summary.active_recent_write, 0);
+    assert_eq!(summary.active_process, 0);
+    assert_eq!(summary.managed_cache, 0);
+    assert_eq!(summary.container_storage, 0);
+    assert_eq!(summary.scan_error, 0);
+    assert_eq!(summary.no_target, 1);
+    assert_eq!(summary.target_read_error, 0);
+
+    assert_eq!(
+        summary,
+        ReviewSummary {
+            total_projects: 2,
+            cleanable_projects: 1,
+            skipped_projects: 1,
+            cleanable_bytes: summary.cleanable_bytes,
+            active_recent_write: 0,
+            active_process: 0,
+            managed_cache: 0,
+            container_storage: 0,
+            scan_error: 0,
+            no_target: 1,
+            target_read_error: 0,
+        }
+    );
 }

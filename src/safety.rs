@@ -50,6 +50,60 @@ pub struct ProjectReview {
     pub decision: CleanDecision,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewSummary {
+    pub total_projects: usize,
+    pub cleanable_projects: usize,
+    pub skipped_projects: usize,
+    pub cleanable_bytes: i64,
+    pub active_recent_write: usize,
+    pub active_process: usize,
+    pub managed_cache: usize,
+    pub container_storage: usize,
+    pub scan_error: usize,
+    pub no_target: usize,
+    pub target_read_error: usize,
+}
+
+pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
+    let mut summary = ReviewSummary {
+        total_projects: reviews.len(),
+        cleanable_projects: 0,
+        skipped_projects: 0,
+        cleanable_bytes: 0,
+        active_recent_write: 0,
+        active_process: 0,
+        managed_cache: 0,
+        container_storage: 0,
+        scan_error: 0,
+        no_target: 0,
+        target_read_error: 0,
+    };
+
+    for review in reviews {
+        match &review.decision {
+            CleanDecision::Cleanable => {
+                summary.cleanable_projects += 1;
+                summary.cleanable_bytes += review.target_bytes as i64;
+            }
+            CleanDecision::Skipped(reason) => {
+                summary.skipped_projects += 1;
+                match reason {
+                    SkipReason::NoTarget => summary.no_target += 1,
+                    SkipReason::ActiveRecentWrite { .. } => summary.active_recent_write += 1,
+                    SkipReason::ActiveProcess => summary.active_process += 1,
+                    SkipReason::ManagedCache => summary.managed_cache += 1,
+                    SkipReason::ContainerStorage => summary.container_storage += 1,
+                    SkipReason::ScanError => summary.scan_error += 1,
+                    SkipReason::TargetReadError => summary.target_read_error += 1,
+                }
+            }
+        }
+    }
+
+    summary
+}
+
 pub fn classify_project(path: &Path) -> ProjectClass {
     let parts = path_components(path);
 
