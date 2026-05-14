@@ -79,6 +79,33 @@ fn scan_respects_gitignore_files_in_scan_roots() {
     assert_eq!(scanner.scan().unwrap(), vec![root.path().join("kept")]);
 }
 
+#[test]
+fn scan_includes_cache_and_container_project_roots_when_not_excluded() {
+    let root = tempfile::tempdir().unwrap();
+    let bun_cache = root
+        .path()
+        .join(".bun/install/cache/@tauri-apps/cli@2.5.0@@@1");
+    let orb_stack_cache = root.path().join(
+        "OrbStack/docker/volumes/minikube/lib/docker/overlay2/layer/diff/src/index.crates.io/crate-1.0.0",
+    );
+    write_file(
+        &bun_cache.join("Cargo.toml"),
+        "[package]\nname='tauri-cli'\nversion='2.5.0'\n",
+    );
+    write_file(
+        &orb_stack_cache.join("Cargo.toml"),
+        "[package]\nname='cached-crate'\nversion='1.0.0'\n",
+    );
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+
+    assert_eq!(scanner.scan().unwrap(), vec![bun_cache, orb_stack_cache]);
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_skips_unreadable_directories_and_reports_errors() {

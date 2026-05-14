@@ -67,6 +67,10 @@ Daemon logs are newline-delimited JSON written to the state directory at
 `car-go-clean.log.2`, and so on.
 Unreadable directories are skipped during scans and recorded as scan errors;
 view them with `car-go-clean logs --errors-only`.
+Broad home-directory scans intentionally discover any directory containing a
+`Cargo.toml`, including nested package sources inside caches or container
+storage. Inspect the cached project list before running a clean cycle against a
+new scan root.
 
 ## Services And Packaging
 
