@@ -5,7 +5,10 @@ use crate::config::{default_path, load, paths, Config, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
-use crate::safety::{review_project, review_summary, ProjectReview, SafetyOptions};
+use crate::safety::{
+    review_project, review_summary, CleanDecision, ProjectClass, ProjectReview, SafetyOptions,
+    SkipReason,
+};
 use crate::scanner::{Scanner, ScannerOptions};
 use crate::store::Store;
 use anyhow::{anyhow, Context, Result};
@@ -40,7 +43,21 @@ enum Commands {
     },
     Status {
         #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
         state_dir: Option<PathBuf>,
+    },
+    Projects {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        risky: bool,
+        #[arg(long)]
+        active: bool,
+        #[arg(long)]
+        json: bool,
     },
     Scan {
         #[arg(long)]
@@ -108,7 +125,14 @@ fn execute(cli: Cli) -> Result<()> {
             print!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Commands::Status { state_dir } => status(state_dir),
+        Commands::Status { config, state_dir } => status(config, state_dir),
+        Commands::Projects {
+            config,
+            state_dir,
+            risky,
+            active,
+            json,
+        } => projects(config, state_dir, risky, active, json),
         Commands::Scan { config, state_dir } => scan(config, state_dir),
         Commands::Run {
             config,
@@ -170,10 +194,19 @@ fn health(
     Ok(())
 }
 
-fn status(state_dir: Option<PathBuf>) -> Result<()> {
+fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
     let projects = store.all_projects()?;
+    let safety = SafetyOptions {
+        target_quiet_period: cfg.target_quiet_period,
+        include_managed_cache: false,
+        include_active: false,
+        force: false,
+    };
+    let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
+    print_review_summary("Status", &reviews);
     println!("Cached projects: {}", projects.len());
     println!("Total bytes recovered (all time): {total}");
     match store.last_run() {
@@ -182,6 +215,40 @@ fn status(state_dir: Option<PathBuf>) -> Result<()> {
             run.id, run.projects_cleaned, run.bytes_recovered, run.errors_count
         ),
         Err(_) => println!("Last run: <none>"),
+    }
+    Ok(())
+}
+
+fn projects(
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    risky: bool,
+    active: bool,
+    json: bool,
+) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let store = open_store(state_dir.as_deref())?;
+    let safety = SafetyOptions {
+        target_quiet_period: cfg.target_quiet_period,
+        include_managed_cache: risky,
+        include_active: active,
+        force: false,
+    };
+    let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reviews)?);
+        return Ok(());
+    }
+
+    for review in &reviews {
+        println!(
+            "{}\t{}\t{}\t{}",
+            decision_label(&review.decision),
+            class_label(review.class),
+            review.target_bytes,
+            review.path.display()
+        );
     }
     Ok(())
 }
@@ -273,6 +340,29 @@ fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
     println!("Cleanable projects: {}", summary.cleanable_projects);
     println!("Skipped projects: {}", summary.skipped_projects);
     println!("Cleanable bytes: {}", summary.cleanable_bytes);
+}
+
+fn decision_label(decision: &CleanDecision) -> &'static str {
+    match decision {
+        CleanDecision::Cleanable => "cleanable",
+        CleanDecision::Skipped(reason) => match reason {
+            SkipReason::NoTarget => "skipped:no_target",
+            SkipReason::ActiveRecentWrite { .. } => "skipped:active_recent_write",
+            SkipReason::ActiveProcess => "skipped:active_process",
+            SkipReason::ManagedCache => "skipped:managed_cache",
+            SkipReason::ContainerStorage => "skipped:container_storage",
+            SkipReason::ScanError => "skipped:scan_error",
+            SkipReason::TargetReadError => "skipped:target_read_error",
+        },
+    }
+}
+
+fn class_label(class: ProjectClass) -> &'static str {
+    match class {
+        ProjectClass::Workspace => "workspace",
+        ProjectClass::ManagedCache => "managed_cache",
+        ProjectClass::ContainerStorage => "container_storage",
+    }
 }
 
 fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
