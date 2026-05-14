@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use car_go_clean::activity::ActivitySignal;
+use car_go_clean::activity::{path_is_within, process_matches_project, ActivitySignal};
 use car_go_clean::safety::{
     classify_project, review_project, CleanDecision, ProjectClass, SafetyOptions, SkipReason,
 };
@@ -57,6 +57,38 @@ fn similar_looking_paths_remain_workspaces() {
         classify_project(Path::new("/tmp/my.cargo/registry/src-demo/app")),
         ProjectClass::Workspace
     );
+    assert_eq!(
+        classify_project(Path::new("/Users/me/src/docker/containers/app")),
+        ProjectClass::Workspace
+    );
+}
+
+#[test]
+fn path_matching_treats_project_and_target_descendants_as_active() {
+    let project = Path::new("/Users/me/src/app");
+    assert!(path_is_within(Path::new("/Users/me/src/app"), project));
+    assert!(path_is_within(
+        Path::new("/Users/me/src/app/target/debug/app"),
+        project
+    ));
+    assert!(!path_is_within(Path::new("/Users/me/src/application"), project));
+}
+
+#[test]
+fn process_command_arguments_can_match_project_or_target_paths() {
+    let project = Path::new("/Users/me/src/app");
+    let args = vec![
+        PathBuf::from("/Users/me/.cargo/bin/cargo"),
+        PathBuf::from("/Users/me/src/app"),
+    ];
+
+    assert!(process_matches_project(Some(Path::new("/tmp")), &args, project));
+
+    let args = vec![PathBuf::from("/Users/me/src/app/target/debug/server")];
+    assert!(process_matches_project(None, &args, project));
+
+    let args = vec![PathBuf::from("/Users/me/src/application")];
+    assert!(!process_matches_project(None, &args, project));
 }
 
 #[test]

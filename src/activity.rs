@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use sysinfo::System;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivitySignal {
@@ -21,6 +22,48 @@ impl ProcessInspector for NoopProcessInspector {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SysinfoProcessInspector;
+
+impl ProcessInspector for SysinfoProcessInspector {
+    fn active_projects(&self, projects: &[PathBuf]) -> Result<Vec<ActivitySignal>> {
+        let system = System::new_all();
+        let mut signals = Vec::new();
+
+        for (pid, process) in system.processes() {
+            let cwd = process.cwd();
+            let args: Vec<PathBuf> = process
+                .cmd()
+                .iter()
+                .map(|arg| PathBuf::from(arg.as_os_str()))
+                .collect();
+
+            for project in projects {
+                if process_matches_project(cwd, &args, project) {
+                    signals.push(ActivitySignal {
+                        pid: pid.as_u32(),
+                        project_path: project.clone(),
+                        reason: "cwd or command references project".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+
+        Ok(signals)
+    }
+}
+
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+pub fn process_matches_project(cwd: Option<&Path>, args: &[PathBuf], project: &Path) -> bool {
+    if cwd.is_some_and(|cwd| path_is_within(cwd, project)) {
+        return true;
+    }
+
+    let target = project.join("target");
+    args.iter()
+        .any(|arg| path_is_within(arg, project) || path_is_within(arg, &target))
 }
