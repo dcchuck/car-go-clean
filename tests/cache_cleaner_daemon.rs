@@ -4,9 +4,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use car_go_clean::activity::NoopProcessInspector;
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::daemon::{Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::safety::SafetyOptions;
 use car_go_clean::scanner::{Scanner, ScannerOptions};
 use car_go_clean::store::Store;
 
@@ -123,6 +125,54 @@ fn daemon_scan_and_run_cycle_record_state() {
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert!(run.bytes_recovered >= 2048);
+}
+
+#[test]
+fn daemon_run_cycle_skips_recent_targets_by_default() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&project, std::time::SystemTime::now())
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        cleaner,
+        DaemonOptions::default(),
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_secs(2 * 60 * 60),
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[test]

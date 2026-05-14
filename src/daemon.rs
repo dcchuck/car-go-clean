@@ -1,8 +1,11 @@
+use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
+use crate::safety::{review_project, review_summary, CleanDecision, SafetyOptions};
 use crate::scanner::Scanner;
 use crate::store::{CleanEvent, ErrorRecord, Store};
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
@@ -51,6 +54,15 @@ impl Default for DaemonOptions {
             scan_interval: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCycleResult {
+    pub run_id: i64,
+    pub cleaned: i64,
+    pub skipped: i64,
+    pub bytes_recovered: i64,
+    pub errors: i64,
 }
 
 pub struct Daemon<'a, R: CommandRunner> {
@@ -105,16 +117,46 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_cycle(&self) -> Result<()> {
+        let opts = SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: true,
+            include_active: true,
+            force: true,
+        };
+        self.run_cycle_with_safety(opts, &crate::activity::NoopProcessInspector)?;
+        Ok(())
+    }
+
+    pub fn run_cycle_with_safety(
+        &self,
+        safety: SafetyOptions,
+        inspector: &impl ProcessInspector,
+    ) -> Result<RunCycleResult> {
         self.cache.sync_on_disk()?;
         let started = SystemTime::now();
         let run_id = self.store.start_run(started)?;
         let projects = self.store.all_projects()?;
+        let project_paths: Vec<PathBuf> = projects
+            .iter()
+            .map(|project| PathBuf::from(&project.path))
+            .collect();
+        let scan_errors = self.store.scan_error_paths_since(SystemTime::UNIX_EPOCH)?;
+        let activity = inspector.active_projects(&project_paths)?;
+        let mut reviews = Vec::with_capacity(projects.len());
 
         let mut projects_cleaned = 0;
         let mut bytes_recovered = 0;
         let mut errors_count = 0;
 
-        for project in projects {
+        for project in &projects {
+            let path = PathBuf::from(&project.path);
+            let review = review_project(&path, &scan_errors, &activity, started, &safety)?;
+            let should_clean = review.decision == CleanDecision::Cleanable;
+            reviews.push(review);
+            if !should_clean {
+                continue;
+            }
+
             match self.cleaner.clean(&project.path) {
                 Ok(result) if result.skipped => {}
                 Ok(result) => {
@@ -147,6 +189,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
         }
 
+        let skipped = review_summary(&reviews).skipped_projects as i64;
         self.store.finish_run(
             run_id,
             SystemTime::now(),
@@ -154,7 +197,13 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             bytes_recovered,
             errors_count,
         )?;
-        Ok(())
+        Ok(RunCycleResult {
+            run_id,
+            cleaned: projects_cleaned,
+            skipped,
+            bytes_recovered,
+            errors: errors_count,
+        })
     }
 
     pub fn run_forever(&self) -> Result<()> {
