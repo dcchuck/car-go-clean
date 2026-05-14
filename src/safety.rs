@@ -55,7 +55,7 @@ pub struct ReviewSummary {
     pub total_projects: usize,
     pub cleanable_projects: usize,
     pub skipped_projects: usize,
-    pub cleanable_bytes: i64,
+    pub cleanable_bytes: u64,
     pub active_recent_write: usize,
     pub active_process: usize,
     pub managed_cache: usize,
@@ -84,7 +84,7 @@ pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
         match &review.decision {
             CleanDecision::Cleanable => {
                 summary.cleanable_projects += 1;
-                summary.cleanable_bytes += review.target_bytes as i64;
+                summary.cleanable_bytes += review.target_bytes;
             }
             CleanDecision::Skipped(reason) => {
                 summary.skipped_projects += 1;

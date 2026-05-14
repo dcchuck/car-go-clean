@@ -239,25 +239,13 @@ fn review_summary_counts_cleanable_and_skip_reasons() {
 
     let summary = review_summary(&[cleanable, skipped]);
 
-    assert_eq!(summary.total_projects, 2);
-    assert_eq!(summary.cleanable_projects, 1);
-    assert_eq!(summary.skipped_projects, 1);
-    assert!(summary.cleanable_bytes >= 4096);
-    assert_eq!(summary.active_recent_write, 0);
-    assert_eq!(summary.active_process, 0);
-    assert_eq!(summary.managed_cache, 0);
-    assert_eq!(summary.container_storage, 0);
-    assert_eq!(summary.scan_error, 0);
-    assert_eq!(summary.no_target, 1);
-    assert_eq!(summary.target_read_error, 0);
-
     assert_eq!(
         summary,
         ReviewSummary {
             total_projects: 2,
             cleanable_projects: 1,
             skipped_projects: 1,
-            cleanable_bytes: summary.cleanable_bytes,
+            cleanable_bytes: 4096,
             active_recent_write: 0,
             active_process: 0,
             managed_cache: 0,
