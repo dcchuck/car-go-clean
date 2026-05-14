@@ -1,9 +1,11 @@
+use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{default_path, load, paths, Config, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
+use crate::safety::{review_project, review_summary, ProjectReview, SafetyOptions};
 use crate::scanner::{Scanner, ScannerOptions};
 use crate::store::Store;
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +53,14 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        include_managed_cache: bool,
+        #[arg(long)]
+        include_active: bool,
+        #[arg(long)]
+        force: bool,
     },
     Daemon {
         #[arg(long)]
@@ -100,7 +110,21 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Status { state_dir } => status(state_dir),
         Commands::Scan { config, state_dir } => scan(config, state_dir),
-        Commands::Run { config, state_dir } => run_once(config, state_dir),
+        Commands::Run {
+            config,
+            state_dir,
+            dry_run,
+            include_managed_cache,
+            include_active,
+            force,
+        } => run_once(
+            config,
+            state_dir,
+            dry_run,
+            include_managed_cache,
+            include_active,
+            force,
+        ),
         Commands::Daemon { config, state_dir } => daemon(config, state_dir),
         Commands::Stats {
             since,
@@ -174,17 +198,80 @@ fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn run_once(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+fn run_once(
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    dry_run: bool,
+    include_managed_cache: bool,
+    include_active: bool,
+    force: bool,
+) -> Result<()> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
     let cfg = load_config(config_path)?;
-    let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
+    let safety = SafetyOptions {
+        target_quiet_period: cfg.target_quiet_period,
+        include_managed_cache,
+        include_active,
+        force,
+    };
     let store = open_store_at(&path_set)?;
+
+    if dry_run {
+        let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
+        print_review_summary("Dry run", &reviews);
+        return Ok(());
+    }
+
+    let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
     let daemon = daemon_for_clean(&store, &cfg, cargo);
-    daemon.run_cycle()?;
-    println!("Run complete");
+    let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
+    println!(
+        "Run complete: cleaned={} skipped={} recovered={} errors={}",
+        result.cleaned, result.skipped, result.bytes_recovered, result.errors
+    );
     Ok(())
+}
+
+fn project_reviews(
+    store: &Store,
+    safety: &SafetyOptions,
+    scan_interval: Duration,
+) -> Result<Vec<ProjectReview>> {
+    let now = SystemTime::now();
+    let projects = store.all_projects()?;
+    let paths: Vec<PathBuf> = projects
+        .iter()
+        .map(|project| PathBuf::from(&project.path))
+        .collect();
+    let scan_error_since = now
+        .checked_sub(scan_interval)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let scan_errors = store.scan_error_paths_since(scan_error_since)?;
+    let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
+
+    projects
+        .iter()
+        .map(|project| {
+            review_project(
+                Path::new(&project.path),
+                &scan_errors,
+                &activity,
+                now,
+                safety,
+            )
+        })
+        .collect()
+}
+
+fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
+    let summary = review_summary(reviews);
+    println!("{label}");
+    println!("Total projects: {}", summary.total_projects);
+    println!("Cleanable projects: {}", summary.cleanable_projects);
+    println!("Skipped projects: {}", summary.skipped_projects);
+    println!("Cleanable bytes: {}", summary.cleanable_bytes);
 }
 
 fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
