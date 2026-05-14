@@ -24,6 +24,30 @@ fn load_missing_file_returns_defaults() {
 }
 
 #[test]
+fn default_target_quiet_period_is_two_hours() {
+    let cfg = Config::default();
+
+    assert_eq!(cfg.target_quiet_period, Duration::from_secs(2 * 60 * 60));
+}
+
+#[test]
+fn load_file_overlays_target_quiet_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+target_quiet_period = "30m"
+"#,
+    )
+    .unwrap();
+
+    let cfg = load(&path).unwrap();
+
+    assert_eq!(cfg.target_quiet_period, Duration::from_secs(30 * 60));
+}
+
+#[test]
 fn load_file_overlays_defaults_and_expands_paths() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -62,6 +86,12 @@ fn validate_rejects_bad_intervals_and_log_levels() {
 
     let cfg = Config {
         scan_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_err());
+
+    let cfg = Config {
+        target_quiet_period: Duration::ZERO,
         ..Default::default()
     };
     assert!(cfg.validate().is_err());

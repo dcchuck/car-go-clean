@@ -17,6 +17,8 @@ pub struct Config {
     pub clean_interval: Duration,
     #[serde(default = "default_scan_interval", with = "humantime_serde")]
     pub scan_interval: Duration,
+    #[serde(default = "default_target_quiet_period", with = "humantime_serde")]
+    pub target_quiet_period: Duration,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -30,6 +32,7 @@ impl Default for Config {
             excludes: default_excludes(),
             clean_interval: default_clean_interval(),
             scan_interval: default_scan_interval(),
+            target_quiet_period: default_target_quiet_period(),
             log_level: default_log_level(),
         }
     }
@@ -42,6 +45,9 @@ impl Config {
         }
         if self.scan_interval.is_zero() {
             return Err(anyhow!("scan_interval must be positive"));
+        }
+        if self.target_quiet_period.is_zero() {
+            return Err(anyhow!("target_quiet_period must be positive"));
         }
         match self.log_level.as_str() {
             "debug" | "info" | "warn" | "error" => Ok(()),
@@ -158,6 +164,10 @@ fn default_clean_interval() -> Duration {
 
 fn default_scan_interval() -> Duration {
     Duration::from_secs(7 * 24 * 60 * 60)
+}
+
+fn default_target_quiet_period() -> Duration {
+    Duration::from_secs(2 * 60 * 60)
 }
 
 fn default_log_level() -> String {
