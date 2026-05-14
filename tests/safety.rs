@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use car_go_clean::activity::{path_is_within, process_matches_project, ActivitySignal};
+use car_go_clean::activity::{
+    activity_signals_for_process, path_is_within, process_matches_project, ActivitySignal,
+};
 use car_go_clean::safety::{
     classify_project, review_project, CleanDecision, ProjectClass, SafetyOptions, SkipReason,
 };
@@ -89,6 +91,23 @@ fn process_command_arguments_can_match_project_or_target_paths() {
 
     let args = vec![PathBuf::from("/Users/me/src/application")];
     assert!(!process_matches_project(None, &args, project));
+}
+
+#[test]
+fn process_activity_marks_every_matching_nested_project() {
+    let repo = tempfile::tempdir().unwrap();
+    let member = repo.path().join("member");
+    let projects = vec![repo.path().to_path_buf(), member.clone()];
+
+    let signals = activity_signals_for_process(42, Some(&member), &[], &projects);
+    let active_projects: Vec<_> = signals
+        .iter()
+        .map(|signal| signal.project_path.as_path())
+        .collect();
+
+    assert_eq!(signals.len(), 2);
+    assert!(active_projects.contains(&repo.path()));
+    assert!(active_projects.contains(&member.as_path()));
 }
 
 #[test]

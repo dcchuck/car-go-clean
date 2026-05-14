@@ -38,16 +38,12 @@ impl ProcessInspector for SysinfoProcessInspector {
                 .map(|arg| PathBuf::from(arg.as_os_str()))
                 .collect();
 
-            for project in projects {
-                if process_matches_project(cwd, &args, project) {
-                    signals.push(ActivitySignal {
-                        pid: pid.as_u32(),
-                        project_path: project.clone(),
-                        reason: "cwd or command references project".to_string(),
-                    });
-                    break;
-                }
-            }
+            signals.extend(activity_signals_for_process(
+                pid.as_u32(),
+                cwd,
+                &args,
+                projects,
+            ));
         }
 
         Ok(signals)
@@ -66,4 +62,21 @@ pub fn process_matches_project(cwd: Option<&Path>, args: &[PathBuf], project: &P
     let target = project.join("target");
     args.iter()
         .any(|arg| path_is_within(arg, project) || path_is_within(arg, &target))
+}
+
+pub fn activity_signals_for_process(
+    pid: u32,
+    cwd: Option<&Path>,
+    args: &[PathBuf],
+    projects: &[PathBuf],
+) -> Vec<ActivitySignal> {
+    projects
+        .iter()
+        .filter(|project| process_matches_project(cwd, args, project))
+        .map(|project| ActivitySignal {
+            pid,
+            project_path: project.clone(),
+            reason: "cwd or command references project".to_string(),
+        })
+        .collect()
 }
