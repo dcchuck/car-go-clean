@@ -80,7 +80,17 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 
     pub fn scan_cycle(&self) -> Result<()> {
         let now = SystemTime::now();
-        for path in self.scanner.scan()? {
+        let report = self.scanner.scan_with_errors()?;
+        for error in report.errors {
+            self.store.record_error(&ErrorRecord {
+                id: 0,
+                ts: now,
+                category: "scan".to_string(),
+                path: Some(error.path.to_string_lossy().into_owned()),
+                message: error.message,
+            })?;
+        }
+        for path in report.projects {
             if let Err(err) = self.store.upsert_project(&path, now) {
                 self.store.record_error(&ErrorRecord {
                     id: 0,

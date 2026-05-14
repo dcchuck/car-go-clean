@@ -65,6 +65,8 @@ State lives under `$XDG_STATE_HOME/car-go-clean`, falling back to
 Daemon logs are newline-delimited JSON written to the state directory at
 `car-go-clean.log`. Logs rotate automatically as `car-go-clean.log.1`,
 `car-go-clean.log.2`, and so on.
+Unreadable directories are skipped during scans and recorded as scan errors;
+view them with `car-go-clean logs --errors-only`.
 
 ## Services And Packaging
 

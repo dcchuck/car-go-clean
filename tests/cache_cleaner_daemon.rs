@@ -164,3 +164,46 @@ fn daemon_shutdown_flag_stops_forever_loop_after_initial_scan() {
     assert_eq!(store.all_projects().unwrap().len(), 1);
     assert!(runner.calls.lock().unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    let blocked = root.path().join("blocked");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let cleaner = Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        cleaner,
+        DaemonOptions::default(),
+    );
+
+    daemon.scan_cycle().unwrap();
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    let errors = store
+        .errors_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "scan");
+    assert_eq!(errors[0].path.as_deref(), Some(blocked.to_str().unwrap()));
+    assert!(errors[0].message.contains("Permission denied"));
+}

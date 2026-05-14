@@ -17,22 +17,42 @@ pub struct Scanner {
     opts: ScannerOptions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub projects: Vec<PathBuf>,
+    pub errors: Vec<ScanError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 impl Scanner {
     pub fn new(opts: ScannerOptions) -> Self {
         Self { opts }
     }
 
     pub fn scan(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.scan_with_errors()?.projects)
+    }
+
+    pub fn scan_with_errors(&self) -> Result<ScanReport> {
         let mut found = BTreeSet::new();
+        let mut errors = Vec::new();
         for root in &self.opts.roots {
-            self.walk(root, &[], &mut found)?;
+            self.walk(root, &[], &mut found, &mut errors)?;
         }
         for project in &self.opts.project_dirs {
             if has_cargo_toml(project) {
                 found.insert(project.clone());
             }
         }
-        Ok(found.into_iter().collect())
+        Ok(ScanReport {
+            projects: found.into_iter().collect(),
+            errors,
+        })
     }
 
     fn walk(
@@ -40,9 +60,14 @@ impl Scanner {
         dir: &Path,
         parent_ignores: &[Arc<Gitignore>],
         found: &mut BTreeSet<PathBuf>,
+        errors: &mut Vec<ScanError>,
     ) -> Result<()> {
-        let Ok(meta) = fs::metadata(dir) else {
-            return Ok(());
+        let meta = match fs::metadata(dir) {
+            Ok(meta) => meta,
+            Err(err) => {
+                errors.push(scan_error(dir, err));
+                return Ok(());
+            }
         };
         if !meta.is_dir() || self.should_skip(dir) || is_ignored(parent_ignores, dir, true) {
             return Ok(());
@@ -52,11 +77,30 @@ impl Scanner {
             return Ok(());
         }
         let ignores = ignores_for(dir, parent_ignores);
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                errors.push(scan_error(dir, err));
+                return Ok(());
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    errors.push(scan_error(dir, err));
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    errors.push(scan_error(entry.path(), err));
+                    continue;
+                }
+            };
             if file_type.is_dir() && !file_type.is_symlink() {
-                self.walk(&entry.path(), &ignores, found)?;
+                self.walk(&entry.path(), &ignores, found, errors)?;
             }
         }
         Ok(())
@@ -82,6 +126,13 @@ impl Scanner {
 
 fn has_cargo_toml(dir: &Path) -> bool {
     dir.join("Cargo.toml").is_file()
+}
+
+fn scan_error(path: impl AsRef<Path>, err: std::io::Error) -> ScanError {
+    ScanError {
+        path: path.as_ref().to_path_buf(),
+        message: err.to_string(),
+    }
 }
 
 fn ignores_for(dir: &Path, parent_ignores: &[Arc<Gitignore>]) -> Vec<Arc<Gitignore>> {
