@@ -219,6 +219,7 @@ fn run_once(
     let store = open_store_at(&path_set)?;
 
     if dry_run {
+        Cache::new(&store).sync_on_disk()?;
         let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
         print_review_summary("Dry run", &reviews);
         return Ok(());
