@@ -48,9 +48,42 @@ fn classifies_known_managed_cache_paths() {
 }
 
 #[test]
+fn similar_looking_paths_remain_workspaces() {
+    assert_eq!(
+        classify_project(Path::new("/Users/me/src/go/pkg/model/app")),
+        ProjectClass::Workspace
+    );
+    assert_eq!(
+        classify_project(Path::new("/tmp/my.cargo/registry/src-demo/app")),
+        ProjectClass::Workspace
+    );
+}
+
+#[test]
 fn missing_direct_target_is_skipped_even_with_force() {
     let project = tempfile::tempdir().unwrap();
     write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+
+    let mut opts = options();
+    opts.force = true;
+    let review = review_project(project.path(), &[], &[], SystemTime::now(), &opts).unwrap();
+
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::NoTarget)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_target_is_skipped_as_missing_target() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let real_target = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&real_target.path().join("debug/blob.bin"), &[0; 4096]);
+    symlink(real_target.path(), project.path().join("target")).unwrap();
 
     let mut opts = options();
     opts.force = true;

@@ -3,7 +3,7 @@ use crate::activity::{path_is_within, ActivitySignal};
 use anyhow::Result;
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,15 +51,15 @@ pub struct ProjectReview {
 }
 
 pub fn classify_project(path: &Path) -> ProjectClass {
-    let path = path.to_string_lossy();
+    let parts = path_components(path);
 
-    if path.contains(".bun/install/cache")
-        || path.contains("go/pkg/mod")
-        || path.contains(".cargo/registry/src")
-        || path.contains(".cargo/git/checkouts")
+    if contains_sequence(&parts, &[".bun", "install", "cache"])
+        || contains_sequence(&parts, &["go", "pkg", "mod"])
+        || contains_sequence(&parts, &[".cargo", "registry", "src"])
+        || contains_sequence(&parts, &[".cargo", "git", "checkouts"])
     {
         ProjectClass::ManagedCache
-    } else if path.contains("OrbStack/docker") {
+    } else if contains_sequence(&parts, &["OrbStack", "docker"]) {
         ProjectClass::ContainerStorage
     } else {
         ProjectClass::Workspace
@@ -76,7 +76,7 @@ pub fn review_project(
     let class = classify_project(project);
     let target_path = project.join("target");
 
-    if !target_path.is_dir() {
+    if !is_direct_directory(&target_path) {
         return Ok(review(
             project,
             class,
@@ -181,6 +181,30 @@ pub fn review_project(
         target_bytes,
         CleanDecision::Cleanable,
     ))
+}
+
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn contains_sequence(parts: &[String], needle: &[&str]) -> bool {
+    parts.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(part, needle)| part == needle)
+    })
+}
+
+fn is_direct_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 fn review(
