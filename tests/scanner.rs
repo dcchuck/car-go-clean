@@ -56,3 +56,25 @@ fn scan_includes_project_dirs_that_contain_cargo_toml() {
 
     assert_eq!(scanner.scan().unwrap(), vec![root.path().to_path_buf()]);
 }
+
+#[test]
+fn scan_respects_gitignore_files_in_scan_roots() {
+    let root = tempfile::tempdir().unwrap();
+    write_file(&root.path().join(".gitignore"), "ignored/\n");
+    write_file(
+        &root.path().join("kept/Cargo.toml"),
+        "[package]\nname='kept'\nversion='0.1.0'\n",
+    );
+    write_file(
+        &root.path().join("ignored/Cargo.toml"),
+        "[package]\nname='ignored'\nversion='0.1.0'\n",
+    );
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+
+    assert_eq!(scanner.scan().unwrap(), vec![root.path().join("kept")]);
+}

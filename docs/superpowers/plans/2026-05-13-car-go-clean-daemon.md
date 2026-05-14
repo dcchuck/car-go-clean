@@ -36,24 +36,23 @@ and integration tests using `tempfile`/`assert_cmd`.
   `scan`, `run`, `daemon`, `stats`, and `logs`.
 - [x] Added CLI smoke coverage for scan -> run -> stats with fake `cargo`.
 
-## Remaining Hardening Opportunities
+## Completed Hardening
 
-- [ ] Add graceful signal handling for `daemon`.
-- [ ] Add rotating structured logs instead of the current simple append-only
-  log file.
-- [ ] Add service unit files for launchd/systemd once install paths are settled.
-- [ ] Add release packaging after deciding whether distribution is primarily
-  `cargo install`, Homebrew, or both.
-- [ ] Consider using the `ignore` crate for gitignore-aware traversal if users
-  want project-local ignore semantics.
+- [x] Added graceful `SIGINT`/`SIGTERM` shutdown handling for `daemon`.
+- [x] Added rotating newline-delimited JSON logs.
+- [x] Added service unit templates for launchd and systemd.
+- [x] Added release packaging notes with `cargo install` as the primary
+  distribution channel and Homebrew as the secondary channel.
+- [x] Used the `ignore` crate for gitignore-aware traversal while preserving
+  the existing no-descent behavior for project roots.
 
 ## Verification Commands
 
 Run with the repository toolchain:
 
 ```bash
-mise exec rust@1.91.1 -- cargo fmt -- --check
-mise exec rust@1.91.1 -- cargo test
-mise exec rust@1.91.1 -- cargo clippy --all-targets -- -D warnings
-mise exec rust@1.91.1 -- cargo build
+mise exec rust@1.95.0 -- cargo fmt -- --check
+mise exec rust@1.95.0 -- cargo test
+mise exec rust@1.95.0 -- cargo clippy --all-targets -- -D warnings
+mise exec rust@1.95.0 -- cargo build
 ```

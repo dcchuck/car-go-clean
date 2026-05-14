@@ -3,7 +3,40 @@ use crate::cleaner::{Cleaner, CommandRunner};
 use crate::scanner::Scanner;
 use crate::store::{CleanEvent, ErrorRecord, Store};
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownFlag;
+
+impl ShutdownFlag {
+    pub fn new() -> Self {
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        Self
+    }
+
+    pub fn request(&self) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+    }
+
+    pub fn install_signal_handlers(&self) -> Result<()> {
+        install_signal_handlers()
+    }
+}
+
+impl Default for ShutdownFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DaemonOptions {
@@ -115,17 +148,71 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_forever(&self) -> Result<()> {
+        let shutdown = ShutdownFlag::new();
+        shutdown.install_signal_handlers()?;
+        self.run_until_shutdown(&shutdown)
+    }
+
+    pub fn run_until_shutdown(&self, shutdown: &ShutdownFlag) -> Result<()> {
         if self.store.all_projects()?.is_empty() {
             self.scan_cycle()?;
         }
         let mut last_scan = SystemTime::now();
-        loop {
-            std::thread::sleep(self.opts.clean_interval);
+        while !shutdown.is_requested() {
+            if wait_for_interval_or_shutdown(self.opts.clean_interval, shutdown) {
+                break;
+            }
             self.run_cycle()?;
             if last_scan.elapsed().unwrap_or_default() >= self.opts.scan_interval {
                 self.scan_cycle()?;
                 last_scan = SystemTime::now();
             }
         }
+        Ok(())
     }
+}
+
+fn wait_for_interval_or_shutdown(interval: Duration, shutdown: &ShutdownFlag) -> bool {
+    if interval.is_zero() {
+        return shutdown.is_requested();
+    }
+    let started = Instant::now();
+    while started.elapsed() < interval {
+        if shutdown.is_requested() {
+            return true;
+        }
+        let remaining = interval.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+    shutdown.is_requested()
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() -> Result<()> {
+    unsafe extern "C" fn handle_signal(_: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    unsafe {
+        if libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
+            anyhow::bail!("install SIGINT handler");
+        }
+        if libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
+            anyhow::bail!("install SIGTERM handler");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() -> Result<()> {
+    Ok(())
 }

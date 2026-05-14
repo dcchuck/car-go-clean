@@ -20,7 +20,7 @@ cargo run -- stats
 This checkout also works with the local mise toolchain:
 
 ```bash
-mise exec rust@1.91.1 -- cargo test
+mise exec rust@1.95.0 -- cargo test
 ```
 
 ## Configuration
@@ -62,13 +62,23 @@ log_level = "info"
 State lives under `$XDG_STATE_HOME/car-go-clean`, falling back to
 `$HOME/.local/state/car-go-clean`.
 
+Daemon logs are newline-delimited JSON written to the state directory at
+`car-go-clean.log`. Logs rotate automatically as `car-go-clean.log.1`,
+`car-go-clean.log.2`, and so on.
+
+## Services And Packaging
+
+Service templates live in `packaging/systemd/` and `packaging/launchd/`.
+Release notes and distribution-channel decisions live in `packaging/release/`;
+the primary install path is currently `cargo install`.
+
 ## Development
 
 ```bash
-mise exec rust@1.91.1 -- cargo fmt -- --check
-mise exec rust@1.91.1 -- cargo test
-mise exec rust@1.91.1 -- cargo clippy --all-targets -- -D warnings
-mise exec rust@1.91.1 -- cargo build
+mise exec rust@1.95.0 -- cargo fmt -- --check
+mise exec rust@1.95.0 -- cargo test
+mise exec rust@1.95.0 -- cargo clippy --all-targets -- -D warnings
+mise exec rust@1.95.0 -- cargo build
 ```
 
 See `docs/superpowers/specs/` for the design.

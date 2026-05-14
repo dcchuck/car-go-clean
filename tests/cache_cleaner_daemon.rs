@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
-use car_go_clean::daemon::{Daemon, DaemonOptions};
+use car_go_clean::daemon::{Daemon, DaemonOptions, ShutdownFlag};
 use car_go_clean::scanner::{Scanner, ScannerOptions};
 use car_go_clean::store::Store;
 
@@ -123,4 +123,44 @@ fn daemon_scan_and_run_cycle_record_state() {
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert!(run.bytes_recovered >= 2048);
+}
+
+#[test]
+fn daemon_shutdown_flag_stops_forever_loop_after_initial_scan() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_millis(1));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        cleaner,
+        DaemonOptions {
+            clean_interval: Duration::from_millis(1),
+            scan_interval: Duration::from_secs(60),
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    shutdown.request();
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }

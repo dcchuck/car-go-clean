@@ -1,0 +1,14 @@
+[Unit]
+Description=Run car-go-clean daemon
+Documentation=https://github.com/dcchuck/car-go-clean
+After=network.target
+
+[Service]
+Type=simple
+Environment=CAR_GO_CLEAN_CONFIG=%h/.config/car-go-clean/config.toml
+ExecStart=/usr/bin/env car-go-clean daemon --config ${CAR_GO_CLEAN_CONFIG}
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
