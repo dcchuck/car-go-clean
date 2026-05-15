@@ -111,6 +111,7 @@ pub fn classify_project(path: &Path) -> ProjectClass {
         || contains_sequence(&parts, &["go", "pkg", "mod"])
         || contains_sequence(&parts, &[".cargo", "registry", "src"])
         || contains_sequence(&parts, &[".cargo", "git", "checkouts"])
+        || contains_sequence(&parts, &["Library", "Caches"])
     {
         ProjectClass::ManagedCache
     } else if contains_sequence(&parts, &["OrbStack", "docker"]) {

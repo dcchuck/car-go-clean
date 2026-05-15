@@ -41,6 +41,10 @@ fn classifies_known_managed_cache_paths() {
         ProjectClass::ManagedCache
     );
     assert_eq!(
+        classify_project(Path::new("/Users/me/Library/Caches/some-tool/cached-crate")),
+        ProjectClass::ManagedCache
+    );
+    assert_eq!(
         classify_project(Path::new("/Users/me/OrbStack/docker/containers/crate")),
         ProjectClass::ContainerStorage
     );
