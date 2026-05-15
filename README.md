@@ -51,6 +51,7 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 `cargo clean` for cached projects that pass all safety gates:
 
 - `project/target` exists directly under the cached project path.
+- The direct target directory can be read and measured.
 - The newest non-symlink file under `target/` is at least
   `target_quiet_period` old.
 - The project is not under a known managed cache or container storage path.
