@@ -197,7 +197,7 @@ fn health(
 fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
-    let projects = store.all_projects()?;
+    Cache::new(&store).sync_on_disk()?;
     let safety = SafetyOptions {
         target_quiet_period: cfg.target_quiet_period,
         include_managed_cache: false,
@@ -205,6 +205,7 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()
         force: false,
     };
     let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
+    let projects = store.all_projects()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
     print_review_summary("Status", &reviews);
     println!("Cached projects: {}", projects.len());
@@ -228,6 +229,7 @@ fn projects(
 ) -> Result<()> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
+    Cache::new(&store).sync_on_disk()?;
     let safety = SafetyOptions {
         target_quiet_period: cfg.target_quiet_period,
         include_managed_cache: risky,

@@ -262,6 +262,59 @@ fn status_prints_safe_cleaning_summary() {
 }
 
 #[test]
+fn status_syncs_stale_cached_projects_before_review() {
+    let work = tempfile::tempdir().unwrap();
+    let live_project = work.path().join("tree/live");
+    let stale_project = work.path().join("tree/stale");
+    for project in [&live_project, &stale_project] {
+        fs::create_dir_all(project.join("target/debug")).unwrap();
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(project.join("target/debug/blob.bin"), vec![0; 16 * 1024]).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("tree").display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("scan")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    fs::remove_dir_all(&stale_project).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("status")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Total projects: 1"))
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains("Cached projects: 1"));
+}
+
+#[test]
 fn run_dry_run_syncs_stale_cached_projects_before_review() {
     let work = tempfile::tempdir().unwrap();
     let live_project = work.path().join("tree/live");
