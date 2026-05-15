@@ -69,8 +69,8 @@ Use these commands to review or override the default policy:
   container storage paths in the review policy.
 - `car-go-clean run --include-active` includes projects with active process
   matches in the review policy.
-- `car-go-clean run --force` bypasses safety gates except the direct
-  `project/target` requirement.
+- `car-go-clean run --force` bypasses policy gates except the direct,
+  readable `project/target` requirement.
 - `car-go-clean projects` lists cached projects and decisions.
 - `car-go-clean projects --risky` previews decisions with managed cache and
   container storage paths included.

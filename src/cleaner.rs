@@ -69,7 +69,7 @@ impl<R: CommandRunner> Cleaner<R> {
             skipped: false,
         };
 
-        if !target_dir.is_dir() {
+        if !is_direct_directory(&target_dir) {
             result.skipped = true;
             return Ok(result);
         }
@@ -141,6 +141,12 @@ fn is_executable(path: &Path) -> bool {
     {
         true
     }
+}
+
+fn is_direct_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 fn dir_size(root: &Path) -> Result<i64> {

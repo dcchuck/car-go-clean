@@ -106,6 +106,30 @@ fn scan_includes_cache_and_container_project_roots_when_not_excluded() {
     assert_eq!(scanner.scan().unwrap(), vec![bun_cache, orb_stack_cache]);
 }
 
+#[test]
+fn multi_component_excludes_skip_matching_subtrees() {
+    let root = tempfile::tempdir().unwrap();
+    write_file(
+        &root.path().join("Library/Caches/cached-crate/Cargo.toml"),
+        "[package]\nname='cached-crate'\nversion='0.1.0'\n",
+    );
+    write_file(
+        &root.path().join("Library/Other/kept-crate/Cargo.toml"),
+        "[package]\nname='kept-crate'\nversion='0.1.0'\n",
+    );
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec!["Library/Caches".to_string()],
+    });
+
+    assert_eq!(
+        scanner.scan().unwrap(),
+        vec![root.path().join("Library/Other/kept-crate")]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_skips_unreadable_directories_and_reports_errors() {

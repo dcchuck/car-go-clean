@@ -86,6 +86,28 @@ fn cleaner_measures_bytes_and_skips_missing_target() {
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn cleaner_skips_symlinked_target_without_invoking_runner() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    let external_target = tempfile::tempdir().unwrap();
+    symlink(external_target.path(), project.path().join("target")).unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+
+    let result = cleaner.clean(project.path()).unwrap();
+
+    assert!(result.skipped);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
 #[test]
 fn daemon_scan_and_run_cycle_record_state() {
     let root = tempfile::tempdir().unwrap();

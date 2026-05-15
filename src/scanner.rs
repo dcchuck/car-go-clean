@@ -117,11 +117,22 @@ impl Scanner {
         self.opts.excludes.iter().any(|exclude| {
             !exclude.is_empty()
                 && (base == exclude
+                    || path_ends_with(path, exclude)
                     || path
                         .components()
                         .any(|component| component.as_os_str() == exclude.as_str()))
         })
     }
+}
+
+fn path_ends_with(path: &Path, exclude: &str) -> bool {
+    let exclude = Path::new(exclude);
+    let exclude_parts: Vec<_> = exclude.components().collect();
+    if exclude_parts.is_empty() {
+        return false;
+    }
+    let path_parts: Vec<_> = path.components().collect();
+    path_parts.ends_with(&exclude_parts)
 }
 
 fn has_cargo_toml(dir: &Path) -> bool {
