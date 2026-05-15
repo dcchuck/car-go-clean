@@ -77,7 +77,11 @@ impl<R: CommandRunner> Cleaner<R> {
         result.bytes_before = dir_size(&target_dir)?;
         let start = Instant::now();
         let mut cmd = Command::new(&self.cargo_bin);
-        cmd.arg("clean").current_dir(project_dir);
+        cmd.arg("clean")
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env_remove("CARGO_TARGET_DIR")
+            .current_dir(project_dir);
         let outcome = self.runner.run(project_dir, &mut cmd)?;
         result.duration = start.elapsed();
         result.exit_code = outcome.exit_code;

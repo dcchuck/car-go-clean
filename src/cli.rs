@@ -10,7 +10,7 @@ use crate::safety::{
     SkipReason,
 };
 use crate::scanner::{Scanner, ScannerOptions};
-use crate::store::Store;
+use crate::store::{ErrorRecord, Store};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -291,6 +291,7 @@ fn run_once(
         Cache::new(&store).sync_on_disk()?;
         let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
         print_review_summary("Dry run", &reviews);
+        print_cleanable_targets(&reviews);
         return Ok(());
     }
 
@@ -321,7 +322,7 @@ fn project_reviews(
     let scan_errors = store.scan_error_paths_since(scan_error_since)?;
     let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
 
-    projects
+    let reviews = projects
         .iter()
         .map(|project| {
             review_project(
@@ -332,7 +333,9 @@ fn project_reviews(
                 safety,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    record_review_diagnostics(store, &reviews)?;
+    Ok(reviews)
 }
 
 fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
@@ -342,6 +345,44 @@ fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
     println!("Cleanable projects: {}", summary.cleanable_projects);
     println!("Skipped projects: {}", summary.skipped_projects);
     println!("Cleanable bytes: {}", summary.cleanable_bytes);
+}
+
+fn print_cleanable_targets(reviews: &[ProjectReview]) {
+    if !reviews
+        .iter()
+        .any(|review| review.decision == CleanDecision::Cleanable)
+    {
+        return;
+    }
+
+    println!("Cleanable targets:");
+    for review in reviews
+        .iter()
+        .filter(|review| review.decision == CleanDecision::Cleanable)
+    {
+        println!(
+            "  {}\t{}\t{}",
+            review.target_bytes,
+            review.target_path.display(),
+            review.path.display()
+        );
+    }
+}
+
+fn record_review_diagnostics(store: &Store, reviews: &[ProjectReview]) -> Result<()> {
+    let now = SystemTime::now();
+    for review in reviews {
+        if review.decision == CleanDecision::Skipped(SkipReason::TargetReadError) {
+            store.record_error(&ErrorRecord {
+                id: 0,
+                ts: now,
+                category: "review".to_string(),
+                path: Some(review.target_path.to_string_lossy().into_owned()),
+                message: "target read error: unable to read direct target directory".to_string(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn decision_label(decision: &CleanDecision) -> &'static str {

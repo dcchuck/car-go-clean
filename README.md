@@ -63,8 +63,8 @@ The default `target_quiet_period` is `2h`.
 
 Use these commands to review or override the default policy:
 
-- `car-go-clean run --dry-run` prints the clean plan without deleting any
-  `target/` directories.
+- `car-go-clean run --dry-run` prints the clean summary and exact target list
+  without deleting any `target/` directories.
 - `car-go-clean run --include-managed-cache` includes known managed cache and
   container storage paths in the review policy.
 - `car-go-clean run --include-active` includes projects with active process
@@ -77,8 +77,8 @@ Use these commands to review or override the default policy:
 - `car-go-clean projects --active` previews decisions with active process paths
   included.
 - `car-go-clean projects --json` emits structured project review data.
-- `car-go-clean logs --errors-only` shows scan and clean diagnostics, including
-  unreadable directories.
+- `car-go-clean logs --errors-only` shows scan, review, and clean diagnostics,
+  including unreadable directories.
 
 ## Commands
 
@@ -124,7 +124,8 @@ Validation points:
 - `projects` should show why each cached project is cleanable or skipped.
 - Unreadable directories such as protected macOS library folders should appear
   in `logs --errors-only`.
-- `run --dry-run` should not delete any `target/` directories.
+- `run --dry-run` should list cleanable target paths and should not delete any
+  `target/` directories.
 - A real `run` should clean only rows reported as `cleanable` by the same
   review policy.
 

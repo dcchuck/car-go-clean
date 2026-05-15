@@ -158,6 +158,17 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             let path = PathBuf::from(&project.path);
             let review = review_project(&path, &scan_errors, &activity, started, &safety)?;
             let should_clean = review.decision == CleanDecision::Cleanable;
+            if review.decision == CleanDecision::Skipped(crate::safety::SkipReason::TargetReadError)
+            {
+                self.store.record_error(&ErrorRecord {
+                    id: 0,
+                    ts: SystemTime::now(),
+                    category: "review".to_string(),
+                    path: Some(review.target_path.to_string_lossy().into_owned()),
+                    message: "target read error: unable to read direct target directory"
+                        .to_string(),
+                })?;
+            }
             reviews.push(review);
             if !should_clean {
                 continue;

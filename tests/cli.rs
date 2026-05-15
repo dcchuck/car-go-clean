@@ -149,9 +149,74 @@ fn run_dry_run_reports_without_invoking_cargo_clean() {
         .assert()
         .success()
         .stdout(contains("Dry run"))
-        .stdout(contains("Cleanable projects: 1"));
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains("Cleanable targets:"))
+        .stdout(contains(project.join("target").display().to_string()));
 
     assert!(project.join("target/debug/blob.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_dry_run_records_unreadable_targets_in_error_logs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("tree/proj");
+    fs::create_dir_all(project.join("target/debug")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='x'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(project.join("target/debug/blob.bin"), vec![0; 16 * 1024]).unwrap();
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("scan_dirs = [\"{}\"]\n", work.path().join("tree").display()),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("scan")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    let target = project.join("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("run")
+        .arg("--dry-run")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Skipped projects: 1"));
+
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("logs")
+        .arg("--errors-only")
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("[review]"))
+        .stdout(contains(target.display().to_string()))
+        .stdout(contains("target read error"));
 }
 
 #[test]

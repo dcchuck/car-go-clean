@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,15 +44,32 @@ fn cache_verify_and_sync_remove_dead_projects() {
 
 #[derive(Clone, Default)]
 struct FakeRunner {
-    calls: Arc<Mutex<Vec<PathBuf>>>,
+    calls: Arc<Mutex<Vec<FakeCall>>>,
     delete_target: bool,
     exit_code: i32,
     stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FakeCall {
+    dir: PathBuf,
+    args: Vec<String>,
+    envs: Vec<(String, Option<String>)>,
+}
+
 impl CommandRunner for FakeRunner {
-    fn run(&self, dir: &Path, _cmd: &mut Command) -> anyhow::Result<CleanOutcome> {
-        self.calls.lock().unwrap().push(dir.to_path_buf());
+    fn run(&self, dir: &Path, cmd: &mut Command) -> anyhow::Result<CleanOutcome> {
+        self.calls.lock().unwrap().push(FakeCall {
+            dir: dir.to_path_buf(),
+            args: cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            envs: cmd
+                .get_envs()
+                .map(|(key, value)| (to_string(key), value.map(to_string)))
+                .collect(),
+        });
         if self.delete_target {
             let _ = fs::remove_dir_all(dir.join("target"));
         }
@@ -60,6 +78,10 @@ impl CommandRunner for FakeRunner {
             stderr: self.stderr.clone(),
         })
     }
+}
+
+fn to_string(value: &OsStr) -> String {
+    value.to_string_lossy().into_owned()
 }
 
 #[test]
@@ -84,6 +106,38 @@ fn cleaner_measures_bytes_and_skips_missing_target() {
     assert!(result.bytes_before >= 4096);
     assert_eq!(result.bytes_after, 0);
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cleaner_forces_reviewed_direct_target_dir() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+
+    let result = cleaner.clean(project.path()).unwrap();
+
+    assert!(!result.skipped);
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].dir, project.path());
+    assert_eq!(
+        calls[0].args,
+        vec![
+            "clean".to_string(),
+            "--target-dir".to_string(),
+            project.path().join("target").to_string_lossy().into_owned()
+        ]
+    );
+    assert!(calls[0]
+        .envs
+        .iter()
+        .any(|(key, value)| key == "CARGO_TARGET_DIR" && value.is_none()));
 }
 
 #[cfg(unix)]
