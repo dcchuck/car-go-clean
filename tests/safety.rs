@@ -214,7 +214,14 @@ fn active_process_is_skipped_unless_included() {
         reason: "cwd inside project".to_string(),
     };
 
-    let review = review_project(project.path(), &[], &[signal.clone()], now, &options()).unwrap();
+    let review = review_project(
+        project.path(),
+        &[],
+        std::slice::from_ref(&signal),
+        now,
+        &options(),
+    )
+    .unwrap();
     assert_eq!(
         review.decision,
         CleanDecision::Skipped(SkipReason::ActiveProcess)
