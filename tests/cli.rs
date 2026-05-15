@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 use std::fs;
 use std::time::Duration;
@@ -150,7 +151,7 @@ fn run_dry_run_reports_without_invoking_cargo_clean() {
         .success()
         .stdout(contains("Dry run"))
         .stdout(contains("Cleanable projects: 1"))
-        .stdout(contains("Cleanable targets:"))
+        .stdout(contains("Cleanable target preview:"))
         .stdout(contains(project.join("target").display().to_string()));
 
     assert!(project.join("target/debug/blob.bin").exists());
@@ -256,6 +257,7 @@ fn projects_lists_cleanability_and_supports_json() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .arg("projects")
+        .arg("--all")
         .args(["--config"])
         .arg(&config)
         .args(["--state-dir"])
@@ -280,7 +282,133 @@ fn projects_lists_cleanability_and_supports_json() {
 }
 
 #[test]
+fn projects_default_is_compact_and_all_shows_full_list() {
+    let work = tempfile::tempdir().unwrap();
+    let tree = work.path().join("tree");
+    let first = tree.join("proj-00");
+    let last = tree.join("proj-24");
+    for idx in 0..25 {
+        let project = tree.join(format!("proj-{idx:02}"));
+        fs::create_dir_all(project.join("target/debug")).unwrap();
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(project.join("target/debug/blob.bin"), vec![0; 1024]).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            tree.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("scan")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("projects")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Projects"))
+        .stdout(contains("Cleanable projects: 25"))
+        .stdout(contains("Cleanable target preview:"))
+        .stdout(contains(first.join("target").display().to_string()))
+        .stdout(predicate::str::contains(last.join("target").display().to_string()).not())
+        .stdout(contains("Use `projects --all` to show all 25 rows."));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("projects")
+        .arg("--all")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains(last.display().to_string()));
+}
+
+#[test]
 fn status_prints_safe_cleaning_summary() {
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("tree/proj");
+    fs::create_dir_all(project.join("target/debug")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='x'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(project.join("target/debug/blob.bin"), vec![0; 16 * 1024]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("tree").display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("scan")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("run")
+        .arg("--dry-run")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("status")
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Last review:"))
+        .stdout(contains("Source: dry-run"))
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains("Cleanable bytes:"));
+}
+
+#[test]
+fn status_reports_no_review_before_explicit_review() {
     let work = tempfile::tempdir().unwrap();
     let project = work.path().join("tree/proj");
     fs::create_dir_all(project.join("target/debug")).unwrap();
@@ -322,12 +450,13 @@ fn status_prints_safe_cleaning_summary() {
         .arg(&state)
         .assert()
         .success()
-        .stdout(contains("Cleanable projects: 1"))
-        .stdout(contains("Cleanable bytes:"));
+        .stdout(contains("Cached projects: 1"))
+        .stdout(contains("Last review: <none>"))
+        .stdout(predicate::str::contains("Cleanable projects:").not());
 }
 
 #[test]
-fn status_syncs_stale_cached_projects_before_review() {
+fn dry_run_syncs_stale_cached_projects_before_status_snapshot() {
     let work = tempfile::tempdir().unwrap();
     let live_project = work.path().join("tree/live");
     let stale_project = work.path().join("tree/stale");
@@ -367,7 +496,8 @@ fn status_syncs_stale_cached_projects_before_review() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
-        .arg("status")
+        .arg("run")
+        .arg("--dry-run")
         .args(["--config"])
         .arg(&config)
         .args(["--state-dir"])
@@ -375,8 +505,17 @@ fn status_syncs_stale_cached_projects_before_review() {
         .assert()
         .success()
         .stdout(contains("Total projects: 1"))
-        .stdout(contains("Cleanable projects: 1"))
-        .stdout(contains("Cached projects: 1"));
+        .stdout(contains("Cleanable projects: 1"));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("status")
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Cached projects: 1"))
+        .stdout(contains("Cleanable projects: 1"));
 }
 
 #[test]

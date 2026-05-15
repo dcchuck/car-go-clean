@@ -18,6 +18,8 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+const DEFAULT_PREVIEW_LIMIT: usize = 20;
+
 #[derive(Debug, Parser)]
 #[command(name = "car-go-clean")]
 #[command(about = "Periodically run cargo clean on Rust projects.")]
@@ -46,6 +48,8 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[arg(long)]
+        refresh: bool,
     },
     Projects {
         #[arg(long)]
@@ -58,6 +62,8 @@ enum Commands {
         active: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        all: bool,
     },
     Scan {
         #[arg(long)]
@@ -78,6 +84,8 @@ enum Commands {
         include_active: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        all: bool,
     },
     Daemon {
         #[arg(long)]
@@ -125,14 +133,19 @@ fn execute(cli: Cli) -> Result<()> {
             print!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Commands::Status { config, state_dir } => status(config, state_dir),
+        Commands::Status {
+            config,
+            state_dir,
+            refresh,
+        } => status(config, state_dir, refresh),
         Commands::Projects {
             config,
             state_dir,
             risky,
             active,
             json,
-        } => projects(config, state_dir, risky, active, json),
+            all,
+        } => projects(config, state_dir, risky, active, json, all),
         Commands::Scan { config, state_dir } => scan(config, state_dir),
         Commands::Run {
             config,
@@ -141,6 +154,7 @@ fn execute(cli: Cli) -> Result<()> {
             include_managed_cache,
             include_active,
             force,
+            all,
         } => run_once(
             config,
             state_dir,
@@ -148,6 +162,7 @@ fn execute(cli: Cli) -> Result<()> {
             include_managed_cache,
             include_active,
             force,
+            all,
         ),
         Commands::Daemon { config, state_dir } => daemon(config, state_dir),
         Commands::Stats {
@@ -194,21 +209,33 @@ fn health(
     Ok(())
 }
 
-fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
-    let cfg = load_config(config_path)?;
+fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: bool) -> Result<()> {
     let store = open_store(state_dir.as_deref())?;
-    Cache::new(&store).sync_on_disk()?;
-    let safety = SafetyOptions {
-        target_quiet_period: cfg.target_quiet_period,
-        include_managed_cache: false,
-        include_active: false,
-        force: false,
-    };
-    let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
-    let projects = store.all_projects()?;
+    if refresh {
+        let cfg = load_config(config_path)?;
+        Cache::new(&store).sync_on_disk()?;
+        let safety = SafetyOptions {
+            target_quiet_period: cfg.target_quiet_period,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        };
+        project_reviews(&store, &safety, cfg.scan_interval, "status --refresh")?;
+    }
+
+    let cached_projects = store.project_count()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
-    print_review_summary("Status", &reviews);
-    println!("Cached projects: {}", projects.len());
+    println!("Status");
+    println!("Cached projects: {cached_projects}");
+    match store.last_review_status()? {
+        Some(review_status) => {
+            print_review_status(&review_status);
+        }
+        None => {
+            println!("Last review: <none>");
+            println!("Run `car-go-clean run --dry-run` or `car-go-clean status --refresh` to refresh safety status.");
+        }
+    }
     println!("Total bytes recovered (all time): {total}");
     match store.last_run() {
         Ok(run) => println!(
@@ -226,6 +253,7 @@ fn projects(
     risky: bool,
     active: bool,
     json: bool,
+    all: bool,
 ) -> Result<()> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
@@ -236,21 +264,27 @@ fn projects(
         include_active: active,
         force: false,
     };
-    let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
+    let reviews = project_reviews(&store, &safety, cfg.scan_interval, "projects")?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&reviews)?);
         return Ok(());
     }
 
-    for review in &reviews {
-        println!(
-            "{}\t{}\t{}\t{}",
-            decision_label(&review.decision),
-            class_label(review.class),
-            review.target_bytes,
-            review.path.display()
-        );
+    if all {
+        for review in &reviews {
+            println!(
+                "{}\t{}\t{}\t{}",
+                decision_label(&review.decision),
+                class_label(review.class),
+                review.target_bytes,
+                review.path.display()
+            );
+        }
+    } else {
+        print_review_summary("Projects", &reviews);
+        print_skip_breakdown(&review_summary(&reviews));
+        print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, false);
     }
     Ok(())
 }
@@ -274,6 +308,7 @@ fn run_once(
     include_managed_cache: bool,
     include_active: bool,
     force: bool,
+    all: bool,
 ) -> Result<()> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
@@ -289,9 +324,10 @@ fn run_once(
 
     if dry_run {
         Cache::new(&store).sync_on_disk()?;
-        let reviews = project_reviews(&store, &safety, cfg.scan_interval)?;
+        let reviews = project_reviews(&store, &safety, cfg.scan_interval, "dry-run")?;
         print_review_summary("Dry run", &reviews);
-        print_cleanable_targets(&reviews);
+        print_skip_breakdown(&review_summary(&reviews));
+        print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, all);
         return Ok(());
     }
 
@@ -309,6 +345,7 @@ fn project_reviews(
     store: &Store,
     safety: &SafetyOptions,
     scan_interval: Duration,
+    source: &str,
 ) -> Result<Vec<ProjectReview>> {
     let now = SystemTime::now();
     let projects = store.all_projects()?;
@@ -335,37 +372,94 @@ fn project_reviews(
         })
         .collect::<Result<Vec<_>>>()?;
     record_review_diagnostics(store, &reviews)?;
+    store.record_review_status(now, source, &review_summary(&reviews))?;
     Ok(reviews)
 }
 
 fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
     let summary = review_summary(reviews);
     println!("{label}");
+    print_summary_counts(&summary);
+}
+
+fn print_review_status(status: &crate::store::ReviewStatus) {
+    let reviewed_age = SystemTime::now()
+        .duration_since(status.reviewed_at)
+        .unwrap_or_default();
+    println!(
+        "Last review: {} ago",
+        humantime::format_duration(reviewed_age)
+    );
+    println!("Source: {}", status.source);
+    print_summary_counts(&status.summary);
+    print_skip_breakdown(&status.summary);
+}
+
+fn print_summary_counts(summary: &crate::safety::ReviewSummary) {
     println!("Total projects: {}", summary.total_projects);
     println!("Cleanable projects: {}", summary.cleanable_projects);
     println!("Skipped projects: {}", summary.skipped_projects);
     println!("Cleanable bytes: {}", summary.cleanable_bytes);
 }
 
-fn print_cleanable_targets(reviews: &[ProjectReview]) {
-    if !reviews
-        .iter()
-        .any(|review| review.decision == CleanDecision::Cleanable)
-    {
+fn print_skip_breakdown(summary: &crate::safety::ReviewSummary) {
+    if summary.skipped_projects == 0 {
         return;
     }
 
-    println!("Cleanable targets:");
-    for review in reviews
+    let mut parts = Vec::new();
+    if summary.no_target > 0 {
+        parts.push(format!("no_target={}", summary.no_target));
+    }
+    if summary.active_recent_write > 0 {
+        parts.push(format!("recent_write={}", summary.active_recent_write));
+    }
+    if summary.active_process > 0 {
+        parts.push(format!("active_process={}", summary.active_process));
+    }
+    if summary.managed_cache > 0 {
+        parts.push(format!("managed_cache={}", summary.managed_cache));
+    }
+    if summary.container_storage > 0 {
+        parts.push(format!("container_storage={}", summary.container_storage));
+    }
+    if summary.scan_error > 0 {
+        parts.push(format!("scan_error={}", summary.scan_error));
+    }
+    if summary.target_read_error > 0 {
+        parts.push(format!("target_read_error={}", summary.target_read_error));
+    }
+    if !parts.is_empty() {
+        println!("Skipped breakdown: {}", parts.join(", "));
+    }
+}
+
+fn print_cleanable_target_preview(reviews: &[ProjectReview], limit: usize, all: bool) {
+    let cleanable: Vec<_> = reviews
         .iter()
         .filter(|review| review.decision == CleanDecision::Cleanable)
-    {
+        .collect();
+    if cleanable.is_empty() {
+        return;
+    }
+
+    let shown = if all {
+        cleanable.len()
+    } else {
+        cleanable.len().min(limit)
+    };
+    println!("Cleanable target preview:");
+    for review in cleanable.iter().take(shown) {
         println!(
             "  {}\t{}\t{}",
             review.target_bytes,
             review.target_path.display(),
             review.path.display()
         );
+    }
+    if shown < cleanable.len() {
+        println!("Use `projects --all` to show all {} rows.", reviews.len());
+        println!("Use `run --dry-run --all` to show all cleanable targets.");
     }
 }
 

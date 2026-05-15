@@ -209,6 +209,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         }
 
         let skipped = review_summary(&reviews).skipped_projects as i64 + cleaner_skipped;
+        self.store
+            .record_review_status(started, "run", &review_summary(&reviews))?;
         self.store.finish_run(
             run_id,
             SystemTime::now(),

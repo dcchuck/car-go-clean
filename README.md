@@ -63,15 +63,20 @@ The default `target_quiet_period` is `2h`.
 
 Use these commands to review or override the default policy:
 
-- `car-go-clean run --dry-run` prints the clean summary and exact target list
-  without deleting any `target/` directories.
+- `car-go-clean run --dry-run` refreshes the safety review, prints a compact
+  summary and target preview, and does not delete any `target/` directories.
+- `car-go-clean run --dry-run --all` prints every cleanable target path.
 - `car-go-clean run --include-managed-cache` includes known managed cache and
   container storage paths in the review policy.
 - `car-go-clean run --include-active` includes projects with active process
   matches in the review policy.
 - `car-go-clean run --force` bypasses policy gates except the direct,
   readable `project/target` requirement.
-- `car-go-clean projects` lists cached projects and decisions.
+- `car-go-clean status` reports the last saved safety review without doing a
+  live filesystem/process review.
+- `car-go-clean status --refresh` recomputes and saves the safety review.
+- `car-go-clean projects` refreshes the review and prints a compact summary.
+- `car-go-clean projects --all` prints every cached project decision.
 - `car-go-clean projects --risky` previews decisions with managed cache and
   container storage paths included.
 - `car-go-clean projects --active` previews decisions with active process paths
@@ -88,8 +93,8 @@ Use these commands to review or override the default policy:
 | `car-go-clean scan` | Refresh the project cache. |
 | `car-go-clean run` | Run one clean cycle now. |
 | `car-go-clean health` | Validate config, Cargo availability, and state DB access. |
-| `car-go-clean status` | Show safe cleaning summary and last run summary. |
-| `car-go-clean projects` | Show cached projects with cleanable/skipped decisions. |
+| `car-go-clean status` | Show cached project count, last saved safety review, and last run summary. |
+| `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |
 | `car-go-clean stats` | Show recovered bytes and top projects. |
 | `car-go-clean logs` | Tail logs or show recent stored errors. |
 | `car-go-clean config` | Print effective config. |
@@ -111,21 +116,25 @@ mise exec rust@1.95.0 -- cargo install --path . --force
 car-go-clean health --skip-cargo
 car-go-clean scan
 car-go-clean status
-car-go-clean projects | head -50
-car-go-clean projects --json > /tmp/car-go-clean-projects.json
 car-go-clean run --dry-run
+car-go-clean status
+car-go-clean projects
+car-go-clean projects --all
+car-go-clean projects --json > /tmp/car-go-clean-projects.json
 car-go-clean logs --errors-only
 ```
 
 Validation points:
 
-- `status` should show cached project count, cleanable project count, skipped
-  project count, and cleanable bytes.
-- `projects` should show why each cached project is cleanable or skipped.
+- `status` should be fast; before the first review it reports `Last review:
+  <none>`, and after `run --dry-run` it reports the saved review summary.
+- `projects` should show a compact summary by default.
+- `projects --all` should show why each cached project is cleanable or skipped.
 - Unreadable directories such as protected macOS library folders should appear
   in `logs --errors-only`.
-- `run --dry-run` should list cleanable target paths and should not delete any
-  `target/` directories.
+- `run --dry-run` should list a cleanable target preview and should not delete
+  any `target/` directories.
+- `run --dry-run --all` should list every cleanable target.
 - A real `run` should clean only rows reported as `cleanable` by the same
   review policy.
 

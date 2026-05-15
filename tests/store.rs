@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use car_go_clean::safety::ReviewSummary;
 use car_go_clean::store::{CleanEvent, ErrorRecord, Store};
 
 fn test_store(path: &Path) -> Store {
@@ -21,6 +22,7 @@ fn open_creates_file_and_migrations_create_tables() {
     assert!(store.table_exists("clean_events").unwrap());
     assert!(store.table_exists("errors").unwrap());
     assert!(store.table_exists("runs").unwrap());
+    assert!(store.table_exists("review_status").unwrap());
 }
 
 #[test]
@@ -130,4 +132,57 @@ fn scan_error_paths_since_returns_only_scan_paths() {
             .unwrap(),
         vec![std::path::PathBuf::from("/tmp/blocked")]
     );
+}
+
+#[test]
+fn records_latest_review_status_snapshot() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
+
+    store
+        .record_review_status(
+            t0,
+            "projects",
+            &ReviewSummary {
+                total_projects: 2,
+                cleanable_projects: 1,
+                skipped_projects: 1,
+                cleanable_bytes: 512,
+                active_recent_write: 0,
+                active_process: 1,
+                managed_cache: 0,
+                container_storage: 0,
+                scan_error: 0,
+                no_target: 0,
+                target_read_error: 0,
+            },
+        )
+        .unwrap();
+    store
+        .record_review_status(
+            t1,
+            "dry-run",
+            &ReviewSummary {
+                total_projects: 3,
+                cleanable_projects: 2,
+                skipped_projects: 1,
+                cleanable_bytes: 1024,
+                active_recent_write: 1,
+                active_process: 0,
+                managed_cache: 0,
+                container_storage: 0,
+                scan_error: 0,
+                no_target: 0,
+                target_read_error: 0,
+            },
+        )
+        .unwrap();
+
+    let status = store.last_review_status().unwrap().unwrap();
+    assert_eq!(status.reviewed_at, t1);
+    assert_eq!(status.source, "dry-run");
+    assert_eq!(status.summary.total_projects, 3);
+    assert_eq!(status.summary.cleanable_projects, 2);
+    assert_eq!(status.summary.cleanable_bytes, 1024);
 }

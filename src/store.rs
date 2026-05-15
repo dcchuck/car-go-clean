@@ -1,3 +1,4 @@
+use crate::safety::ReviewSummary;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -55,6 +56,13 @@ pub struct ProjectBytes {
     pub bytes: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewStatus {
+    pub reviewed_at: SystemTime,
+    pub source: String,
+    pub summary: ReviewSummary,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -82,49 +90,71 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        if current >= 1 {
-            return Ok(());
+        if current < 1 {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS projects (
+                    path TEXT PRIMARY KEY,
+                    discovered_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    last_cleaned_at INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER,
+                    projects_cleaned INTEGER NOT NULL DEFAULT 0,
+                    bytes_recovered INTEGER NOT NULL DEFAULT 0,
+                    errors_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS clean_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    ts INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    bytes_before INTEGER NOT NULL,
+                    bytes_after INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    exit_code INTEGER NOT NULL DEFAULT 0,
+                    stderr_excerpt TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS errors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    path TEXT,
+                    message TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_clean_events_ts ON clean_events(ts);
+                CREATE INDEX IF NOT EXISTS idx_errors_ts ON errors(ts);
+                CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
+                INSERT INTO schema_version (version) VALUES (1);
+                ",
+            )?;
         }
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS projects (
-                path TEXT PRIMARY KEY,
-                discovered_at INTEGER NOT NULL,
-                last_seen_at INTEGER NOT NULL,
-                last_cleaned_at INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at INTEGER NOT NULL,
-                finished_at INTEGER,
-                projects_cleaned INTEGER NOT NULL DEFAULT 0,
-                bytes_recovered INTEGER NOT NULL DEFAULT 0,
-                errors_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS clean_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL REFERENCES runs(id),
-                ts INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                bytes_before INTEGER NOT NULL,
-                bytes_after INTEGER NOT NULL,
-                duration_ms INTEGER NOT NULL DEFAULT 0,
-                exit_code INTEGER NOT NULL DEFAULT 0,
-                stderr_excerpt TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS errors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                path TEXT,
-                message TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_clean_events_ts ON clean_events(ts);
-            CREATE INDEX IF NOT EXISTS idx_errors_ts ON errors(ts);
-            CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
-            INSERT INTO schema_version (version) VALUES (1);
-            ",
-        )?;
+        if current < 2 {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS review_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    reviewed_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    total_projects INTEGER NOT NULL,
+                    cleanable_projects INTEGER NOT NULL,
+                    skipped_projects INTEGER NOT NULL,
+                    cleanable_bytes INTEGER NOT NULL,
+                    active_recent_write INTEGER NOT NULL,
+                    active_process INTEGER NOT NULL,
+                    managed_cache INTEGER NOT NULL,
+                    container_storage INTEGER NOT NULL,
+                    scan_error INTEGER NOT NULL,
+                    no_target INTEGER NOT NULL,
+                    target_read_error INTEGER NOT NULL
+                );
+                INSERT INTO schema_version (version) VALUES (2);
+                ",
+            )?;
+        }
         Ok(())
     }
 
@@ -184,6 +214,13 @@ impl Store {
             })
         })?;
         collect_rows(rows)
+    }
+
+    pub fn project_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn start_run(&self, started_at: SystemTime) -> Result<i64> {
@@ -351,6 +388,89 @@ impl Store {
         })?;
         collect_rows(rows)
     }
+
+    pub fn record_review_status(
+        &self,
+        reviewed_at: SystemTime,
+        source: &str,
+        summary: &ReviewSummary,
+    ) -> Result<()> {
+        self.conn.execute(
+            "
+            INSERT INTO review_status (
+                id, reviewed_at, source, total_projects, cleanable_projects, skipped_projects,
+                cleanable_bytes, active_recent_write, active_process, managed_cache,
+                container_storage, scan_error, no_target, target_read_error
+            )
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(id) DO UPDATE SET
+                reviewed_at = excluded.reviewed_at,
+                source = excluded.source,
+                total_projects = excluded.total_projects,
+                cleanable_projects = excluded.cleanable_projects,
+                skipped_projects = excluded.skipped_projects,
+                cleanable_bytes = excluded.cleanable_bytes,
+                active_recent_write = excluded.active_recent_write,
+                active_process = excluded.active_process,
+                managed_cache = excluded.managed_cache,
+                container_storage = excluded.container_storage,
+                scan_error = excluded.scan_error,
+                no_target = excluded.no_target,
+                target_read_error = excluded.target_read_error
+            ",
+            params![
+                to_epoch(reviewed_at)?,
+                source,
+                summary.total_projects as i64,
+                summary.cleanable_projects as i64,
+                summary.skipped_projects as i64,
+                i64::try_from(summary.cleanable_bytes).unwrap_or(i64::MAX),
+                summary.active_recent_write as i64,
+                summary.active_process as i64,
+                summary.managed_cache as i64,
+                summary.container_storage as i64,
+                summary.scan_error as i64,
+                summary.no_target as i64,
+                summary.target_read_error as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_review_status(&self) -> Result<Option<ReviewStatus>> {
+        self.conn
+            .query_row(
+                "
+                SELECT reviewed_at, source, total_projects, cleanable_projects, skipped_projects,
+                    cleanable_bytes, active_recent_write, active_process, managed_cache,
+                    container_storage, scan_error, no_target, target_read_error
+                FROM review_status
+                WHERE id = 1
+                ",
+                [],
+                |row| {
+                    Ok(ReviewStatus {
+                        reviewed_at: from_epoch(row.get(0)?),
+                        source: row.get(1)?,
+                        summary: ReviewSummary {
+                            total_projects: to_usize(row.get(2)?),
+                            cleanable_projects: to_usize(row.get(3)?),
+                            skipped_projects: to_usize(row.get(4)?),
+                            cleanable_bytes: to_u64(row.get(5)?),
+                            active_recent_write: to_usize(row.get(6)?),
+                            active_process: to_usize(row.get(7)?),
+                            managed_cache: to_usize(row.get(8)?),
+                            container_storage: to_usize(row.get(9)?),
+                            scan_error: to_usize(row.get(10)?),
+                            no_target: to_usize(row.get(11)?),
+                            target_read_error: to_usize(row.get(12)?),
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -384,6 +504,14 @@ fn to_epoch(time: SystemTime) -> Result<i64> {
 
 fn from_epoch(secs: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64)
+}
+
+fn to_usize(value: i64) -> usize {
+    value.max(0) as usize
+}
+
+fn to_u64(value: i64) -> u64 {
+    value.max(0) as u64
 }
 
 #[allow(dead_code)]
