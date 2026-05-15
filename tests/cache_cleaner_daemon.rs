@@ -115,12 +115,17 @@ fn daemon_scan_and_run_cycle_record_state() {
         Cache::new(&store),
         scanner,
         cleaner,
-        DaemonOptions::default(),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(24 * 60 * 60),
+            scan_interval: Duration::from_secs(7 * 24 * 60 * 60),
+            target_quiet_period: Duration::from_millis(1),
+        },
     );
 
     daemon.scan_cycle().unwrap();
     assert_eq!(store.all_projects().unwrap().len(), 1);
 
+    std::thread::sleep(Duration::from_millis(10));
     daemon.run_cycle().unwrap();
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
@@ -158,20 +163,9 @@ fn daemon_run_cycle_skips_recent_targets_by_default() {
         DaemonOptions::default(),
     );
 
-    let result = daemon
-        .run_cycle_with_safety(
-            SafetyOptions {
-                target_quiet_period: Duration::from_secs(2 * 60 * 60),
-                include_managed_cache: false,
-                include_active: false,
-                force: false,
-            },
-            &NoopProcessInspector,
-        )
-        .unwrap();
+    daemon.run_cycle().unwrap();
 
-    assert_eq!(result.cleaned, 0);
-    assert_eq!(result.skipped, 1);
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 
@@ -260,6 +254,7 @@ fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
         DaemonOptions {
             clean_interval: Duration::from_secs(60),
             scan_interval: Duration::from_secs(1),
+            target_quiet_period: Duration::from_secs(2 * 60 * 60),
         },
     );
 
@@ -309,6 +304,7 @@ fn daemon_shutdown_flag_stops_forever_loop_after_initial_scan() {
         DaemonOptions {
             clean_interval: Duration::from_millis(1),
             scan_interval: Duration::from_secs(60),
+            target_quiet_period: Duration::from_secs(2 * 60 * 60),
         },
     );
     let shutdown = ShutdownFlag::new();

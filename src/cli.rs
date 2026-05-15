@@ -454,6 +454,7 @@ fn daemon_for_scan<'a>(store: &'a Store, cfg: &Config) -> Daemon<'a, RealRunner>
         DaemonOptions {
             clean_interval: cfg.clean_interval,
             scan_interval: cfg.scan_interval,
+            target_quiet_period: cfg.target_quiet_period,
         },
     )
 }
@@ -471,6 +472,7 @@ fn daemon_for_clean<'a>(
         DaemonOptions {
             clean_interval: cfg.clean_interval,
             scan_interval: cfg.scan_interval,
+            target_quiet_period: cfg.target_quiet_period,
         },
     )
 }

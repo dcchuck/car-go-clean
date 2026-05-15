@@ -45,6 +45,7 @@ impl Default for ShutdownFlag {
 pub struct DaemonOptions {
     pub clean_interval: Duration,
     pub scan_interval: Duration,
+    pub target_quiet_period: Duration,
 }
 
 impl Default for DaemonOptions {
@@ -52,6 +53,7 @@ impl Default for DaemonOptions {
         Self {
             clean_interval: Duration::from_secs(24 * 60 * 60),
             scan_interval: Duration::from_secs(7 * 24 * 60 * 60),
+            target_quiet_period: Duration::from_secs(2 * 60 * 60),
         }
     }
 }
@@ -118,12 +120,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 
     pub fn run_cycle(&self) -> Result<()> {
         let opts = SafetyOptions {
-            target_quiet_period: Duration::ZERO,
-            include_managed_cache: true,
-            include_active: true,
-            force: true,
+            target_quiet_period: self.opts.target_quiet_period,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
         };
-        self.run_cycle_with_safety(opts, &crate::activity::NoopProcessInspector)?;
+        self.run_cycle_with_safety(opts, &crate::activity::SysinfoProcessInspector)?;
         Ok(())
     }
 
