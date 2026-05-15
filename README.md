@@ -55,7 +55,7 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 - The newest non-symlink file under `target/` is at least
   `target_quiet_period` old.
 - The project is not under a known managed cache or container storage path.
-- The latest scan did not record a related unreadable path for the project.
+- No recent scan recorded a related unreadable path for the project.
 - No running process has a cwd or command argument inside the project or
   `target/`.
 

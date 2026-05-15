@@ -61,7 +61,37 @@ pub fn process_matches_project(cwd: Option<&Path>, args: &[PathBuf], project: &P
 
     let target = project.join("target");
     args.iter()
-        .any(|arg| path_is_within(arg, project) || path_is_within(arg, &target))
+        .any(|arg| argument_references_path(arg, project) || argument_references_path(arg, &target))
+}
+
+fn argument_references_path(arg: &Path, root: &Path) -> bool {
+    if path_is_within(arg, root) {
+        return true;
+    }
+
+    let arg = arg.to_string_lossy();
+    let root = root.to_string_lossy();
+    contains_path_prefix(&arg, &root)
+}
+
+fn contains_path_prefix(value: &str, root: &str) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    let mut rest = value;
+    while let Some(offset) = rest.find(root) {
+        let after = &rest[offset + root.len()..];
+        if after
+            .chars()
+            .next()
+            .is_none_or(|ch| ch == '/' || ch == '\\')
+        {
+            return true;
+        }
+        let advance = after.chars().next().map(char::len_utf8).unwrap_or(0);
+        rest = &after[advance..];
+    }
+    false
 }
 
 pub fn activity_signals_for_process(

@@ -143,7 +143,6 @@ pub fn review_project(
 
     let target_bytes = match directory_size(&target_path) {
         Ok(bytes) => bytes,
-        Err(_) if opts.force => 0,
         Err(_) => {
             return Ok(review(
                 project,

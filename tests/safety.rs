@@ -101,7 +101,25 @@ fn process_command_arguments_can_match_project_or_target_paths() {
     let args = vec![PathBuf::from("/Users/me/src/app/target/debug/server")];
     assert!(process_matches_project(None, &args, project));
 
+    let args = vec![PathBuf::from(
+        "--manifest-path=/Users/me/src/app/Cargo.toml",
+    )];
+    assert!(process_matches_project(None, &args, project));
+
+    let args = vec![PathBuf::from("--target-dir=/Users/me/src/app/target")];
+    assert!(process_matches_project(None, &args, project));
+
     let args = vec![PathBuf::from("/Users/me/src/application")];
+    assert!(!process_matches_project(None, &args, project));
+
+    let args = vec![PathBuf::from(
+        "--manifest-path=/Users/me/src/application/Cargo.toml",
+    )];
+    assert!(!process_matches_project(None, &args, project));
+
+    let args = vec![PathBuf::from(
+        "--manifest-path=/Users/me/src/app\u{00e9}/Cargo.toml",
+    )];
     assert!(!process_matches_project(None, &args, project));
 }
 
@@ -155,6 +173,28 @@ fn symlinked_target_is_skipped_as_missing_target() {
     assert_eq!(
         review.decision,
         CleanDecision::Skipped(SkipReason::NoTarget)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_target_is_skipped_even_with_force() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let target = project.path().join("target");
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&target.join("debug/blob.bin"), &[0; 4096]);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut opts = options();
+    opts.force = true;
+    let review = review_project(project.path(), &[], &[], SystemTime::now(), &opts).unwrap();
+
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::TargetReadError)
     );
 }
 
