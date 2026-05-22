@@ -19,8 +19,11 @@ fn launchd_plist_runs_daemon_with_configurable_paths() {
     let plist = repo_file("packaging/launchd/com.dcchuck.car-go-clean.plist");
 
     assert!(plist.contains("<key>ProgramArguments</key>"));
-    assert!(plist.contains("car-go-clean"));
+    assert!(plist.contains("/Users/charlesdanielsson/.cargo/bin/car-go-clean"));
     assert!(plist.contains("daemon"));
+    assert!(!plist.contains("/usr/local/bin/car-go-clean"));
+    assert!(!plist.contains("/tmp/car-go-clean.launchd"));
+    assert!(plist.contains("/Users/charlesdanielsson/Library/Logs/car-go-clean"));
 }
 
 #[test]

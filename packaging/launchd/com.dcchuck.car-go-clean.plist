@@ -7,7 +7,7 @@
   <string>com.dcchuck.car-go-clean</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/car-go-clean</string>
+    <string>/Users/charlesdanielsson/.cargo/bin/car-go-clean</string>
     <string>daemon</string>
   </array>
   <key>RunAtLoad</key>
@@ -15,8 +15,8 @@
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/car-go-clean.launchd.out.log</string>
+  <string>/Users/charlesdanielsson/Library/Logs/car-go-clean/car-go-clean.launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/car-go-clean.launchd.err.log</string>
+  <string>/Users/charlesdanielsson/Library/Logs/car-go-clean/car-go-clean.launchd.err.log</string>
 </dict>
 </plist>
