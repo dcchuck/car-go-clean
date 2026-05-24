@@ -413,8 +413,14 @@ fn status_prints_safe_cleaning_summary() {
         .success()
         .stdout(contains("Last review:"))
         .stdout(contains("Source: dry-run"))
+        .stdout(contains("Cache"))
+        .stdout(contains("Review"))
+        .stdout(contains("Recovery"))
+        .stdout(contains("Schedule"))
         .stdout(contains("Cleanable projects: 1"))
-        .stdout(contains("Cleanable bytes:"));
+        .stdout(contains("Cleanable bytes: 16.0 KiB"))
+        .stdout(predicate::str::contains("16,384 B").not())
+        .stdout(contains("Total bytes recovered (all time): 0 B"));
 }
 
 #[test]
@@ -496,10 +502,10 @@ fn status_prints_scheduler_timing() {
         .arg(&state)
         .assert()
         .success()
-        .stdout(contains("Clean interval: 1h"))
+        .stdout(contains("Clean interval: 1 hour"))
         .stdout(contains("Scheduler state: recorded"))
         .stdout(contains("Next scheduled clean: overdue by"))
-        .stdout(contains("Scan interval: 2h"))
+        .stdout(contains("Scan interval: 2 hours"))
         .stdout(contains("Next scheduled scan: in"));
 }
 

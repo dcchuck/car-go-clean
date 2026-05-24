@@ -14,11 +14,133 @@ use crate::store::{ErrorRecord, Store};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_PREVIEW_LIMIT: usize = 20;
+
+fn print_heading(label: &str) {
+    if color_enabled() {
+        println!("\x1b[1;36m{label}\x1b[0m");
+    } else {
+        println!("{label}");
+    }
+}
+
+fn print_section(label: &str) {
+    if color_enabled() {
+        println!("\n\x1b[1;34m{label}\x1b[0m");
+    } else {
+        println!("\n{label}");
+    }
+}
+
+fn print_row(label: &str, value: impl AsRef<str>) {
+    println!("  {label}: {}", value.as_ref());
+}
+
+fn color_enabled() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn format_count(value: usize) -> String {
+    format_unsigned(value as u128)
+}
+
+fn format_count_i64(value: i64) -> String {
+    if value < 0 {
+        format!("-{}", format_unsigned(value.unsigned_abs() as u128))
+    } else {
+        format_unsigned(value as u128)
+    }
+}
+
+fn format_count_u64(value: u64) -> String {
+    format_unsigned(value as u128)
+}
+
+fn format_unsigned(mut value: u128) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+
+    let mut groups = Vec::new();
+    loop {
+        groups.push(format!("{:03}", value % 1000));
+        value /= 1000;
+        if value == 0 {
+            break;
+        }
+    }
+    let Some(last) = groups.last_mut() else {
+        return "0".to_string();
+    };
+    *last = last.trim_start_matches('0').to_string();
+    groups.reverse();
+    groups.join(",")
+}
+
+fn format_bytes_i64(value: i64) -> String {
+    if value < 0 {
+        format!("-{}", format_bytes_u64(value.unsigned_abs()))
+    } else {
+        format_bytes_u64(value as u64)
+    }
+}
+
+fn format_bytes_u64(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{} B", format_count_u64(bytes));
+    }
+
+    let mut amount = bytes as f64;
+    let mut unit = "B";
+    for candidate in ["KiB", "MiB", "GiB", "TiB"] {
+        amount /= 1024.0;
+        unit = candidate;
+        if amount < 1024.0 {
+            break;
+        }
+    }
+    format!("{amount:.1} {unit}")
+}
+
+fn format_duration_display(duration: Duration) -> String {
+    let mut remaining = duration.as_secs();
+    if remaining == 0 {
+        return if duration.subsec_millis() > 0 {
+            format!("{} ms", duration.subsec_millis())
+        } else {
+            "0 seconds".to_string()
+        };
+    }
+
+    let mut parts = Vec::new();
+    for (unit, seconds) in [
+        ("day", 24 * 60 * 60),
+        ("hour", 60 * 60),
+        ("minute", 60),
+        ("second", 1),
+    ] {
+        let count = remaining / seconds;
+        if count == 0 {
+            continue;
+        }
+        remaining %= seconds;
+        parts.push(format!(
+            "{} {}{}",
+            format_count_u64(count),
+            unit,
+            if count == 1 { "" } else { "s" }
+        ));
+        if parts.len() == 3 {
+            break;
+        }
+    }
+
+    parts.join(" ")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "car-go-clean")]
@@ -225,25 +347,42 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: boo
 
     let cached_projects = store.project_count()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
-    println!("Status");
-    println!("Cached projects: {cached_projects}");
+
+    print_heading("Status");
+    print_section("Cache");
+    print_row("Cached projects", format_count(cached_projects));
+
+    print_section("Review");
     match store.last_review_status()? {
         Some(review_status) => {
             print_review_status(&review_status);
         }
         None => {
-            println!("Last review: <none>");
-            println!("Run `car-go-clean run --dry-run` or `car-go-clean status --refresh` to refresh safety status.");
+            print_row("Last review", "<none>");
+            print_row(
+                "Refresh",
+                "run `car-go-clean run --dry-run` or `car-go-clean status --refresh`",
+            );
         }
     }
-    println!("Total bytes recovered (all time): {total}");
+
+    print_section("Recovery");
+    print_row("Total bytes recovered (all time)", format_bytes_i64(total));
     match store.last_run() {
-        Ok(run) => println!(
-            "Last run: id={} cleaned={} recovered={} errors={}",
-            run.id, run.projects_cleaned, run.bytes_recovered, run.errors_count
+        Ok(run) => print_row(
+            "Last run",
+            format!(
+                "id={} cleaned={} recovered={} errors={}",
+                run.id,
+                format_count_i64(run.projects_cleaned),
+                format_bytes_i64(run.bytes_recovered),
+                format_count_i64(run.errors_count)
+            ),
         ),
-        Err(_) => println!("Last run: <none>"),
+        Err(_) => print_row("Last run", "<none>"),
     }
+
+    print_section("Schedule");
     print_scheduler_status(&store, &cfg)?;
     Ok(())
 }
@@ -387,46 +526,46 @@ fn print_review_status(status: &crate::store::ReviewStatus) {
     let reviewed_age = SystemTime::now()
         .duration_since(status.reviewed_at)
         .unwrap_or_default();
-    println!(
-        "Last review: {} ago",
-        humantime::format_duration(reviewed_age)
+    print_row(
+        "Last review",
+        format!("{} ago", format_duration_display(reviewed_age)),
     );
-    println!("Source: {}", review_source_label(&status.source));
+    print_row("Source", review_source_label(&status.source));
     print_summary_counts(&status.summary);
     print_skip_breakdown(&status.summary);
 }
 
 fn print_scheduler_status(store: &Store, cfg: &Config) -> Result<()> {
-    println!(
-        "Clean interval: {}",
-        humantime::format_duration(cfg.clean_interval)
+    print_row(
+        "Clean interval",
+        format_duration_display(cfg.clean_interval),
     );
-    println!(
-        "Scan interval: {}",
-        humantime::format_duration(cfg.scan_interval)
-    );
+    print_row("Scan interval", format_duration_display(cfg.scan_interval));
     match store.scheduler_status()? {
         Some(status) => {
             let now = SystemTime::now();
-            println!(
-                "Scheduler state: recorded {} ago",
-                humantime::format_duration(
-                    now.duration_since(status.updated_at).unwrap_or_default()
-                )
+            print_row(
+                "Scheduler state",
+                format!(
+                    "recorded {} ago",
+                    format_duration_display(
+                        now.duration_since(status.updated_at).unwrap_or_default(),
+                    )
+                ),
             );
-            println!(
-                "Next scheduled clean: {}",
-                schedule_time_label(status.next_clean_at, now)
+            print_row(
+                "Next scheduled clean",
+                schedule_time_label(status.next_clean_at, now),
             );
-            println!(
-                "Next scheduled scan: {}",
-                schedule_time_label(status.next_scan_at, now)
+            print_row(
+                "Next scheduled scan",
+                schedule_time_label(status.next_scan_at, now),
             );
         }
         None => {
-            println!("Scheduler state: <not recorded>");
-            println!("Next scheduled clean: <not recorded>");
-            println!("Next scheduled scan: <not recorded>");
+            print_row("Scheduler state", "<not recorded>");
+            print_row("Next scheduled clean", "<not recorded>");
+            print_row("Next scheduled scan", "<not recorded>");
         }
     }
     Ok(())
@@ -434,10 +573,10 @@ fn print_scheduler_status(store: &Store, cfg: &Config) -> Result<()> {
 
 fn schedule_time_label(when: SystemTime, now: SystemTime) -> String {
     match when.duration_since(now) {
-        Ok(remaining) => format!("in {}", humantime::format_duration(remaining)),
+        Ok(remaining) => format!("in {}", format_duration_display(remaining)),
         Err(_) => {
             let overdue = now.duration_since(when).unwrap_or_default();
-            format!("overdue by {}", humantime::format_duration(overdue))
+            format!("overdue by {}", format_duration_display(overdue))
         }
     }
 }
@@ -451,10 +590,13 @@ fn review_source_label(source: &str) -> String {
 }
 
 fn print_summary_counts(summary: &crate::safety::ReviewSummary) {
-    println!("Total projects: {}", summary.total_projects);
-    println!("Cleanable projects: {}", summary.cleanable_projects);
-    println!("Skipped projects: {}", summary.skipped_projects);
-    println!("Cleanable bytes: {}", summary.cleanable_bytes);
+    print_row("Total projects", format_count(summary.total_projects));
+    print_row(
+        "Cleanable projects",
+        format_count(summary.cleanable_projects),
+    );
+    print_row("Skipped projects", format_count(summary.skipped_projects));
+    print_row("Cleanable bytes", format_bytes_u64(summary.cleanable_bytes));
 }
 
 fn print_skip_breakdown(summary: &crate::safety::ReviewSummary) {
@@ -485,7 +627,7 @@ fn print_skip_breakdown(summary: &crate::safety::ReviewSummary) {
         parts.push(format!("target_read_error={}", summary.target_read_error));
     }
     if !parts.is_empty() {
-        println!("Skipped breakdown: {}", parts.join(", "));
+        print_row("Skipped breakdown", parts.join(", "));
     }
 }
 
