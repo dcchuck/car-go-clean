@@ -63,6 +63,13 @@ pub struct ReviewStatus {
     pub summary: ReviewSummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerStatus {
+    pub updated_at: SystemTime,
+    pub next_clean_at: SystemTime,
+    pub next_scan_at: SystemTime,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -152,6 +159,19 @@ impl Store {
                     target_read_error INTEGER NOT NULL
                 );
                 INSERT INTO schema_version (version) VALUES (2);
+                ",
+            )?;
+        }
+        if current < 3 {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS scheduler_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at INTEGER NOT NULL,
+                    next_clean_at INTEGER NOT NULL,
+                    next_scan_at INTEGER NOT NULL
+                );
+                INSERT INTO schema_version (version) VALUES (3);
                 ",
             )?;
         }
@@ -465,6 +485,51 @@ impl Store {
                             no_target: to_usize(row.get(11)?),
                             target_read_error: to_usize(row.get(12)?),
                         },
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn record_scheduler_status(
+        &self,
+        updated_at: SystemTime,
+        next_clean_at: SystemTime,
+        next_scan_at: SystemTime,
+    ) -> Result<()> {
+        self.conn.execute(
+            "
+            INSERT INTO scheduler_state (id, updated_at, next_clean_at, next_scan_at)
+            VALUES (1, ?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                next_clean_at = excluded.next_clean_at,
+                next_scan_at = excluded.next_scan_at
+            ",
+            params![
+                to_epoch(updated_at)?,
+                to_epoch(next_clean_at)?,
+                to_epoch(next_scan_at)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn scheduler_status(&self) -> Result<Option<SchedulerStatus>> {
+        self.conn
+            .query_row(
+                "
+                SELECT updated_at, next_clean_at, next_scan_at
+                FROM scheduler_state
+                WHERE id = 1
+                ",
+                [],
+                |row| {
+                    Ok(SchedulerStatus {
+                        updated_at: from_epoch(row.get(0)?),
+                        next_clean_at: from_epoch(row.get(1)?),
+                        next_scan_at: from_epoch(row.get(2)?),
                     })
                 },
             )

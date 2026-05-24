@@ -2,7 +2,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use car_go_clean::activity::NoopProcessInspector;
@@ -83,6 +84,11 @@ impl CommandRunner for FakeRunner {
 
 fn to_string(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
+}
+
+fn shutdown_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
 #[test]
@@ -276,6 +282,65 @@ fn daemon_logs_run_cycle_summary() {
 }
 
 #[test]
+fn daemon_uses_persisted_overdue_clean_schedule_after_restart() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&project, std::time::SystemTime::now())
+        .unwrap();
+    let now = std::time::SystemTime::now();
+    store
+        .record_scheduler_status(
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap(),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        cleaner,
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    let schedule = store.scheduler_status().unwrap().unwrap();
+    assert!(schedule.next_clean_at > now);
+}
+
+#[test]
 fn daemon_run_cycle_skips_recent_targets_by_default() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
@@ -420,6 +485,7 @@ fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
 
 #[test]
 fn daemon_shutdown_flag_stops_forever_loop_after_initial_scan() {
+    let _guard = shutdown_test_lock();
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
     write_file(&project.join("Cargo.toml"), b"[package]\n");

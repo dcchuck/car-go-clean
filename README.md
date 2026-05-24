@@ -93,7 +93,7 @@ Use these commands to review or override the default policy:
 | `car-go-clean scan` | Refresh the project cache. |
 | `car-go-clean run` | Run one clean cycle now. |
 | `car-go-clean health` | Validate config, Cargo availability, and state DB access. |
-| `car-go-clean status` | Show cached project count, last saved safety review, and last run summary. |
+| `car-go-clean status` | Show cached project count, last saved safety review, scheduler timing, and last run summary. |
 | `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |
 | `car-go-clean stats` | Show recovered bytes and top projects. |
 | `car-go-clean logs` | Tail logs or show recent stored errors. |
@@ -128,6 +128,8 @@ Validation points:
 
 - `status` should be fast; before the first review it reports `Last review:
   <none>`, and after `run --dry-run` it reports the saved review summary.
+- `status` should show `Clean interval`, `Scan interval`, and the next
+  scheduled clean/scan time once the daemon has recorded scheduler state.
 - `projects` should show a compact summary by default.
 - `projects --all` should show why each cached project is cleanable or skipped.
 - Unreadable directories such as protected macOS library folders should appear
@@ -147,6 +149,12 @@ the current user. Override those paths with `CAR_GO_CLEAN_BIN` or
 `CAR_GO_CLEAN_LOG_DIR` when needed.
 Release notes and distribution-channel decisions live in `packaging/release/`;
 the primary install path is currently `cargo install`.
+
+The daemon persists its next clean and scan times in the state database. On
+restart, it resumes from that stored schedule instead of waiting a full interval
+from process start. If no scheduler state exists yet, the daemon initializes the
+next clean from the last completed run plus `clean_interval`, or from startup
+plus `clean_interval` when there has never been a run.
 
 ## Development
 

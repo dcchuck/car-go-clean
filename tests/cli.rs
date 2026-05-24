@@ -1,8 +1,9 @@
 use assert_cmd::Command;
+use car_go_clean::store::Store;
 use predicates::prelude::*;
 use predicates::str::contains;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[test]
 fn version_prints_package_version() {
@@ -462,6 +463,44 @@ fn status_reports_no_review_before_explicit_review() {
         .stdout(contains("Cached projects: 1"))
         .stdout(contains("Last review: <none>"))
         .stdout(predicate::str::contains("Cleanable projects:").not());
+}
+
+#[test]
+fn status_prints_scheduler_timing() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        "clean_interval = \"1h\"\nscan_interval = \"2h\"\ntarget_quiet_period = \"1ms\"\n",
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::now();
+    store
+        .record_scheduler_status(
+            now,
+            now.checked_sub(Duration::from_secs(60)).unwrap(),
+            now + Duration::from_secs(3600),
+        )
+        .unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("status")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Clean interval: 1h"))
+        .stdout(contains("Scheduler state: recorded"))
+        .stdout(contains("Next scheduled clean: overdue by"))
+        .stdout(contains("Scan interval: 2h"))
+        .stdout(contains("Next scheduled scan: in"));
 }
 
 #[test]

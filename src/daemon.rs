@@ -4,7 +4,7 @@ use crate::cleaner::{Cleaner, CommandRunner};
 use crate::logging::Logger;
 use crate::safety::{review_project, review_summary, CleanDecision, SafetyOptions};
 use crate::scanner::Scanner;
-use crate::store::{CleanEvent, ErrorRecord, Store};
+use crate::store::{CleanEvent, ErrorRecord, SchedulerStatus, Store};
 use anyhow::Result;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -265,25 +265,66 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         if self.store.all_projects()?.is_empty() {
             self.scan_cycle()?;
         }
-        let mut last_scan = SystemTime::now();
+        let mut schedule = self.scheduler_status_or_initialize()?;
         while !shutdown.is_requested() {
-            if wait_for_interval_or_shutdown(self.opts.clean_interval, shutdown) {
+            let next_due = if schedule.next_clean_at <= schedule.next_scan_at {
+                schedule.next_clean_at
+            } else {
+                schedule.next_scan_at
+            };
+            if wait_until_or_shutdown(next_due, shutdown) {
                 break;
             }
-            self.run_cycle()?;
-            if last_scan.elapsed().unwrap_or_default() >= self.opts.scan_interval {
-                self.scan_cycle()?;
-                last_scan = SystemTime::now();
+
+            let now = SystemTime::now();
+            if now >= schedule.next_clean_at {
+                self.run_cycle()?;
+                schedule.next_clean_at = SystemTime::now() + self.opts.clean_interval;
             }
+            if now >= schedule.next_scan_at {
+                self.scan_cycle()?;
+                schedule.next_scan_at = SystemTime::now() + self.opts.scan_interval;
+            }
+            self.store.record_scheduler_status(
+                SystemTime::now(),
+                schedule.next_clean_at,
+                schedule.next_scan_at,
+            )?;
         }
         Ok(())
     }
+
+    fn scheduler_status_or_initialize(&self) -> Result<SchedulerStatus> {
+        if let Some(status) = self.store.scheduler_status()? {
+            return Ok(status);
+        }
+
+        let now = SystemTime::now();
+        let next_clean_at = self
+            .store
+            .last_run()
+            .ok()
+            .and_then(|run| run.finished_at)
+            .map(|finished_at| finished_at + self.opts.clean_interval)
+            .unwrap_or(now + self.opts.clean_interval);
+        let status = SchedulerStatus {
+            updated_at: now,
+            next_clean_at,
+            next_scan_at: now + self.opts.scan_interval,
+        };
+        self.store.record_scheduler_status(
+            status.updated_at,
+            status.next_clean_at,
+            status.next_scan_at,
+        )?;
+        Ok(status)
+    }
 }
 
-fn wait_for_interval_or_shutdown(interval: Duration, shutdown: &ShutdownFlag) -> bool {
-    if interval.is_zero() {
+fn wait_until_or_shutdown(deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
+    let Ok(interval) = deadline.duration_since(SystemTime::now()) else {
         return shutdown.is_requested();
-    }
+    };
     let started = Instant::now();
     while started.elapsed() < interval {
         if shutdown.is_requested() {

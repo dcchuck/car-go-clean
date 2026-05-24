@@ -210,9 +210,9 @@ fn health(
 }
 
 fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: bool) -> Result<()> {
+    let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
     if refresh {
-        let cfg = load_config(config_path)?;
         Cache::new(&store).sync_on_disk()?;
         let safety = SafetyOptions {
             target_quiet_period: cfg.target_quiet_period,
@@ -244,6 +244,7 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: boo
         ),
         Err(_) => println!("Last run: <none>"),
     }
+    print_scheduler_status(&store, &cfg)?;
     Ok(())
 }
 
@@ -393,6 +394,52 @@ fn print_review_status(status: &crate::store::ReviewStatus) {
     println!("Source: {}", review_source_label(&status.source));
     print_summary_counts(&status.summary);
     print_skip_breakdown(&status.summary);
+}
+
+fn print_scheduler_status(store: &Store, cfg: &Config) -> Result<()> {
+    println!(
+        "Clean interval: {}",
+        humantime::format_duration(cfg.clean_interval)
+    );
+    println!(
+        "Scan interval: {}",
+        humantime::format_duration(cfg.scan_interval)
+    );
+    match store.scheduler_status()? {
+        Some(status) => {
+            let now = SystemTime::now();
+            println!(
+                "Scheduler state: recorded {} ago",
+                humantime::format_duration(
+                    now.duration_since(status.updated_at).unwrap_or_default()
+                )
+            );
+            println!(
+                "Next scheduled clean: {}",
+                schedule_time_label(status.next_clean_at, now)
+            );
+            println!(
+                "Next scheduled scan: {}",
+                schedule_time_label(status.next_scan_at, now)
+            );
+        }
+        None => {
+            println!("Scheduler state: <not recorded>");
+            println!("Next scheduled clean: <not recorded>");
+            println!("Next scheduled scan: <not recorded>");
+        }
+    }
+    Ok(())
+}
+
+fn schedule_time_label(when: SystemTime, now: SystemTime) -> String {
+    match when.duration_since(now) {
+        Ok(remaining) => format!("in {}", humantime::format_duration(remaining)),
+        Err(_) => {
+            let overdue = now.duration_since(when).unwrap_or_default();
+            format!("overdue by {}", humantime::format_duration(overdue))
+        }
+    }
 }
 
 fn review_source_label(source: &str) -> String {

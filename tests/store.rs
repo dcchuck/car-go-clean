@@ -23,6 +23,7 @@ fn open_creates_file_and_migrations_create_tables() {
     assert!(store.table_exists("errors").unwrap());
     assert!(store.table_exists("runs").unwrap());
     assert!(store.table_exists("review_status").unwrap());
+    assert!(store.table_exists("scheduler_state").unwrap());
 }
 
 #[test]
@@ -185,4 +186,21 @@ fn records_latest_review_status_snapshot() {
     assert_eq!(status.summary.total_projects, 3);
     assert_eq!(status.summary.cleanable_projects, 2);
     assert_eq!(status.summary.cleanable_bytes, 1024);
+}
+
+#[test]
+fn records_scheduler_status_snapshot() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let next_clean = now + Duration::from_secs(60);
+    let next_scan = now + Duration::from_secs(120);
+
+    store
+        .record_scheduler_status(now, next_clean, next_scan)
+        .unwrap();
+
+    let status = store.scheduler_status().unwrap().unwrap();
+    assert_eq!(status.updated_at, now);
+    assert_eq!(status.next_clean_at, next_clean);
+    assert_eq!(status.next_scan_at, next_scan);
 }
