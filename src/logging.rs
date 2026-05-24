@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ struct LogEvent<'a> {
     ts: u64,
     level: &'a str,
     message: &'a str,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
 }
 
 impl Logger {
@@ -54,19 +57,28 @@ impl Logger {
     }
 
     pub fn info(&self, message: impl AsRef<str>) {
-        self.write("INFO", message.as_ref());
+        self.write("INFO", message.as_ref(), Map::new());
+    }
+
+    pub fn info_fields(&self, message: impl AsRef<str>, fields: Map<String, Value>) {
+        self.write("INFO", message.as_ref(), fields);
     }
 
     pub fn error(&self, message: impl AsRef<str>) {
-        self.write("ERROR", message.as_ref());
+        self.write("ERROR", message.as_ref(), Map::new());
     }
 
-    fn write(&self, level: &str, message: &str) {
+    fn write(&self, level: &str, message: &str, fields: Map<String, Value>) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let event = LogEvent { ts, level, message };
+        let event = LogEvent {
+            ts,
+            level,
+            message,
+            fields,
+        };
         let Ok(mut line) = serde_json::to_string(&event) else {
             return;
         };

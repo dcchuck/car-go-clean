@@ -1,10 +1,12 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
+use crate::logging::Logger;
 use crate::safety::{review_project, review_summary, CleanDecision, SafetyOptions};
 use crate::scanner::Scanner;
 use crate::store::{CleanEvent, ErrorRecord, Store};
 use anyhow::Result;
+use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -73,6 +75,7 @@ pub struct Daemon<'a, R: CommandRunner> {
     scanner: Scanner,
     cleaner: Cleaner<R>,
     opts: DaemonOptions,
+    logger: Option<Logger>,
 }
 
 impl<'a, R: CommandRunner> Daemon<'a, R> {
@@ -89,7 +92,13 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             scanner,
             cleaner,
             opts,
+            logger: None,
         }
+    }
+
+    pub fn with_logger(mut self, logger: Logger) -> Self {
+        self.logger = Some(logger);
+        self
     }
 
     pub fn scan_cycle(&self) -> Result<()> {
@@ -208,9 +217,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
         }
 
-        let skipped = review_summary(&reviews).skipped_projects as i64 + cleaner_skipped;
-        self.store
-            .record_review_status(started, "run", &review_summary(&reviews))?;
+        let summary = review_summary(&reviews);
+        let skipped = summary.skipped_projects as i64 + cleaner_skipped;
+        self.store.record_review_status(started, "run", &summary)?;
         self.store.finish_run(
             run_id,
             SystemTime::now(),
@@ -218,13 +227,32 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             bytes_recovered,
             errors_count,
         )?;
-        Ok(RunCycleResult {
+        let result = RunCycleResult {
             run_id,
             cleaned: projects_cleaned,
             skipped,
             bytes_recovered,
             errors: errors_count,
-        })
+        };
+        self.log_run_cycle(&result);
+        Ok(result)
+    }
+
+    fn log_run_cycle(&self, result: &RunCycleResult) {
+        let Some(logger) = &self.logger else {
+            return;
+        };
+
+        let mut fields = Map::new();
+        fields.insert("run_id".to_string(), Value::from(result.run_id));
+        fields.insert("cleaned".to_string(), Value::from(result.cleaned));
+        fields.insert("skipped".to_string(), Value::from(result.skipped));
+        fields.insert(
+            "bytes_recovered".to_string(),
+            Value::from(result.bytes_recovered),
+        );
+        fields.insert("errors".to_string(), Value::from(result.errors));
+        logger.info_fields("clean cycle complete", fields);
     }
 
     pub fn run_forever(&self) -> Result<()> {

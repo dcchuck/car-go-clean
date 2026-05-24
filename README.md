@@ -141,6 +141,10 @@ Validation points:
 ## Services And Packaging
 
 Service templates live in `packaging/systemd/` and `packaging/launchd/`.
+The launchd plist is a template; install it with
+`packaging/launchd/install.sh` so the binary and log paths are rendered for
+the current user. Override those paths with `CAR_GO_CLEAN_BIN` or
+`CAR_GO_CLEAN_LOG_DIR` when needed.
 Release notes and distribution-channel decisions live in `packaging/release/`;
 the primary install path is currently `cargo install`.
 

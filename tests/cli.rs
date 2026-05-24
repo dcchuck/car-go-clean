@@ -85,6 +85,15 @@ fn scan_run_stats_work_with_fake_cargo() {
         .success()
         .stdout(contains("Bytes recovered"))
         .stdout(contains(project.display().to_string()));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("status")
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Source: run (pre-clean snapshot)"));
 }
 
 #[test]

@@ -9,6 +9,7 @@ use car_go_clean::activity::NoopProcessInspector;
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::daemon::{Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::safety::SafetyOptions;
 use car_go_clean::scanner::{Scanner, ScannerOptions};
 use car_go_clean::store::{ErrorRecord, Store};
@@ -206,6 +207,72 @@ fn daemon_scan_and_run_cycle_record_state() {
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert!(run.bytes_recovered >= 2048);
+}
+
+#[test]
+fn daemon_logs_run_cycle_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&project, std::time::SystemTime::now())
+        .unwrap();
+
+    let log_path = db_dir.path().join("car-go-clean.log");
+    let logger = Logger::with_options(
+        &log_path,
+        LoggerOptions {
+            max_bytes: 1024,
+            max_files: 2,
+        },
+    )
+    .unwrap();
+    let cleaner = Cleaner::new(
+        "cargo",
+        FakeRunner {
+            delete_target: true,
+            ..FakeRunner::default()
+        },
+        Duration::from_secs(60),
+    );
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        cleaner,
+        DaemonOptions::default(),
+    )
+    .with_logger(logger);
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    let body = fs::read_to_string(log_path).unwrap();
+    let event: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(event["message"], "clean cycle complete");
+    assert_eq!(event["run_id"], result.run_id);
+    assert_eq!(event["cleaned"], 1);
+    assert_eq!(event["skipped"], 0);
+    assert!(event["bytes_recovered"].as_i64().unwrap() >= 2048);
+    assert_eq!(event["errors"], 0);
 }
 
 #[test]

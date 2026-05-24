@@ -19,11 +19,22 @@ fn launchd_plist_runs_daemon_with_configurable_paths() {
     let plist = repo_file("packaging/launchd/com.dcchuck.car-go-clean.plist");
 
     assert!(plist.contains("<key>ProgramArguments</key>"));
-    assert!(plist.contains("/Users/charlesdanielsson/.cargo/bin/car-go-clean"));
+    assert!(plist.contains("__CAR_GO_CLEAN_BIN__"));
+    assert!(plist.contains("__CAR_GO_CLEAN_LOG_DIR__"));
     assert!(plist.contains("daemon"));
+    assert!(!plist.contains("/Users/charlesdanielsson"));
     assert!(!plist.contains("/usr/local/bin/car-go-clean"));
     assert!(!plist.contains("/tmp/car-go-clean.launchd"));
-    assert!(plist.contains("/Users/charlesdanielsson/Library/Logs/car-go-clean"));
+}
+
+#[test]
+fn launchd_installer_renders_user_specific_plist() {
+    let installer = repo_file("packaging/launchd/install.sh");
+
+    assert!(installer.contains("CAR_GO_CLEAN_BIN"));
+    assert!(installer.contains("CAR_GO_CLEAN_LOG_DIR"));
+    assert!(installer.contains("Library/LaunchAgents"));
+    assert!(installer.contains("launchctl bootstrap"));
 }
 
 #[test]

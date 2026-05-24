@@ -390,9 +390,17 @@ fn print_review_status(status: &crate::store::ReviewStatus) {
         "Last review: {} ago",
         humantime::format_duration(reviewed_age)
     );
-    println!("Source: {}", status.source);
+    println!("Source: {}", review_source_label(&status.source));
     print_summary_counts(&status.summary);
     print_skip_breakdown(&status.summary);
+}
+
+fn review_source_label(source: &str) -> String {
+    if source == "run" {
+        "run (pre-clean snapshot)".to_string()
+    } else {
+        source.to_string()
+    }
 }
 
 fn print_summary_counts(summary: &crate::safety::ReviewSummary) {
@@ -510,7 +518,7 @@ fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()
     logger.info("daemon starting");
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
     let store = open_store_at(&path_set)?;
-    let daemon = daemon_for_clean(&store, &cfg, cargo);
+    let daemon = daemon_for_clean(&store, &cfg, cargo).with_logger(logger);
     daemon.run_forever()
 }
 
