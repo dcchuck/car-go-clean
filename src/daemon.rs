@@ -10,7 +10,6 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -322,18 +321,24 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 }
 
 fn wait_until_or_shutdown(deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
-    let Ok(interval) = deadline.duration_since(SystemTime::now()) else {
-        return shutdown.is_requested();
-    };
-    let started = Instant::now();
-    while started.elapsed() < interval {
+    loop {
         if shutdown.is_requested() {
             return true;
         }
-        let remaining = interval.saturating_sub(started.elapsed());
-        thread::sleep(remaining.min(Duration::from_millis(250)));
+        let Some(wait_for) = wall_clock_wait_chunk(deadline, SystemTime::now()) else {
+            return false;
+        };
+        thread::sleep(wait_for);
     }
-    shutdown.is_requested()
+}
+
+fn wall_clock_wait_chunk(deadline: SystemTime, now: SystemTime) -> Option<Duration> {
+    let remaining = deadline.duration_since(now).ok()?;
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining.min(Duration::from_millis(250)))
+    }
 }
 
 #[cfg(unix)]
@@ -364,4 +369,29 @@ fn install_signal_handlers() -> Result<()> {
 #[cfg(not(unix))]
 fn install_signal_handlers() -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wall_clock_wait_chunk_polls_until_deadline_is_reached() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let deadline = now + Duration::from_secs(1);
+
+        assert_eq!(
+            wall_clock_wait_chunk(deadline, now),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            wall_clock_wait_chunk(deadline, now + Duration::from_millis(900)),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(wall_clock_wait_chunk(deadline, deadline), None);
+        assert_eq!(
+            wall_clock_wait_chunk(deadline, deadline + Duration::from_secs(1)),
+            None
+        );
+    }
 }
