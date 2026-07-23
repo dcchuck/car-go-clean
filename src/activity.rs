@@ -202,6 +202,12 @@ fn rust_option_argument_matches_unix(
                 || argument.strip_prefix(b"--emit=").is_some_and(|value| {
                     nested_rust_bytes_match(value, RustPathSyntax::Emit, cwd, canonical_project)
                 })
+                || argument
+                    .strip_prefix(b"--manifest-path=")
+                    .or_else(|| argument.strip_prefix(b"--target-dir="))
+                    .or_else(|| argument.strip_prefix(b"--out-dir="))
+                    .filter(|value| !value.is_empty() && !value.starts_with(b"-"))
+                    .is_some_and(|path| native_path_matches(path, cwd, canonical_project))
         }
     }
 }

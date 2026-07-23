@@ -449,6 +449,9 @@ fn nested_rust_options_preserve_non_utf8_path_suffixes() {
             prefixed_path(b"dependency=", &target),
         ],
         vec![prefixed_path(b"--library-path=dependency=", &target)],
+        vec![prefixed_path(b"--manifest-path=", &future)],
+        vec![prefixed_path(b"--target-dir=", &future)],
+        vec![prefixed_path(b"--out-dir=", &future)],
     ];
 
     for arguments in argument_sets {

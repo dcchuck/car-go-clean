@@ -26,14 +26,11 @@ impl<'a> Cache<'a> {
                 removed.push(path);
                 continue;
             }
-            if self.store.is_active_worktree_discovery_identity(&path)? {
-                continue;
-            }
             let canonical = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize cached project {}", path.display()))?;
             if canonical != path {
-                self.store.replace_project_path(&path, &canonical)?;
+                self.store.replace_cached_project_path(&path, &canonical)?;
             }
         }
         Ok(removed)

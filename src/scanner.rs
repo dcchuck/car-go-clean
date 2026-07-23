@@ -157,8 +157,9 @@ impl Scanner {
         canonical_roots.sort();
         canonical_roots.dedup();
         for root in &self.opts.roots {
+            let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             self.walk(
-                root,
+                &canonical_root,
                 &[],
                 &canonical_roots,
                 &mut found,
@@ -171,7 +172,7 @@ impl Scanner {
                 self.add_cargo_project(
                     project,
                     &canonical_roots,
-                    false,
+                    true,
                     &mut found,
                     &mut worktree_discoveries,
                     &mut errors,
@@ -331,7 +332,7 @@ impl Scanner {
                         out_of_scope.insert(candidate);
                         continue;
                     }
-                    if self.should_skip(&candidate) && !self.is_explicit_project(&candidate) {
+                    if self.should_skip(&candidate) {
                         excluded.insert(candidate);
                         continue;
                     }
@@ -362,14 +363,6 @@ impl Scanner {
             .excludes
             .iter()
             .any(|exclude| path_matches_exclude(path, exclude))
-    }
-
-    fn is_explicit_project(&self, path: &Path) -> bool {
-        self.opts
-            .project_dirs
-            .iter()
-            .filter_map(|project| fs::canonicalize(project).ok())
-            .any(|project| project == path)
     }
 }
 

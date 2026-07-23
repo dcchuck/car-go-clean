@@ -341,6 +341,36 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_cached_project_path(&self, old_path: &Path, new_path: &Path) -> Result<()> {
+        let old_path = path_to_string(old_path)?;
+        let new_path = path_to_string(new_path)?;
+        if old_path == new_path {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "
+            INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
+            SELECT ?2, discovered_at, last_seen_at, last_cleaned_at
+            FROM projects
+            WHERE path=?1
+            ON CONFLICT(path) DO UPDATE SET
+                discovered_at = MIN(projects.discovered_at, excluded.discovered_at),
+                last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at),
+                last_cleaned_at = CASE
+                    WHEN projects.last_cleaned_at IS NULL THEN excluded.last_cleaned_at
+                    WHEN excluded.last_cleaned_at IS NULL THEN projects.last_cleaned_at
+                    ELSE MAX(projects.last_cleaned_at, excluded.last_cleaned_at)
+                END
+            ",
+            params![old_path, new_path],
+        )?;
+        tx.execute("DELETE FROM projects WHERE path=?1", [&old_path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn normalize_resolvable_project_aliases(&self) -> Result<()> {
         let frozen_identities = self.frozen_worktree_identities()?;
         let mut stmt = self.conn.prepare(
@@ -456,7 +486,6 @@ impl Store {
                 SELECT linked_path
                 FROM linked_worktrees
                 WHERE canonical_primary_path=?1
-                   OR (canonical_primary_path IS NULL AND primary_path=?1)
                 ",
             )?;
             let rows = stmt.query_map([&primary], |row| row.get::<_, String>(0))?;
@@ -466,14 +495,13 @@ impl Store {
             "
             DELETE FROM linked_worktrees
             WHERE canonical_primary_path=?1
-               OR (canonical_primary_path IS NULL AND primary_path=?1)
             ",
             [&primary],
         )?;
         for linked_path in &linked {
             tx.execute(
                 "
-                INSERT INTO linked_worktrees (
+                INSERT OR IGNORE INTO linked_worktrees (
                     primary_path,
                     linked_path,
                     canonical_primary_path

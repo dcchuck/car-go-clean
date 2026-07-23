@@ -317,6 +317,59 @@ fn retargeted_trusted_association_primary_is_not_normalized_to_its_new_target() 
 
 #[cfg(unix)]
 #[test]
+fn project_only_cache_rekey_preserves_trusted_association_provenance() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let replacement = root.path().join("Library/Caches/replacement");
+    let child = root.path().join("child");
+    for path in [&original, &replacement, &child] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_replacement = replacement.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    store
+        .upsert_project(&canonical_original, SystemTime::UNIX_EPOCH)
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_original, std::slice::from_ref(&canonical_child))
+        .unwrap();
+
+    fs::remove_dir(&canonical_original).unwrap();
+    symlink(&canonical_replacement, &canonical_original).unwrap();
+    store
+        .replace_cached_project_path(&canonical_original, &canonical_replacement)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![canonical_replacement.to_string_lossy().into_owned()]
+    );
+    fs::remove_file(&canonical_original).unwrap();
+    fs::create_dir(&canonical_original).unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_original,
+            SystemTime::UNIX_EPOCH,
+            "original failed",
+        )
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_child, canonical_original]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_success() {
     use std::os::unix::fs::symlink;
 
@@ -484,6 +537,94 @@ fn migrated_v4_broken_primary_association_blocks_child_after_fresh_failure() {
 #[test]
 fn migrated_v4_retargeted_primary_association_blocks_child_after_fresh_failure() {
     assert_v4_alias_association_blocks_child_after_fresh_primary_failure(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn reused_v4_untrusted_primary_spelling_does_not_claim_historical_association() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let original = root_path.join("original");
+    let alias = root_path.join("reused-primary");
+    let child = root_path.join("historical-child");
+    for path in [&original, &child] {
+        fs::create_dir_all(path).unwrap();
+    }
+    symlink(&original, &alias).unwrap();
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (4);
+        CREATE TABLE projects (
+            path TEXT PRIMARY KEY,
+            discovered_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_cleaned_at INTEGER
+        );
+        CREATE TABLE linked_worktrees (
+            primary_path TEXT NOT NULL,
+            linked_path TEXT NOT NULL,
+            PRIMARY KEY (primary_path, linked_path)
+        );
+        CREATE TABLE worktree_discovery_failures (
+            primary_path TEXT PRIMARY KEY,
+            failed_at INTEGER NOT NULL,
+            message TEXT NOT NULL
+        );
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (path, discovered_at, last_seen_at) VALUES (?1, 0, 0)",
+        [canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+        rusqlite::params![alias.to_str().unwrap(), canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    fs::remove_file(&alias).unwrap();
+    fs::create_dir(&alias).unwrap();
+    store.replace_linked_worktrees(&alias, &[]).unwrap();
+    let inspection = rusqlite::Connection::open(&db_path).unwrap();
+    let untrusted_associations = inspection
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM linked_worktrees
+            WHERE primary_path=?1 AND canonical_primary_path IS NULL
+            ",
+            [alias.to_str().unwrap()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(untrusted_associations, 1);
+    drop(inspection);
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_original,
+            SystemTime::UNIX_EPOCH,
+            "original failed",
+        )
+        .unwrap();
+
+    assert!(store
+        .blocked_worktree_discovery_paths()
+        .unwrap()
+        .contains(&canonical_child));
 }
 
 #[test]

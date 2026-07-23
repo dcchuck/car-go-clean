@@ -104,7 +104,7 @@ fn scan_includes_project_dirs_that_contain_cargo_toml() {
 }
 
 #[test]
-fn configured_project_dir_remains_explicit_when_its_name_is_excluded_from_scans() {
+fn configured_project_dir_does_not_override_exclusions() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("explicit-project");
     write_file(&project.join("Cargo.toml"), "[package]\n");
@@ -115,10 +115,7 @@ fn configured_project_dir_remains_explicit_when_its_name_is_excluded_from_scans(
         excludes: vec!["explicit-project".to_string()],
     });
 
-    assert_eq!(
-        scanner.scan().unwrap(),
-        vec![project.canonicalize().unwrap()]
-    );
+    assert!(scanner.scan().unwrap().is_empty());
 }
 
 #[test]
@@ -303,9 +300,13 @@ fn multi_component_excludes_skip_matching_subtrees() {
 #[cfg(unix)]
 #[test]
 fn scan_skips_unreadable_directories_and_reports_errors() {
+    use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias = alias_parent.path().join("scan-root-alias");
+    symlink(root.path(), &alias).unwrap();
     write_file(
         &root.path().join("kept/Cargo.toml"),
         "[package]\nname='kept'\nversion='0.1.0'\n",
@@ -315,7 +316,7 @@ fn scan_skips_unreadable_directories_and_reports_errors() {
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
     let scanner = Scanner::new(ScannerOptions {
-        roots: vec![root.path().to_path_buf()],
+        roots: vec![alias],
         project_dirs: vec![],
         excludes: vec![],
     });
@@ -328,7 +329,7 @@ fn scan_skips_unreadable_directories_and_reports_errors() {
         vec![root.path().join("kept").canonicalize().unwrap()]
     );
     assert_eq!(report.errors.len(), 1);
-    assert_eq!(report.errors[0].path, blocked);
+    assert_eq!(report.errors[0].path, blocked.canonicalize().unwrap());
     assert!(report.errors[0].message.contains("Permission denied"));
 }
 

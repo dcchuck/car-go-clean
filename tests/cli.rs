@@ -500,9 +500,8 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
         )))
         .stdout(contains(format!(
             "skipped:no_target\tworkspace\t0\t{}",
-            child_alias.display()
-        )))
-        .stdout(predicate::str::contains(canonical_unrelated.display().to_string()).not());
+            canonical_unrelated.display()
+        )));
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
@@ -1109,4 +1108,239 @@ fn run_dry_run_syncs_stale_cached_projects_before_review() {
         .assert()
         .success()
         .stdout(contains("Cached projects: 1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for (trusted, class_path, decision) in [
+        (true, "Library/Caches/replacement", "skipped:managed_cache"),
+        (
+            true,
+            "OrbStack/docker/replacement",
+            "skipped:container_storage",
+        ),
+        (false, "Library/Caches/replacement", "skipped:managed_cache"),
+        (
+            false,
+            "OrbStack/docker/replacement",
+            "skipped:container_storage",
+        ),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let work_path = work.path().canonicalize().unwrap();
+        let original = work_path.join("original");
+        let frozen_primary = work_path.join("frozen-primary");
+        let replacement = work_path.join(class_path);
+        let child = work_path.join("historical-child");
+        for path in [&original, &replacement, &child] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(replacement.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir_all(replacement.join("target")).unwrap();
+        fs::write(replacement.join("target/blob.bin"), vec![0; 4096]).unwrap();
+        let canonical_replacement = replacement.canonicalize().unwrap();
+        let canonical_child = child.canonicalize().unwrap();
+        let state = work_path.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let db_path = state.join("state.db");
+
+        if trusted {
+            fs::create_dir_all(&frozen_primary).unwrap();
+            fs::write(frozen_primary.join("Cargo.toml"), "[package]\n").unwrap();
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            store
+                .upsert_project(&frozen_primary, SystemTime::now())
+                .unwrap();
+            store
+                .replace_linked_worktrees(&frozen_primary, std::slice::from_ref(&canonical_child))
+                .unwrap();
+            drop(store);
+            fs::remove_dir_all(&frozen_primary).unwrap();
+            symlink(&canonical_replacement, &frozen_primary).unwrap();
+        } else {
+            symlink(&original, &frozen_primary).unwrap();
+            {
+                let store = Store::open(&db_path).unwrap();
+                store.migrate().unwrap();
+                store
+                    .upsert_project(&frozen_primary, SystemTime::now())
+                    .unwrap();
+            }
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                DROP TABLE linked_worktrees;
+                CREATE TABLE linked_worktrees (
+                    primary_path TEXT NOT NULL,
+                    linked_path TEXT NOT NULL,
+                    PRIMARY KEY (primary_path, linked_path)
+                );
+                DELETE FROM schema_version WHERE version >= 5;
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+                rusqlite::params![
+                    frozen_primary.to_str().unwrap(),
+                    canonical_child.to_str().unwrap()
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            drop(store);
+            fs::remove_file(&frozen_primary).unwrap();
+            symlink(&canonical_replacement, &frozen_primary).unwrap();
+        }
+
+        let bin_dir = work_path.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let marker = work_path.join("cargo-ran");
+        let fake_cargo = bin_dir.join("cargo");
+        fs::write(
+            &fake_cargo,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = work_path.join("config.toml");
+        fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+        let mut path = bin_dir.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .args(["projects", "--all"])
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .assert()
+            .success()
+            .stdout(contains(decision))
+            .stdout(contains(canonical_replacement.display().to_string()));
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("run")
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("PATH", &path)
+            .assert()
+            .success()
+            .stdout(contains("cleaned=0"));
+
+        assert!(!marker.exists(), "trusted={trusted}, path={class_path}");
+        assert!(
+            replacement.join("target/blob.bin").exists(),
+            "trusted={trusted}, path={class_path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_reused_v4_untrusted_primary_does_not_release_historical_child() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let work = tempfile::tempdir().unwrap();
+    let work_path = work.path().canonicalize().unwrap();
+    let original = work_path.join("original");
+    let reused = work_path.join("reused-primary");
+    let child = work_path.join("historical-child");
+    fs::create_dir_all(&original).unwrap();
+    fs::create_dir_all(child.join("target")).unwrap();
+    fs::write(child.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(child.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    symlink(&original, &reused).unwrap();
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    let state = work_path.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let db_path = state.join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_project(&canonical_child, SystemTime::now())
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        DROP TABLE linked_worktrees;
+        CREATE TABLE linked_worktrees (
+            primary_path TEXT NOT NULL,
+            linked_path TEXT NOT NULL,
+            PRIMARY KEY (primary_path, linked_path)
+        );
+        DELETE FROM schema_version WHERE version >= 5;
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+        rusqlite::params![reused.to_str().unwrap(), canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    fs::remove_file(&reused).unwrap();
+    fs::create_dir(&reused).unwrap();
+    store.replace_linked_worktrees(&reused, &[]).unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_original, SystemTime::now(), "original failed")
+        .unwrap();
+    drop(store);
+
+    let bin_dir = work_path.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let marker = work_path.join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = work_path.join("config.toml");
+    fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("skipped:scan_error"))
+        .stdout(contains(canonical_child.display().to_string()));
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("run")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("cleaned=0"));
+
+    assert!(!marker.exists());
+    assert!(child.join("target/blob.bin").exists());
 }

@@ -50,8 +50,9 @@ it also discovers linked Rust worktrees that Git reports within the configured
 scan roots. This includes Git-reported worktrees hidden by ignore rules;
 configured exclusions and the normal cleaning safeguards still apply. A
 successful enumeration also removes previously cached Git candidates that are
-now excluded or outside the configured scan roots; explicitly configured
-`project_dirs` remain authorized.
+now excluded or outside the configured scan roots. Explicitly configured
+`project_dirs` may authorize projects outside the scan roots, but never
+override configured exclusions.
 
 If Git worktree discovery fails for a primary checkout, the failure is recorded
 as an ordinary scan error, which retains the usual recent, hierarchical
@@ -65,10 +66,11 @@ retain the canonical primary identity, and their persisted primary identity is
 not rewritten from a later filesystem target. Migrated primary aliases in
 either failure or association state are trusted only when the persisted primary
 was already canonical; unresolvable or noncanonical legacy associations are
-never inferred from their current target. While any discovery failure is
-active, such untrusted legacy association state blocks all cached projects. As
-another conservative fallback, if a saved linked identity is unresolvable or no
-longer canonical, all cached projects are temporarily blocked until successful
+never inferred from their current target or discarded merely because a new
+checkout reuses the same path spelling. While any discovery failure is active,
+such untrusted legacy association state blocks all cached projects. As another
+conservative fallback, if a saved linked identity is unresolvable or no longer
+canonical, all cached projects are temporarily blocked until successful
 discovery safely replaces the association. An explicit forced run still
 bypasses either durable block.
 
@@ -82,13 +84,20 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 - The newest non-symlink file under `target/` is at least
   `target_quiet_period` old.
 - The project is not under a known managed cache or container storage path.
-- No recent scan recorded a related unreadable path for the project.
+- No recent scan recorded a physically related unreadable ancestor or
+  descendant path for the project.
 - No running process has a cwd or command argument inside the project or
   `target/`.
 
+Cached project rows are canonicalized to their current physical locations
+before these gates run, even when immutable discovery provenance retains an
+older primary spelling. This keeps cache/container classification physical
+without transferring or clearing historical worktree associations.
+
 On Unix, Rust compiler path options are parsed as native OS bytes, so non-UTF-8
-path suffixes in `--extern`, `--emit`, `-L`, and `--library-path` still protect
-the matching canonical project.
+path suffixes in `--manifest-path`, `--target-dir`, `--out-dir`, `--extern`,
+`--emit`, `-L`, and `--library-path` still protect the matching canonical
+project.
 
 The default `target_quiet_period` is `2h`.
 

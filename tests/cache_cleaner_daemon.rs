@@ -466,7 +466,7 @@ fn successful_out_of_scope_reconciliation_preserves_explicit_project_dir() {
 }
 
 #[test]
-fn successful_exclusion_reconciliation_preserves_explicit_project_dir() {
+fn configured_project_dir_does_not_override_exclusion_reconciliation() {
     let root = tempfile::tempdir().unwrap();
     let primary = root.path().join("router");
     let explicit = root.path().join("excluded/team/worktree");
@@ -503,7 +503,7 @@ fn successful_exclusion_reconciliation_preserves_explicit_project_dir() {
     );
 
     daemon.scan_cycle().unwrap();
-    assert!(store
+    assert!(!store
         .all_projects()
         .unwrap()
         .iter()
@@ -513,7 +513,7 @@ fn successful_exclusion_reconciliation_preserves_explicit_project_dir() {
         .unwrap();
     assert_eq!(
         store.blocked_worktree_discovery_paths().unwrap(),
-        vec![canonical_explicit.clone(), canonical_primary]
+        vec![canonical_primary]
     );
     daemon.scan_cycle().unwrap();
     assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
@@ -528,9 +528,8 @@ fn successful_exclusion_reconciliation_preserves_explicit_project_dir() {
             &NoopProcessInspector,
         )
         .unwrap();
-    assert_eq!(result.cleaned, 1);
-    assert_eq!(runner.calls.lock().unwrap().len(), 1);
-    assert_eq!(runner.calls.lock().unwrap()[0].dir, canonical_explicit);
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -608,6 +607,229 @@ fn daemon_does_not_clean_a_persisted_alias_of_a_managed_cache_project() {
             .to_string_lossy()
             .into_owned()]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
+    use std::os::unix::fs::symlink;
+
+    for (trusted, class_path) in [
+        (true, "Library/Caches/replacement"),
+        (true, "OrbStack/docker/replacement"),
+        (false, "Library/Caches/replacement"),
+        (false, "OrbStack/docker/replacement"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let original = root_path.join("original");
+        let frozen_primary = root_path.join("frozen-primary");
+        let replacement = root_path.join(class_path);
+        let child = root_path.join("historical-child");
+        for path in [&original, &replacement, &child] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write_file(&replacement.join("Cargo.toml"), b"[package]\n");
+        write_file(&replacement.join("target/blob.bin"), &[0; 2048]);
+        let canonical_replacement = replacement.canonicalize().unwrap();
+        let canonical_child = child.canonicalize().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("state.db");
+
+        let store = if trusted {
+            fs::create_dir_all(&frozen_primary).unwrap();
+            write_file(&frozen_primary.join("Cargo.toml"), b"[package]\n");
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            store
+                .upsert_project(&frozen_primary, SystemTime::now())
+                .unwrap();
+            store
+                .replace_linked_worktrees(&frozen_primary, std::slice::from_ref(&canonical_child))
+                .unwrap();
+            fs::remove_dir_all(&frozen_primary).unwrap();
+            symlink(&canonical_replacement, &frozen_primary).unwrap();
+            store
+        } else {
+            symlink(&original, &frozen_primary).unwrap();
+            {
+                let store = Store::open(&db_path).unwrap();
+                store.migrate().unwrap();
+                store
+                    .upsert_project(&frozen_primary, SystemTime::now())
+                    .unwrap();
+            }
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                DROP TABLE linked_worktrees;
+                CREATE TABLE linked_worktrees (
+                    primary_path TEXT NOT NULL,
+                    linked_path TEXT NOT NULL,
+                    PRIMARY KEY (primary_path, linked_path)
+                );
+                DELETE FROM schema_version WHERE version >= 5;
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+                rusqlite::params![
+                    frozen_primary.to_str().unwrap(),
+                    canonical_child.to_str().unwrap()
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            fs::remove_file(&frozen_primary).unwrap();
+            symlink(&canonical_replacement, &frozen_primary).unwrap();
+            store
+        };
+
+        let runner = FakeRunner {
+            delete_target: true,
+            ..FakeRunner::default()
+        };
+        let daemon = Daemon::new(
+            &store,
+            Cache::new(&store),
+            Scanner::new(ScannerOptions {
+                roots: vec![],
+                project_dirs: vec![],
+                excludes: vec![],
+            }),
+            Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+            DaemonOptions {
+                target_quiet_period: Duration::ZERO,
+                ..DaemonOptions::default()
+            },
+        );
+        let result = daemon
+            .run_cycle_with_safety(
+                SafetyOptions {
+                    target_quiet_period: Duration::ZERO,
+                    include_managed_cache: false,
+                    include_active: false,
+                    force: false,
+                },
+                &NoopProcessInspector,
+            )
+            .unwrap();
+
+        assert_eq!(result.cleaned, 0, "trusted={trusted}, path={class_path}");
+        assert_eq!(result.skipped, 1, "trusted={trusted}, path={class_path}");
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "trusted={trusted}, path={class_path}"
+        );
+        assert!(
+            replacement.join("target/blob.bin").exists(),
+            "trusted={trusted}, path={class_path}"
+        );
+        assert_eq!(
+            store
+                .all_projects()
+                .unwrap()
+                .into_iter()
+                .map(|project| project.path)
+                .collect::<Vec<_>>(),
+            vec![canonical_replacement.to_string_lossy().into_owned()]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_reused_v4_untrusted_primary_does_not_release_historical_child() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let original = root_path.join("original");
+    let reused = root_path.join("reused-primary");
+    let child = root_path.join("historical-child");
+    fs::create_dir_all(&original).unwrap();
+    write_file(&child.join("Cargo.toml"), b"[package]\n");
+    write_file(&child.join("target/blob.bin"), &[0; 2048]);
+    symlink(&original, &reused).unwrap();
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_project(&canonical_child, SystemTime::now())
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        DROP TABLE linked_worktrees;
+        CREATE TABLE linked_worktrees (
+            primary_path TEXT NOT NULL,
+            linked_path TEXT NOT NULL,
+            PRIMARY KEY (primary_path, linked_path)
+        );
+        DELETE FROM schema_version WHERE version >= 5;
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+        rusqlite::params![reused.to_str().unwrap(), canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+
+    fs::remove_file(&reused).unwrap();
+    fs::create_dir_all(reused.join(".git")).unwrap();
+    write_file(&reused.join("Cargo.toml"), b"[workspace]\n");
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![],
+                project_dirs: vec![reused],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_original, SystemTime::now(), "original failed")
+        .unwrap();
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(child.join("target/blob.bin").exists());
 }
 
 #[derive(Clone, Default)]
@@ -1059,6 +1281,18 @@ fn daemon_skips_non_utf8_nested_rust_argument_paths_with_outside_cwd() {
         vec![
             PathBuf::from("rustc"),
             prefixed_path(b"--library-path=dependency=", &target),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--manifest-path=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--target-dir=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--out-dir=", &future),
         ],
     ];
 
@@ -1766,8 +2000,73 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
         .unwrap();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].category, "scan");
-    assert_eq!(errors[0].path.as_deref(), Some(blocked.to_str().unwrap()));
+    assert_eq!(
+        errors[0].path.as_deref(),
+        Some(blocked.canonicalize().unwrap().to_str().unwrap())
+    );
     assert!(errors[0].message.contains("Permission denied"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_spelled_scan_error_blocks_cached_canonical_descendant() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let physical_root = tempfile::tempdir().unwrap();
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias_root = alias_parent.path().join("scan-root-alias");
+    symlink(physical_root.path(), &alias_root).unwrap();
+    let blocked = physical_root.path().join("blocked");
+    let project = blocked.join("cached-project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let canonical_project = project.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_project, SystemTime::now())
+        .unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![alias_root],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
 }
 
 #[test]
@@ -1869,8 +2168,8 @@ fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() 
         )
         .unwrap();
 
-    assert_eq!(result.cleaned, 1);
-    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -2602,7 +2901,7 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
     assert!(runner.calls.lock().unwrap().is_empty());
     let blocked = store.blocked_worktree_discovery_paths().unwrap();
     assert!(blocked.contains(&linked_alias));
-    assert!(!blocked.contains(&unrelated.canonicalize().unwrap()));
+    assert!(blocked.contains(&unrelated.canonicalize().unwrap()));
 
     let repaired_state = Daemon::new(
         &store,

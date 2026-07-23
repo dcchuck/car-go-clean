@@ -348,7 +348,10 @@ fn has_related_scan_error(
     scan_error_paths: &[PathBuf],
 ) -> bool {
     scan_error_paths.iter().any(|scan_error_path| {
-        path_is_within(scan_error_path, project) || path_is_within(scan_error_path, target_path)
+        path_is_within(scan_error_path, project)
+            || path_is_within(project, scan_error_path)
+            || path_is_within(scan_error_path, target_path)
+            || path_is_within(target_path, scan_error_path)
     })
 }
 
