@@ -171,6 +171,32 @@ fn symlink_spelled_process_paths_match_canonical_project_activity() {
         ))],
         &canonical_project
     ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!(
+            "--out-dir={}",
+            alias.join("target").display()
+        ))],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!(
+            "-Ldependency={}",
+            alias.join("target").display()
+        ))],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("MODE=project-alias/target")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--color=always")],
+        &canonical_project
+    ));
     assert!(!process_matches_project(
         None,
         &[alias.join("target/debug/nonexistent")],

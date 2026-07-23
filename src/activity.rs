@@ -96,11 +96,18 @@ fn canonical_argument_path(arg: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
 
 fn explicit_argument_path(arg: &Path) -> Option<&Path> {
     let arg = arg.to_str()?;
-    ["--manifest-path=", "--target-dir="]
-        .iter()
-        .find_map(|prefix| arg.strip_prefix(prefix))
-        .filter(|path| !path.is_empty())
-        .map(Path::new)
+    let (option, value) = arg.split_once('=')?;
+    if value.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(value);
+    let known_path_option = matches!(option, "--manifest-path" | "--target-dir" | "--out-dir");
+    let path_like_option_value = option.starts_with('-')
+        && option.len() > 1
+        && (path.is_absolute() || path.components().count() > 1);
+
+    (known_path_option || path_like_option_value).then_some(path)
 }
 
 fn raw_argument_path<'a>(arg: &'a Path, cwd: Option<&Path>) -> Option<&'a Path> {
