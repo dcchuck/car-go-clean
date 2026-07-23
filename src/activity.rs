@@ -102,6 +102,12 @@ fn canonical_arguments_match_project(
                 .and_then(|value| split_path_option_value(value))
                 .and_then(|value| canonicalize_argument_path(value, cwd))
                 .is_some_and(|value| path_is_within(&value, canonical_project)),
+            "-L" | "--library-path" => args
+                .get(index + 1)
+                .and_then(|value| split_path_option_value(value))
+                .and_then(rust_library_search_path)
+                .and_then(|value| canonicalize_argument_path(value, cwd))
+                .is_some_and(|value| path_is_within(&value, canonical_project)),
             "--extern" => args.get(index + 1).is_some_and(|value| {
                 nested_rust_paths_match(value, RustPathSyntax::Extern, cwd, canonical_project)
             }),
@@ -138,6 +144,23 @@ fn split_path_option_value(value: &Path) -> Option<&Path> {
         return None;
     }
     Some(value)
+}
+
+fn rust_library_search_path(value: &Path) -> Option<&Path> {
+    let Some(value_str) = value.to_str() else {
+        return Some(value);
+    };
+    let Some((kind, path)) = value_str.split_once('=') else {
+        return Some(value);
+    };
+    if !matches!(
+        kind,
+        "dependency" | "crate" | "native" | "framework" | "all"
+    ) || path.is_empty()
+    {
+        return None;
+    }
+    Some(Path::new(path))
 }
 
 #[derive(Clone, Copy)]

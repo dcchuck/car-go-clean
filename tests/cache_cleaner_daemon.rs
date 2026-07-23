@@ -704,6 +704,11 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
     );
     let argument_sets = [
         vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("-L"),
+            PathBuf::from(format!("dependency={}", alias.join("target").display())),
+        ],
+        vec![
             PathBuf::from("cargo"),
             PathBuf::from("--manifest-path"),
             PathBuf::from("manifest-link"),

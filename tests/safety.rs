@@ -263,6 +263,24 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
         &canonical_project
     ));
 
+    let library_args = vec![
+        PathBuf::from("-L"),
+        PathBuf::from(format!("dependency={}", alias.join("target").display())),
+    ];
+    assert!(process_matches_project(
+        Some(root.path()),
+        &library_args,
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[
+            PathBuf::from("--library-path"),
+            PathBuf::from("target-link")
+        ],
+        &canonical_project
+    ));
+
     let extern_value = format!("dep={}", alias.join("target/libdep.rlib").display());
     assert!(process_matches_project(
         Some(root.path()),
@@ -306,11 +324,29 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
         &[PathBuf::from("dep=project-alias/target/libdep.rlib")],
         &canonical_project
     ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("-L"), PathBuf::from("--version")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[
+            PathBuf::from("-L"),
+            PathBuf::from("invalid=project-alias/target")
+        ],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("-L"), PathBuf::from("dependency=missing")],
+        &canonical_project
+    ));
 
     let signals = activity_signals_for_process(
         42,
         Some(root.path()),
-        &split_manifest,
+        &library_args,
         std::slice::from_ref(&canonical_project),
     );
     let review = review_project(
