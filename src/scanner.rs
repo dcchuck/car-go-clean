@@ -39,6 +39,7 @@ pub enum WorktreeDiscovery {
         primary: PathBuf,
         linked: Vec<PathBuf>,
         excluded: Vec<PathBuf>,
+        out_of_scope: Vec<PathBuf>,
     },
     Failure {
         primary: PathBuf,
@@ -306,6 +307,7 @@ impl Scanner {
                 }
                 let mut linked = BTreeSet::new();
                 let mut excluded = BTreeSet::new();
+                let mut out_of_scope = BTreeSet::new();
                 for candidate in candidates {
                     let Ok(candidate) = fs::canonicalize(candidate) else {
                         continue;
@@ -319,11 +321,14 @@ impl Scanner {
                         );
                         return;
                     }
-                    if candidate == primary
-                        || !canonical_roots
-                            .iter()
-                            .any(|root| candidate.starts_with(root))
+                    if candidate == primary {
+                        continue;
+                    }
+                    if !canonical_roots
+                        .iter()
+                        .any(|root| candidate.starts_with(root))
                     {
+                        out_of_scope.insert(candidate);
                         continue;
                     }
                     if self.should_skip(&candidate) && !self.is_explicit_project(&candidate) {
@@ -340,6 +345,7 @@ impl Scanner {
                     primary: primary.to_path_buf(),
                     linked: linked.into_iter().collect(),
                     excluded: excluded.into_iter().collect(),
+                    out_of_scope: out_of_scope.into_iter().collect(),
                 });
             }
             Err(err) => {

@@ -416,6 +416,7 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     let work = tempfile::tempdir().unwrap();
+    let unrelated_root = tempfile::tempdir().unwrap();
     let bin_dir = work.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let marker = work.path().join("cargo-ran");
@@ -432,14 +433,15 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
 
     let primary = work.path().join("tree/router");
     let child = work.path().join("tree/linked");
-    let unrelated = work.path().join("tree/unrelated");
+    let unrelated = unrelated_root.path().join("unrelated");
     let child_alias = work.path().join("tree/linked-alias");
     fs::create_dir_all(primary.join(".git")).unwrap();
     fs::create_dir_all(child.join("target/debug")).unwrap();
-    fs::create_dir_all(&unrelated).unwrap();
     fs::write(primary.join("Cargo.toml"), "[workspace]\n").unwrap();
     fs::write(child.join("Cargo.toml"), "[workspace]\n").unwrap();
     fs::write(child.join("target/debug/blob.bin"), vec![0; 4096]).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(unrelated.join("Cargo.toml"), "[workspace]\n").unwrap();
     symlink(&child, &child_alias).unwrap();
     std::thread::sleep(Duration::from_millis(10));
 
@@ -458,8 +460,12 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
     store.migrate().unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
     let canonical_child = child.canonicalize().unwrap();
+    let canonical_unrelated = unrelated.canonicalize().unwrap();
     store
         .upsert_project(&canonical_child, SystemTime::now())
+        .unwrap();
+    store
+        .upsert_project(&child_alias, SystemTime::now())
         .unwrap();
     store
         .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&child_alias))
@@ -481,6 +487,25 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
+        .args(["projects", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains(format!(
+            "skipped:scan_error\tworkspace\t4096\t{}",
+            canonical_child.display()
+        )))
+        .stdout(contains(format!(
+            "skipped:no_target\tworkspace\t0\t{}",
+            child_alias.display()
+        )))
+        .stdout(predicate::str::contains(canonical_unrelated.display().to_string()).not());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
         .arg("run")
         .args(["--config"])
         .arg(&config)
@@ -490,7 +515,7 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
         .assert()
         .success()
         .stdout(contains("cleaned=0"))
-        .stdout(contains("skipped=1"));
+        .stdout(contains("skipped=2"));
     assert!(child.join("target/debug/blob.bin").exists());
     assert!(!marker.exists());
 }

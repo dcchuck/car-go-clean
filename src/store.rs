@@ -288,6 +288,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn is_active_worktree_discovery_identity(&self, path: &Path) -> Result<bool> {
+        let path = path_to_string(path)?;
+        Ok(self.active_worktree_discovery_identities()?.contains(&path))
+    }
+
     pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
         self.replace_linked_worktrees_with_exclusions(primary, linked, &[])
     }
@@ -298,12 +303,26 @@ impl Store {
         linked: &[PathBuf],
         excluded: &[PathBuf],
     ) -> Result<()> {
+        self.replace_linked_worktrees_with_reconciliation(primary, linked, excluded, &[])
+    }
+
+    pub fn replace_linked_worktrees_with_reconciliation(
+        &self,
+        primary: &Path,
+        linked: &[PathBuf],
+        excluded: &[PathBuf],
+        out_of_scope: &[PathBuf],
+    ) -> Result<()> {
         let primary = path_to_string(primary)?;
         let linked: BTreeSet<_> = linked
             .iter()
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
         let excluded: BTreeSet<_> = excluded
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?;
+        let out_of_scope: BTreeSet<_> = out_of_scope
             .iter()
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
@@ -330,6 +349,9 @@ impl Store {
         }
         for excluded_path in excluded {
             tx.execute("DELETE FROM projects WHERE path=?1", [excluded_path])?;
+        }
+        for out_of_scope_path in out_of_scope {
+            tx.execute("DELETE FROM projects WHERE path=?1", [out_of_scope_path])?;
         }
         tx.execute(
             "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",

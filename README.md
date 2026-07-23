@@ -48,7 +48,10 @@ scan_interval = "1d"
 The default scan interval is one day. When a scan finds a primary Git checkout,
 it also discovers linked Rust worktrees that Git reports within the configured
 scan roots. This includes Git-reported worktrees hidden by ignore rules;
-configured exclusions and the normal cleaning safeguards still apply.
+configured exclusions and the normal cleaning safeguards still apply. A
+successful enumeration also removes previously cached Git candidates that are
+now excluded or outside the configured scan roots; explicitly configured
+`project_dirs` remain authorized.
 
 If Git worktree discovery fails for a primary checkout, the failure is recorded
 as an ordinary scan error, which retains the usual recent, hierarchical

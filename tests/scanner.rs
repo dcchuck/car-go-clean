@@ -174,6 +174,7 @@ fn configured_primary_project_discovers_ignored_linked_worktrees() {
             primary: canonical_primary,
             linked: vec![canonical_linked],
             excluded: vec![],
+            out_of_scope: vec![],
         }]
     );
 }
@@ -365,6 +366,7 @@ fn scan_discovers_ignored_in_scope_linked_worktree_once() {
             primary: canonical_primary,
             linked: vec![canonical_linked],
             excluded: vec![],
+            out_of_scope: vec![],
         }]
     );
 }
@@ -389,6 +391,7 @@ fn scan_rejects_linked_worktree_outside_canonical_root() {
 
     let report = scanner.scan_with_errors().unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_outside = outside.path().canonicalize().unwrap();
     assert_eq!(report.projects, vec![canonical_primary.clone()]);
     assert_eq!(
         report.worktree_discoveries,
@@ -396,6 +399,7 @@ fn scan_rejects_linked_worktree_outside_canonical_root() {
             primary: canonical_primary,
             linked: vec![],
             excluded: vec![],
+            out_of_scope: vec![canonical_outside],
         }]
     );
 }
@@ -428,6 +432,7 @@ fn scan_rejects_configured_excluded_linked_worktree() {
             primary: canonical_primary,
             linked: vec![],
             excluded: vec![canonical_linked],
+            out_of_scope: vec![],
         }]
     );
 }
@@ -467,6 +472,7 @@ fn scan_rejects_git_candidates_beneath_a_multi_component_exclusion_after_canonic
             primary: canonical_primary,
             linked: vec![],
             excluded: vec![canonical_excluded],
+            out_of_scope: vec![],
         }]
     );
 }
@@ -497,6 +503,7 @@ fn scan_rejects_linked_worktree_symlink_that_resolves_outside_root() {
 
     let report = scanner.scan_with_errors().unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_outside = outside.path().canonicalize().unwrap();
     assert_eq!(report.projects, vec![canonical_primary.clone()]);
     assert_eq!(
         report.worktree_discoveries,
@@ -504,6 +511,7 @@ fn scan_rejects_linked_worktree_symlink_that_resolves_outside_root() {
             primary: canonical_primary,
             linked: vec![],
             excluded: vec![],
+            out_of_scope: vec![canonical_outside],
         }]
     );
 }
@@ -536,6 +544,7 @@ fn scan_skips_linked_worktree_without_direct_cargo_toml() {
             primary: canonical_primary,
             linked: vec![],
             excluded: vec![],
+            out_of_scope: vec![],
         }]
     );
 }

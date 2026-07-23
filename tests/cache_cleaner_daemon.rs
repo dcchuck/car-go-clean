@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use assert_cmd::Command as AssertCommand;
 use car_go_clean::activity::{
     activity_signals_for_process, NoopProcessInspector, ProcessInspector,
 };
@@ -18,6 +19,8 @@ use car_go_clean::scanner::{
     GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, SystemGitWorktreeResolver,
 };
 use car_go_clean::store::{ErrorRecord, Store};
+use predicates::prelude::*;
+use predicates::str::contains;
 
 fn write_file(path: &Path, body: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -259,6 +262,207 @@ fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
         .unwrap();
     assert_eq!(result.cleaned, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn first_v4_scan_reconciles_v3_cached_out_of_scope_worktree_without_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&outside.path().join("Cargo.toml"), b"[workspace]\n");
+    write_file(&outside.path().join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_outside = outside.path().canonicalize().unwrap();
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let db_path = state_dir.path().join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE linked_worktrees;
+            DROP TABLE worktree_discovery_failures;
+            DELETE FROM schema_version WHERE version >= 4;
+            DELETE FROM projects;
+            ",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for path in [&canonical_primary, &canonical_outside] {
+            conn.execute(
+                "
+                INSERT INTO projects (path, discovered_at, last_seen_at)
+                VALUES (?1, ?2, ?2)
+                ",
+                rusqlite::params![path.to_str().unwrap(), now],
+            )
+            .unwrap();
+        }
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![canonical_outside.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![canonical_primary.to_string_lossy().into_owned()]
+    );
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let config = state_dir.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    AssertCommand::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .assert()
+        .success()
+        .stdout(contains(canonical_outside.display().to_string()).not());
+    AssertCommand::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(state_dir.path())
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 0"))
+        .stdout(contains(canonical_outside.display().to_string()).not());
+}
+
+#[test]
+fn successful_out_of_scope_reconciliation_preserves_explicit_project_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&outside.path().join("Cargo.toml"), b"[workspace]\n");
+    write_file(&outside.path().join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_explicit = outside.path().canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_explicit, SystemTime::now())
+        .unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![canonical_explicit.clone()],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::paths(
+                vec![canonical_explicit.clone()],
+            )),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    assert!(store
+        .all_projects()
+        .unwrap()
+        .iter()
+        .any(|project| project.path == canonical_explicit.to_string_lossy()));
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "git failed")
+        .unwrap();
+    let mut expected_blocks = vec![canonical_explicit.clone(), canonical_primary];
+    expected_blocks.sort();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        expected_blocks
+    );
+    daemon.scan_cycle().unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.calls.lock().unwrap()[0].dir, canonical_explicit);
 }
 
 #[test]
@@ -1906,15 +2110,16 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().unwrap();
+    let unrelated_root = tempfile::tempdir().unwrap();
     let primary = root.path().join("router");
     let linked = root.path().join("linked");
-    let unrelated = root.path().join("unrelated");
+    let unrelated = unrelated_root.path().join("unrelated");
     let linked_alias = root.path().join("linked-alias");
     fs::create_dir_all(primary.join(".git")).unwrap();
-    fs::create_dir_all(&unrelated).unwrap();
     write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
     write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
     write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+    write_file(&unrelated.join("Cargo.toml"), b"[workspace]\n");
     symlink(&linked, &linked_alias).unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
     let canonical_linked = linked.canonicalize().unwrap();
@@ -1924,6 +2129,9 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
     store.migrate().unwrap();
     store
         .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .upsert_project(&linked_alias, SystemTime::now())
         .unwrap();
     store
         .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&linked_alias))
@@ -1971,8 +2179,11 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
         )
         .unwrap();
     assert_eq!(result.cleaned, 0);
-    assert_eq!(result.skipped, 1);
+    assert_eq!(result.skipped, 2);
     assert!(runner.calls.lock().unwrap().is_empty());
+    let blocked = store.blocked_worktree_discovery_paths().unwrap();
+    assert!(blocked.contains(&linked_alias));
+    assert!(!blocked.contains(&unrelated.canonicalize().unwrap()));
 
     let repaired_state = Daemon::new(
         &store,

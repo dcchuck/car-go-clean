@@ -121,9 +121,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     primary,
                     linked,
                     excluded,
+                    out_of_scope,
                 } => {
-                    self.store
-                        .replace_linked_worktrees_with_exclusions(&primary, &linked, &excluded)?;
+                    self.store.replace_linked_worktrees_with_reconciliation(
+                        &primary,
+                        &linked,
+                        &excluded,
+                        &out_of_scope,
+                    )?;
                 }
                 WorktreeDiscovery::Failure { primary, message } => {
                     self.store
