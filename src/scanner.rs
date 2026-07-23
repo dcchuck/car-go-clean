@@ -183,7 +183,13 @@ impl Scanner {
         }
         if has_cargo_toml(dir) {
             if dir.join(".git").is_dir() {
-                let primary = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                let primary = match fs::canonicalize(dir) {
+                    Ok(primary) => primary,
+                    Err(err) => {
+                        errors.push(scan_error(dir, err));
+                        return Ok(());
+                    }
+                };
                 found.insert(primary.clone());
                 self.discover_linked_worktrees(&primary, canonical_roots, found, outcomes, errors);
             } else {
