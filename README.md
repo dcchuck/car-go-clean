@@ -54,8 +54,12 @@ If Git worktree discovery fails for a primary checkout, the failure is recorded
 as an ordinary scan error, which retains the usual recent, hierarchical
 scan-error behavior. Independently, the canonical primary and exactly the
 linked worktrees saved for it remain blocked until a later successful discovery
-replaces the association. That persistent block does not extend to ancestors,
-siblings, or other projects, and an explicit forced run still bypasses it.
+replaces the association. That persistent block normally does not extend to
+ancestors, siblings, or other projects. As a conservative exceptional fallback,
+if an identity in the active failure's persisted association can no longer be
+resolved, all cached projects are temporarily blocked until successful discovery
+replaces that association. An explicit forced run still bypasses either durable
+block.
 
 ## Safe Cleaning Model
 

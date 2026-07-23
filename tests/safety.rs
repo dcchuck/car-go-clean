@@ -223,6 +223,110 @@ fn symlink_spelled_process_paths_match_canonical_project_activity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sequential_rust_path_arguments_match_canonical_project_activity() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    let manifest_link = root.path().join("manifest-link");
+    let target_link = root.path().join("target-link");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/libdep.rlib"), &[0; 1024]);
+    write_file(&project.join("target/app"), &[0; 1024]);
+    write_file(&project.join("target/app.d"), &[0; 1024]);
+    symlink(&project, &alias).unwrap();
+    symlink(alias.join("Cargo.toml"), &manifest_link).unwrap();
+    symlink(alias.join("target"), &target_link).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+
+    let split_manifest = vec![
+        PathBuf::from("cargo"),
+        PathBuf::from("--manifest-path"),
+        PathBuf::from("manifest-link"),
+    ];
+    assert!(process_matches_project(
+        Some(root.path()),
+        &split_manifest,
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--target-dir"), PathBuf::from("target-link")],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--out-dir"), PathBuf::from("target-link")],
+        &canonical_project
+    ));
+
+    let extern_value = format!("dep={}", alias.join("target/libdep.rlib").display());
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--extern"), PathBuf::from(&extern_value)],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!("--extern={extern_value}"))],
+        &canonical_project
+    ));
+
+    let emit_value = format!(
+        "link={},dep-info={}",
+        alias.join("target/app").display(),
+        alias.join("target/app.d").display()
+    );
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--emit"), PathBuf::from(&emit_value)],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!("--emit={emit_value}"))],
+        &canonical_project
+    ));
+
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--manifest-path"), PathBuf::from("--version")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--manifest-path"), PathBuf::from("missing")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("dep=project-alias/target/libdep.rlib")],
+        &canonical_project
+    ));
+
+    let signals = activity_signals_for_process(
+        42,
+        Some(root.path()),
+        &split_manifest,
+        std::slice::from_ref(&canonical_project),
+    );
+    let review = review_project(
+        &canonical_project,
+        &[],
+        &signals,
+        SystemTime::now() + Duration::from_secs(3 * 60 * 60),
+        &options(),
+    )
+    .unwrap();
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::ActiveProcess)
+    );
+}
+
 #[test]
 fn process_activity_marks_every_matching_nested_project() {
     let repo = tempfile::tempdir().unwrap();

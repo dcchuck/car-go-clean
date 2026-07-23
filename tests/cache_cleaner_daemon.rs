@@ -422,12 +422,12 @@ struct FakeCall {
 }
 
 #[derive(Clone)]
-struct ArgumentProcessInspector {
-    argument: PathBuf,
+struct ArgumentsProcessInspector {
+    arguments: Vec<PathBuf>,
     cwd: Option<PathBuf>,
 }
 
-impl ProcessInspector for ArgumentProcessInspector {
+impl ProcessInspector for ArgumentsProcessInspector {
     fn active_projects(
         &self,
         projects: &[PathBuf],
@@ -435,7 +435,7 @@ impl ProcessInspector for ArgumentProcessInspector {
         Ok(activity_signals_for_process(
             42,
             self.cwd.as_deref(),
-            std::slice::from_ref(&self.argument),
+            &self.arguments,
             projects,
         ))
     }
@@ -589,8 +589,8 @@ fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
                 include_active: false,
                 force: false,
             },
-            &ArgumentProcessInspector {
-                argument: alias.join("target/debug/server"),
+            &ArgumentsProcessInspector {
+                arguments: vec![alias.join("target/debug/server")],
                 cwd: None,
             },
         )
@@ -647,8 +647,11 @@ fn daemon_skips_canonical_project_for_symlink_spelled_out_dir_argument() {
                 include_active: false,
                 force: false,
             },
-            &ArgumentProcessInspector {
-                argument: PathBuf::from(format!("--out-dir={}", alias.join("target").display())),
+            &ArgumentsProcessInspector {
+                arguments: vec![PathBuf::from(format!(
+                    "--out-dir={}",
+                    alias.join("target").display()
+                ))],
                 cwd: Some(root.path().to_path_buf()),
             },
         )
@@ -656,6 +659,88 @@ fn daemon_skips_canonical_project_for_symlink_spelled_out_dir_argument() {
 
     assert_eq!(result.cleaned, 0);
     assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    let manifest_link = root.path().join("manifest-link");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/libdep.rlib"), &[0; 2048]);
+    write_file(&project.join("target/app"), &[0; 2048]);
+    symlink(&project, &alias).unwrap();
+    symlink(alias.join("Cargo.toml"), &manifest_link).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_project, SystemTime::now())
+        .unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let argument_sets = [
+        vec![
+            PathBuf::from("cargo"),
+            PathBuf::from("--manifest-path"),
+            PathBuf::from("manifest-link"),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--extern"),
+            PathBuf::from(format!(
+                "dep={}",
+                alias.join("target/libdep.rlib").display()
+            )),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--emit"),
+            PathBuf::from(format!("link={}", alias.join("target/app").display())),
+        ],
+    ];
+
+    for arguments in argument_sets {
+        let result = daemon
+            .run_cycle_with_safety(
+                SafetyOptions {
+                    target_quiet_period: Duration::ZERO,
+                    include_managed_cache: false,
+                    include_active: false,
+                    force: false,
+                },
+                &ArgumentsProcessInspector {
+                    arguments,
+                    cwd: Some(root.path().to_path_buf()),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.cleaned, 0);
+        assert_eq!(result.skipped, 1);
+    }
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 

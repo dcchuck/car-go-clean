@@ -78,20 +78,117 @@ pub fn process_matches_project(cwd: Option<&Path>, args: &[PathBuf], project: &P
         return true;
     }
 
-    args.iter().any(|arg| {
-        canonical_argument_path(arg, cwd)
-            .is_some_and(|arg| path_is_within(&arg, &canonical_project))
+    canonical_arguments_match_project(args, cwd, &canonical_project)
+}
+
+fn canonical_arguments_match_project(
+    args: &[PathBuf],
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        if canonical_argument_path(arg, cwd)
+            .is_some_and(|arg| path_is_within(&arg, canonical_project))
+        {
+            return true;
+        }
+
+        let Some(option) = arg.to_str() else {
+            return false;
+        };
+        match option {
+            "--manifest-path" | "--target-dir" | "--out-dir" => args
+                .get(index + 1)
+                .and_then(|value| split_path_option_value(value))
+                .and_then(|value| canonicalize_argument_path(value, cwd))
+                .is_some_and(|value| path_is_within(&value, canonical_project)),
+            "--extern" => args.get(index + 1).is_some_and(|value| {
+                nested_rust_paths_match(value, RustPathSyntax::Extern, cwd, canonical_project)
+            }),
+            "--emit" => args.get(index + 1).is_some_and(|value| {
+                nested_rust_paths_match(value, RustPathSyntax::Emit, cwd, canonical_project)
+            }),
+            _ => {
+                option.strip_prefix("--extern=").is_some_and(|value| {
+                    nested_rust_value_matches(value, RustPathSyntax::Extern, cwd, canonical_project)
+                }) || option.strip_prefix("--emit=").is_some_and(|value| {
+                    nested_rust_value_matches(value, RustPathSyntax::Emit, cwd, canonical_project)
+                })
+            }
+        }
     })
 }
 
 fn canonical_argument_path(arg: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let path = explicit_argument_path(arg).or_else(|| raw_argument_path(arg, cwd))?;
+    canonicalize_argument_path(path, cwd)
+}
+
+fn canonicalize_argument_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd?.join(path)
     };
     fs::canonicalize(path).ok()
+}
+
+fn split_path_option_value(value: &Path) -> Option<&Path> {
+    if value.as_os_str().is_empty() || value.to_str().is_some_and(|value| value.starts_with('-')) {
+        return None;
+    }
+    Some(value)
+}
+
+#[derive(Clone, Copy)]
+enum RustPathSyntax {
+    Extern,
+    Emit,
+}
+
+fn nested_rust_paths_match(
+    value: &Path,
+    syntax: RustPathSyntax,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    value
+        .to_str()
+        .is_some_and(|value| nested_rust_value_matches(value, syntax, cwd, canonical_project))
+}
+
+fn nested_rust_value_matches(
+    value: &str,
+    syntax: RustPathSyntax,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    let path_matches = |path: &Path| {
+        canonicalize_argument_path(path, cwd)
+            .is_some_and(|path| path_is_within(&path, canonical_project))
+    };
+    match syntax {
+        RustPathSyntax::Extern => nested_rust_path(value, syntax).is_some_and(path_matches),
+        RustPathSyntax::Emit => value
+            .split(',')
+            .filter_map(|value| nested_rust_path(value, syntax))
+            .any(path_matches),
+    }
+}
+
+fn nested_rust_path(value: &str, syntax: RustPathSyntax) -> Option<&Path> {
+    let (kind, path) = value.split_once('=')?;
+    let valid_kind = match syntax {
+        RustPathSyntax::Extern => !kind.is_empty(),
+        RustPathSyntax::Emit => matches!(
+            kind,
+            "asm" | "llvm-bc" | "llvm-ir" | "obj" | "metadata" | "link" | "dep-info" | "mir"
+        ),
+    };
+    if !valid_kind || path.is_empty() {
+        return None;
+    }
+    Some(Path::new(path))
 }
 
 fn explicit_argument_path(arg: &Path) -> Option<&Path> {
