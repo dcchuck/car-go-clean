@@ -5,7 +5,7 @@ use crate::logging::Logger;
 use crate::safety::{
     review_project_with_discovery_blocks, review_summary, CleanDecision, SafetyOptions,
 };
-use crate::scanner::{Scanner, WorktreeDiscovery};
+use crate::scanner::{ScanErrorKind, Scanner, WorktreeDiscovery};
 use crate::store::{CleanEvent, ErrorRecord, SchedulerStatus, Store};
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -109,7 +109,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             self.store.record_error(&ErrorRecord {
                 id: 0,
                 ts: now,
-                category: "scan".to_string(),
+                category: match error.kind {
+                    ScanErrorKind::Scan => "scan",
+                    ScanErrorKind::WorktreeDiscovery => "worktree_discovery",
+                }
+                .to_string(),
                 path: error.path.to_str().map(str::to_owned),
                 message: error.message,
             })?;

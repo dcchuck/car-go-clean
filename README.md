@@ -63,7 +63,9 @@ ancestors, siblings, or other projects. New failures retain the primary's
 canonical identity at failure time, so a primary alias changing targets cannot
 transfer or clear the old failure. Successful linked-worktree associations also
 retain the canonical primary identity, and their persisted primary identity is
-not rewritten from a later filesystem target. Migrated primary aliases in
+not rewritten from a later filesystem target. Saved linked-path spellings are
+likewise immutable outside a successful enumeration; ordinary cache
+canonicalization only moves project review rows. Migrated primary aliases in
 either failure or association state are trusted only when the persisted primary
 was already canonical; unresolvable or noncanonical legacy associations are
 never inferred from their current target or discarded merely because a new
@@ -71,8 +73,10 @@ checkout reuses the same path spelling. While any discovery failure is active,
 such untrusted legacy association state blocks all cached projects. As another
 conservative fallback, if a saved linked identity is unresolvable or no longer
 canonical, all cached projects are temporarily blocked until successful
-discovery safely replaces the association. An explicit forced run still
-bypasses either durable block.
+discovery safely replaces the association. Discovery-error diagnostics remain
+in history, but a successful enumeration resolves their safety effect for that
+primary immediately; unrelated ordinary scan errors remain effective. An
+explicit forced run still bypasses either durable block.
 
 ## Safe Cleaning Model
 

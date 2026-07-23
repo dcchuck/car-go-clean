@@ -1344,3 +1344,112 @@ fn cli_reused_v4_untrusted_primary_does_not_release_historical_child() {
     assert!(!marker.exists());
     assert!(child.join("target/blob.bin").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_successful_discovery_resolves_only_its_effective_scan_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let work_path = work.path().canonicalize().unwrap();
+    let primary = work_path.join("primary");
+    let linked = work_path.join("linked");
+    let unrelated = work_path.join("unrelated");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(linked.join("target")).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(primary.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(linked.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(linked.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+    let canonical_unrelated = unrelated.canonicalize().unwrap();
+    let state = work_path.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_linked))
+        .unwrap();
+    store
+        .record_error(&car_go_clean::store::ErrorRecord {
+            id: 0,
+            ts: SystemTime::now(),
+            category: "worktree_discovery".to_string(),
+            path: Some(canonical_primary.to_string_lossy().into_owned()),
+            message: "git failed".to_string(),
+        })
+        .unwrap();
+    store
+        .record_error(&car_go_clean::store::ErrorRecord {
+            id: 0,
+            ts: SystemTime::now(),
+            category: "scan".to_string(),
+            path: Some(canonical_unrelated.to_string_lossy().into_owned()),
+            message: "permission denied".to_string(),
+        })
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "git failed")
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_linked))
+        .unwrap();
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+    drop(store);
+    std::thread::sleep(Duration::from_millis(10));
+
+    let bin_dir = work_path.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let marker = work_path.join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nif [ \"$1\" = clean ]; then rm -rf target; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = work_path.join("config.toml");
+    fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains(format!(
+            "cleanable\tworkspace\t4096\t{}",
+            canonical_linked.display()
+        )));
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("run")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &work_path)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("cleaned=1"));
+
+    assert!(marker.exists());
+    assert!(!linked.join("target").exists());
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+}

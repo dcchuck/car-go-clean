@@ -31,6 +31,13 @@ pub struct ScanReport {
 pub struct ScanError {
     pub path: PathBuf,
     pub message: String,
+    pub kind: ScanErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanErrorKind {
+    Scan,
+    WorktreeDiscovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,6 +616,7 @@ fn record_discovery_failure(
     errors.push(ScanError {
         path: primary.to_path_buf(),
         message: message.to_string(),
+        kind: ScanErrorKind::WorktreeDiscovery,
     });
 }
 
@@ -620,6 +628,7 @@ fn non_utf8_scan_error(path: &Path) -> ScanError {
     ScanError {
         path: path.to_path_buf(),
         message: "project path is non-UTF-8 and cannot be persisted safely".to_string(),
+        kind: ScanErrorKind::Scan,
     }
 }
 
@@ -657,6 +666,7 @@ fn scan_error(path: impl AsRef<Path>, err: std::io::Error) -> ScanError {
     ScanError {
         path: path.as_ref().to_path_buf(),
         message: err.to_string(),
+        kind: ScanErrorKind::Scan,
     }
 }
 

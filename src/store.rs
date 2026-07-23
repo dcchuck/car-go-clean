@@ -291,6 +291,38 @@ impl Store {
             tx.execute("INSERT INTO schema_version (version) VALUES (6)", [])?;
             tx.commit()?;
         }
+        if current < 7 {
+            let tx = self.conn.unchecked_transaction()?;
+            let has_errors = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='errors'
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if has_errors {
+                tx.execute(
+                    "
+                    UPDATE errors
+                    SET category='worktree_discovery'
+                    WHERE category='scan'
+                      AND path IS NOT NULL
+                      AND EXISTS(
+                          SELECT 1
+                          FROM worktree_discovery_failures
+                          WHERE (primary_path=errors.path
+                                 OR canonical_primary_path=errors.path)
+                            AND failed_at=errors.ts
+                            AND message=errors.message
+                      )
+                    ",
+                    [],
+                )?;
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (7)", [])?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -687,7 +719,6 @@ impl Store {
                 UNION
                 SELECT linked_path AS identity
                 FROM linked_worktrees
-                WHERE canonical_primary_path IS NULL
             )
             ORDER BY identity
             ",
@@ -849,8 +880,22 @@ impl Store {
     pub fn scan_error_paths_since(&self, since: SystemTime) -> Result<Vec<PathBuf>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT path FROM errors
-            WHERE ts >= ?1 AND category = 'scan' AND path IS NOT NULL
+            SELECT DISTINCT path
+            FROM errors
+            WHERE ts >= ?1
+              AND path IS NOT NULL
+              AND (
+                  category = 'scan'
+                  OR (
+                      category = 'worktree_discovery'
+                      AND EXISTS(
+                          SELECT 1
+                          FROM worktree_discovery_failures
+                          WHERE primary_path = errors.path
+                             OR canonical_primary_path = errors.path
+                      )
+                  )
+              )
             ORDER BY path
             ",
         )?;

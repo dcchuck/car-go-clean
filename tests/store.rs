@@ -370,6 +370,59 @@ fn project_only_cache_rekey_preserves_trusted_association_provenance() {
 
 #[cfg(unix)]
 #[test]
+fn trusted_linked_association_path_is_frozen_during_ordinary_normalization() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let primary = root_path.join("primary");
+    let linked = root_path.join("linked");
+    let unrelated = root_path.join("unrelated");
+    for path in [&primary, &linked, &unrelated] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+    let canonical_unrelated = unrelated.canonicalize().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = test_store(&db_path);
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_linked))
+        .unwrap();
+
+    fs::remove_dir(&canonical_linked).unwrap();
+    symlink(&canonical_unrelated, &canonical_linked).unwrap();
+    store.normalize_resolvable_project_aliases().unwrap();
+
+    let inspection = rusqlite::Connection::open(&db_path).unwrap();
+    let persisted_linked = inspection
+        .query_row(
+            "SELECT linked_path FROM linked_worktrees WHERE canonical_primary_path=?1",
+            [canonical_primary.to_str().unwrap()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_linked, canonical_linked.to_str().unwrap());
+    drop(inspection);
+
+    fs::remove_file(&canonical_linked).unwrap();
+    fs::create_dir(&canonical_linked).unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::UNIX_EPOCH,
+            "primary failed",
+        )
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_linked, canonical_primary]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_success() {
     use std::os::unix::fs::symlink;
 
@@ -746,6 +799,98 @@ fn scan_error_paths_since_returns_only_scan_paths() {
             .unwrap(),
         vec![std::path::PathBuf::from("/tmp/blocked")]
     );
+}
+
+#[test]
+fn resolved_discovery_error_stops_blocking_without_hiding_ordinary_scan_error() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let unrelated = root.path().join("unrelated");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    let primary = primary.canonicalize().unwrap();
+    let unrelated = unrelated.canonicalize().unwrap();
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "worktree_discovery".to_string(),
+            path: Some(primary.to_string_lossy().into_owned()),
+            message: "git failed".to_string(),
+        })
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "scan".to_string(),
+            path: Some(unrelated.to_string_lossy().into_owned()),
+            message: "permission denied".to_string(),
+        })
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&primary, now, "git failed")
+        .unwrap();
+
+    assert_eq!(
+        store
+            .scan_error_paths_since(SystemTime::UNIX_EPOCH)
+            .unwrap(),
+        vec![primary.clone(), unrelated.clone()]
+    );
+
+    store.replace_linked_worktrees(&primary, &[]).unwrap();
+    assert_eq!(
+        store
+            .scan_error_paths_since(SystemTime::UNIX_EPOCH)
+            .unwrap(),
+        vec![unrelated]
+    );
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+}
+
+#[test]
+fn migration_classifies_matching_active_legacy_discovery_diagnostic() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    fs::create_dir_all(&primary).unwrap();
+    let primary = primary.canonicalize().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    {
+        let store = test_store(&db_path);
+        store
+            .record_error(&ErrorRecord {
+                id: 0,
+                ts: now,
+                category: "scan".to_string(),
+                path: Some(primary.to_string_lossy().into_owned()),
+                message: "git failed".to_string(),
+            })
+            .unwrap();
+        store
+            .mark_worktree_discovery_failed(&primary, now, "git failed")
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute("DELETE FROM schema_version WHERE version >= 7", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store.replace_linked_worktrees(&primary, &[]).unwrap();
+
+    assert!(store
+        .scan_error_paths_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "worktree_discovery");
 }
 
 #[test]
