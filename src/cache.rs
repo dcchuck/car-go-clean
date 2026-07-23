@@ -17,6 +17,7 @@ impl<'a> Cache<'a> {
     }
 
     pub fn sync_on_disk(&self) -> Result<Vec<PathBuf>> {
+        self.store.normalize_resolvable_project_aliases()?;
         let mut removed = Vec::new();
         for project in self.store.all_projects()? {
             let path = PathBuf::from(&project.path);

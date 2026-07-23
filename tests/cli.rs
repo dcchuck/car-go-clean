@@ -225,6 +225,100 @@ fn non_forced_cli_reviews_honor_durable_discovery_blocks_and_force_bypasses_them
 
 #[cfg(unix)]
 #[test]
+fn cli_reviews_normalize_alias_only_linked_provenance_without_a_prior_scan() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempfile::tempdir().unwrap();
+    let primary = work.path().join("tree/router");
+    let child = work.path().join("tree/linked");
+    let child_alias = work.path().join("tree/linked-alias");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(child.join("target/debug")).unwrap();
+    fs::write(primary.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(child.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(child.join("target/debug/blob.bin"), vec![0; 4096]).unwrap();
+    symlink(&child, &child_alias).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("tree").display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    store
+        .upsert_project(&canonical_child, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&child_alias))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "git failed")
+        .unwrap();
+    drop(store);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("skipped:scan_error"))
+        .stdout(contains(canonical_child.display().to_string()));
+
+    let store = Store::open(state.join("state.db")).unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&child_alias))
+        .unwrap();
+    store
+        .upsert_project(&canonical_child, SystemTime::now())
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "git failed")
+        .unwrap();
+    drop(store);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 0"))
+        .stdout(contains("scan_error=1"));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--force", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains(
+            canonical_child.join("target").display().to_string(),
+        ));
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dry_run_records_unreadable_targets_in_error_logs() {
     use std::os::unix::fs::PermissionsExt;
 

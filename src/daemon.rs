@@ -298,13 +298,27 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
 
             let now = SystemTime::now();
+            if now >= schedule.next_scan_at {
+                if let Err(err) = self.scan_cycle() {
+                    let retry_delay = self.opts.scan_interval.max(Duration::from_secs(1));
+                    let retry_at = SystemTime::now() + retry_delay;
+                    schedule.next_scan_at = retry_at;
+                    schedule.next_clean_at = schedule.next_clean_at.max(retry_at);
+                    self.store.record_scheduler_status(
+                        SystemTime::now(),
+                        schedule.next_clean_at,
+                        schedule.next_scan_at,
+                    )?;
+                    if let Some(logger) = &self.logger {
+                        logger.error(format!("scan cycle failed; retry scheduled: {err}"));
+                    }
+                    continue;
+                }
+                schedule.next_scan_at = SystemTime::now() + self.opts.scan_interval;
+            }
             if now >= schedule.next_clean_at {
                 self.run_cycle()?;
                 schedule.next_clean_at = SystemTime::now() + self.opts.clean_interval;
-            }
-            if now >= schedule.next_scan_at {
-                self.scan_cycle()?;
-                schedule.next_scan_at = SystemTime::now() + self.opts.scan_interval;
             }
             self.store.record_scheduler_status(
                 SystemTime::now(),

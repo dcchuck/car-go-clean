@@ -466,6 +466,237 @@ fn daemon_uses_persisted_overdue_clean_schedule_after_restart() {
 }
 
 #[test]
+fn scheduler_scans_before_cleaning_when_equal_deadlines_are_overdue() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = root.path().join("linked");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_primary, SystemTime::now())
+        .unwrap();
+    store
+        .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, &[canonical_linked.clone()])
+        .unwrap();
+    let now = SystemTime::now();
+    let overdue = now.checked_sub(Duration::from_secs(1)).unwrap();
+    store
+        .record_scheduler_status(now, overdue, overdue)
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::failure("git failed")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_linked, canonical_primary]
+    );
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 0);
+}
+
+#[test]
+fn scheduler_reconciles_successful_exclusions_before_equal_due_clean() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let excluded = root.path().join("excluded/team/worktree");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&excluded.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&excluded.join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_excluded = excluded.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_primary, SystemTime::now())
+        .unwrap();
+    store
+        .upsert_project(&canonical_excluded, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, &[canonical_excluded.clone()])
+        .unwrap();
+    let now = SystemTime::now();
+    let overdue = now.checked_sub(Duration::from_secs(1)).unwrap();
+    store
+        .record_scheduler_status(now, overdue, overdue)
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec!["excluded/team".to_string()],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![canonical_excluded])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![canonical_primary.to_string_lossy().into_owned()]
+    );
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn scheduler_defers_clean_and_retry_after_scan_persistence_failure() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let linked = root.path().join("linked");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_primary, SystemTime::now())
+        .unwrap();
+    store
+        .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, &[canonical_linked])
+        .unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_discovery_failure
+            BEFORE INSERT ON worktree_discovery_failures
+            BEGIN
+                SELECT RAISE(FAIL, 'injected discovery persistence failure');
+            END;
+            ",
+        )
+        .unwrap();
+    let now = SystemTime::now();
+    let overdue = now.checked_sub(Duration::from_secs(1)).unwrap();
+    store
+        .record_scheduler_status(now, overdue, overdue)
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::failure("git failed")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::ZERO,
+            target_quiet_period: Duration::ZERO,
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert!(runner.calls.lock().unwrap().is_empty());
+    let schedule = store.scheduler_status().unwrap().unwrap();
+    assert!(schedule.next_scan_at > now);
+    assert!(schedule.next_clean_at >= schedule.next_scan_at);
+    assert!(store.last_run().is_err());
+}
+
+#[test]
 fn daemon_run_cycle_skips_recent_targets_by_default() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
