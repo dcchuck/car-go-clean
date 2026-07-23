@@ -2,6 +2,7 @@ use crate::safety::ReviewSummary;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -175,6 +176,25 @@ impl Store {
                 ",
             )?;
         }
+        if current < 4 {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS linked_worktrees (
+                    primary_path TEXT NOT NULL,
+                    linked_path TEXT NOT NULL,
+                    PRIMARY KEY (primary_path, linked_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_linked_worktrees_linked
+                    ON linked_worktrees(linked_path);
+                CREATE TABLE IF NOT EXISTS worktree_discovery_failures (
+                    primary_path TEXT PRIMARY KEY,
+                    failed_at INTEGER NOT NULL,
+                    message TEXT NOT NULL
+                );
+                INSERT INTO schema_version (version) VALUES (4);
+                ",
+            )?;
+        }
         Ok(())
     }
 
@@ -206,11 +226,77 @@ impl Store {
     }
 
     pub fn remove_project(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path_to_string(path.as_ref());
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM linked_worktrees WHERE primary_path=?1 OR linked_path=?1",
+            [&path],
+        )?;
+        tx.execute(
+            "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+            [&path],
+        )?;
+        tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
+        let primary = path_to_string(primary);
+        let linked: BTreeSet<_> = linked.iter().map(|path| path_to_string(path)).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM linked_worktrees WHERE primary_path=?1",
+            [&primary],
+        )?;
+        for linked_path in linked {
+            tx.execute(
+                "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+                params![primary, linked_path],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+            [&primary],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_worktree_discovery_failed(
+        &self,
+        primary: &Path,
+        now: SystemTime,
+        message: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM projects WHERE path=?1",
-            [path_to_string(path.as_ref())],
+            "
+            INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(primary_path) DO UPDATE SET
+                failed_at = excluded.failed_at,
+                message = excluded.message
+            ",
+            params![path_to_string(primary), to_epoch(now)?, message],
         )?;
         Ok(())
+    }
+
+    pub fn blocked_linked_worktrees(&self) -> Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT linked_path
+            FROM linked_worktrees
+            INNER JOIN worktree_discovery_failures
+                ON linked_worktrees.primary_path = worktree_discovery_failures.primary_path
+            ORDER BY linked_path
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            Ok(PathBuf::from(path))
+        })?;
+        collect_rows(rows)
     }
 
     pub fn mark_project_cleaned(&self, path: impl AsRef<Path>, when: SystemTime) -> Result<()> {

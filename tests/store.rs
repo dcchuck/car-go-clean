@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use car_go_clean::safety::ReviewSummary;
@@ -24,6 +24,42 @@ fn open_creates_file_and_migrations_create_tables() {
     assert!(store.table_exists("runs").unwrap());
     assert!(store.table_exists("review_status").unwrap());
     assert!(store.table_exists("scheduler_state").unwrap());
+    assert!(store.table_exists("linked_worktrees").unwrap());
+    assert!(store.table_exists("worktree_discovery_failures").unwrap());
+}
+
+#[test]
+fn linked_worktree_failure_blocks_cached_children_until_success() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let primary = Path::new("/workspace/main");
+    let linked = PathBuf::from("/workspace/main/.worktrees/feature");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+    store
+        .replace_linked_worktrees(primary, &[linked.clone()])
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(primary, now, "git failed")
+        .unwrap();
+    assert_eq!(
+        store.blocked_linked_worktrees().unwrap(),
+        vec![linked.clone()]
+    );
+
+    store.replace_linked_worktrees(primary, &[linked]).unwrap();
+    assert!(store.blocked_linked_worktrees().unwrap().is_empty());
+}
+
+#[test]
+fn removing_project_removes_linked_worktree_provenance() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let primary = Path::new("/workspace/main");
+    let linked = PathBuf::from("/workspace/main/.worktrees/feature");
+    store
+        .replace_linked_worktrees(primary, &[linked.clone()])
+        .unwrap();
+    store.remove_project(primary).unwrap();
+    assert!(store.blocked_linked_worktrees().unwrap().is_empty());
 }
 
 #[test]
