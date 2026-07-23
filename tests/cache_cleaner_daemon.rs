@@ -907,7 +907,7 @@ fn scheduler_scans_before_cleaning_when_equal_deadlines_are_overdue() {
         .upsert_project(&canonical_linked, SystemTime::now())
         .unwrap();
     store
-        .replace_linked_worktrees(&canonical_primary, &[canonical_linked.clone()])
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_linked))
         .unwrap();
     let now = SystemTime::now();
     let overdue = now.checked_sub(Duration::from_secs(1)).unwrap();
@@ -978,7 +978,10 @@ fn scheduler_reconciles_successful_exclusions_before_equal_due_clean() {
         .upsert_project(&canonical_excluded, SystemTime::now())
         .unwrap();
     store
-        .replace_linked_worktrees(&canonical_primary, &[canonical_excluded.clone()])
+        .replace_linked_worktrees(
+            &canonical_primary,
+            std::slice::from_ref(&canonical_excluded),
+        )
         .unwrap();
     let now = SystemTime::now();
     let overdue = now.checked_sub(Duration::from_secs(1)).unwrap();
@@ -1466,7 +1469,10 @@ fn daemon_excludes_canonical_git_candidate_beneath_multi_component_exclusion() {
     store.migrate().unwrap();
     store.upsert_project(&excluded, SystemTime::now()).unwrap();
     store
-        .replace_linked_worktrees(&primary.canonicalize().unwrap(), &[excluded.clone()])
+        .replace_linked_worktrees(
+            &primary.canonicalize().unwrap(),
+            std::slice::from_ref(&excluded),
+        )
         .unwrap();
     let runner = FakeRunner::default();
     let daemon = Daemon::new(
@@ -1539,7 +1545,7 @@ fn successful_canonical_discovery_clears_alias_keyed_failure_and_stale_provenanc
     store.migrate().unwrap();
     store.upsert_project(&alias, SystemTime::now()).unwrap();
     store
-        .replace_linked_worktrees(&alias, &[stale.clone()])
+        .replace_linked_worktrees(&alias, std::slice::from_ref(&stale))
         .unwrap();
     store
         .mark_worktree_discovery_failed(&alias, SystemTime::now(), "legacy failure")
@@ -1669,6 +1675,121 @@ fn failed_discovery_blocks_canonical_child_from_alias_only_provenance() {
         .unwrap();
     assert_eq!(result.cleaned, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = root.path().join("linked");
+    let linked_alias = root.path().join("linked-alias");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+    symlink(&linked, &linked_alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&linked_alias))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::now(),
+            "active legacy failure",
+        )
+        .unwrap();
+    fs::remove_file(&linked_alias).unwrap();
+
+    let runner = FakeRunner::default();
+    let daemon_options = DaemonOptions {
+        target_quiet_period: Duration::ZERO,
+        ..DaemonOptions::default()
+    };
+    let scanner_options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+    let failed_state = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options.clone(),
+            Arc::new(FakeWorktreeResolver::failure("still failing")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+
+    let result = failed_state
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let forced = failed_state
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(forced.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    runner.calls.lock().unwrap().clear();
+
+    symlink(&linked, &linked_alias).unwrap();
+    let repaired_state = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options,
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+    repaired_state.scan_cycle().unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+
+    let repaired = repaired_state
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(repaired.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
 }
 
 #[test]

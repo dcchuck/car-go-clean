@@ -36,7 +36,7 @@ fn linked_worktree_failure_blocks_cached_children_until_success() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
 
     store
-        .replace_linked_worktrees(primary, &[linked.clone()])
+        .replace_linked_worktrees(primary, std::slice::from_ref(&linked))
         .unwrap();
     store
         .mark_worktree_discovery_failed(primary, now, "git failed")
@@ -56,7 +56,7 @@ fn removing_project_preserves_linked_worktree_provenance() {
     let primary = Path::new("/workspace/main");
     let linked = PathBuf::from("/workspace/main/.worktrees/feature");
     store
-        .replace_linked_worktrees(primary, &[linked.clone()])
+        .replace_linked_worktrees(primary, std::slice::from_ref(&linked))
         .unwrap();
     store.remove_project(primary).unwrap();
     store
@@ -74,7 +74,7 @@ fn removing_failed_primary_project_preserves_durable_association_until_success()
     let primary = Path::new("/workspace/main");
     let linked = PathBuf::from("/workspace/feature");
     store
-        .replace_linked_worktrees(primary, &[linked.clone()])
+        .replace_linked_worktrees(primary, std::slice::from_ref(&linked))
         .unwrap();
     store
         .mark_worktree_discovery_failed(primary, SystemTime::UNIX_EPOCH, "git failed")
@@ -99,7 +99,7 @@ fn non_utf8_provenance_is_rejected_before_replacing_existing_failure_state() {
     let linked = PathBuf::from("/workspace/main/.worktrees/saved");
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     store
-        .replace_linked_worktrees(primary, &[linked.clone()])
+        .replace_linked_worktrees(primary, std::slice::from_ref(&linked))
         .unwrap();
     store
         .mark_worktree_discovery_failed(primary, now, "git failed")
@@ -164,7 +164,7 @@ fn replacing_project_path_deduplicates_metadata_and_provenance() {
     store.upsert_project(old, t2).unwrap();
     store.mark_project_cleaned(old, t2).unwrap();
     store
-        .replace_linked_worktrees(old, &[linked.clone()])
+        .replace_linked_worktrees(old, std::slice::from_ref(&linked))
         .unwrap();
     store
         .mark_worktree_discovery_failed(old, t2, "git failed")
@@ -201,7 +201,7 @@ fn normalizing_resolvable_orphan_alias_rekeys_provenance_before_success() {
 
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     store
-        .replace_linked_worktrees(&alias, &[stale.clone()])
+        .replace_linked_worktrees(&alias, std::slice::from_ref(&stale))
         .unwrap();
     store
         .mark_worktree_discovery_failed(&alias, SystemTime::UNIX_EPOCH, "legacy failure")
@@ -209,7 +209,7 @@ fn normalizing_resolvable_orphan_alias_rekeys_provenance_before_success() {
 
     store.normalize_resolvable_project_aliases().unwrap();
     store
-        .replace_linked_worktrees(&canonical, &[current.clone()])
+        .replace_linked_worktrees(&canonical, std::slice::from_ref(&current))
         .unwrap();
 
     assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());

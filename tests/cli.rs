@@ -319,6 +319,99 @@ fn cli_reviews_normalize_alias_only_linked_provenance_without_a_prior_scan() {
 
 #[cfg(unix)]
 #[test]
+fn cli_run_blocks_canonical_child_for_broken_alias_in_active_provenance() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let work = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let marker = work.path().join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nif [ \"$1\" = clean ]; then rm -rf target; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let primary = work.path().join("tree/router");
+    let child = work.path().join("tree/linked");
+    let child_alias = work.path().join("tree/linked-alias");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(child.join("target/debug")).unwrap();
+    fs::write(primary.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(child.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(child.join("target/debug/blob.bin"), vec![0; 4096]).unwrap();
+    symlink(&child, &child_alias).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("tree").display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    store
+        .upsert_project(&canonical_child, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&child_alias))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::now(),
+            "active legacy failure",
+        )
+        .unwrap();
+    fs::remove_file(&child_alias).unwrap();
+    drop(store);
+
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("run")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("cleaned=0"))
+        .stdout(contains("skipped=1"));
+    assert!(child.join("target/debug/blob.bin").exists());
+    assert!(!marker.exists());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--force", "--all"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 1"));
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dry_run_records_unreadable_targets_in_error_logs() {
     use std::os::unix::fs::PermissionsExt;
 

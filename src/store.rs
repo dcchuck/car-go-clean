@@ -373,7 +373,20 @@ impl Store {
             let path: String = row.get(0)?;
             Ok(PathBuf::from(path))
         })?;
-        collect_rows(rows)
+        let blocked = collect_rows(rows)?;
+        drop(stmt);
+
+        if blocked.iter().all(|path| fs::canonicalize(path).is_ok()) {
+            return Ok(blocked);
+        }
+
+        let mut fail_closed = blocked.into_iter().collect::<BTreeSet<_>>();
+        fail_closed.extend(
+            self.all_projects()?
+                .into_iter()
+                .map(|project| PathBuf::from(project.path)),
+        );
+        Ok(fail_closed.into_iter().collect())
     }
 
     pub fn mark_project_cleaned(&self, path: impl AsRef<Path>, when: SystemTime) -> Result<()> {
