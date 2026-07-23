@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use car_go_clean::activity::NoopProcessInspector;
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
-use car_go_clean::daemon::{Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
 use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::safety::SafetyOptions;
-use car_go_clean::scanner::{Scanner, ScannerOptions};
+use car_go_clean::scanner::{GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions};
 use car_go_clean::store::{ErrorRecord, Store};
 
 fn write_file(path: &Path, body: &[u8]) {
@@ -79,6 +79,29 @@ impl CommandRunner for FakeRunner {
             exit_code: self.exit_code,
             stderr: self.stderr.clone(),
         })
+    }
+}
+
+#[derive(Clone)]
+struct FakeWorktreeResolver {
+    result: Result<Vec<PathBuf>, String>,
+}
+
+impl FakeWorktreeResolver {
+    fn paths(paths: Vec<PathBuf>) -> Self {
+        Self { result: Ok(paths) }
+    }
+
+    fn failure(message: &str) -> Self {
+        Self {
+            result: Err(message.to_string()),
+        }
+    }
+}
+
+impl GitWorktreeResolver for FakeWorktreeResolver {
+    fn linked_worktrees(&self, _primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError> {
+        self.result.clone().map_err(GitWorktreeError::new)
     }
 }
 
@@ -566,4 +589,121 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
     assert_eq!(errors[0].category, "scan");
     assert_eq!(errors[0].path.as_deref(), Some(blocked.to_str().unwrap()));
     assert!(errors[0].message.contains("Permission denied"));
+}
+
+#[test]
+fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon_options = DaemonOptions {
+        target_quiet_period: Duration::ZERO,
+        ..DaemonOptions::default()
+    };
+    let scanner_options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+
+    let successful_scan = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options.clone(),
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+    successful_scan.scan_cycle().unwrap();
+
+    let failed_scan = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options.clone(),
+            Arc::new(FakeWorktreeResolver::failure("git failed")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+    failed_scan.scan_cycle().unwrap();
+    let result = failed_scan
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let successful_scan = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options,
+            Arc::new(FakeWorktreeResolver::paths(vec![linked])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+    successful_scan.scan_cycle().unwrap();
+    let result = successful_scan
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn daemon_defaults_to_daily_scans() {
+    assert_eq!(
+        DaemonOptions::default().scan_interval,
+        Duration::from_secs(24 * 60 * 60)
+    );
+}
+
+#[test]
+fn daemon_clamps_only_legacy_scan_deadlines_beyond_the_current_interval() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let interval = Duration::from_secs(24 * 60 * 60);
+    let old_deadline = now + Duration::from_secs(6 * 24 * 60 * 60);
+    let earlier_deadline = now + Duration::from_secs(60 * 60);
+
+    assert_eq!(
+        clamp_next_scan_at(old_deadline, now, interval),
+        now + interval
+    );
+    assert_eq!(
+        clamp_next_scan_at(earlier_deadline, now, interval),
+        earlier_deadline
+    );
 }

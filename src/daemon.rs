@@ -3,7 +3,7 @@ use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
 use crate::logging::Logger;
 use crate::safety::{review_project, review_summary, CleanDecision, SafetyOptions};
-use crate::scanner::Scanner;
+use crate::scanner::{Scanner, WorktreeDiscovery};
 use crate::store::{CleanEvent, ErrorRecord, SchedulerStatus, Store};
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -53,7 +53,7 @@ impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
             clean_interval: Duration::from_secs(24 * 60 * 60),
-            scan_interval: Duration::from_secs(7 * 24 * 60 * 60),
+            scan_interval: Duration::from_secs(24 * 60 * 60),
             target_quiet_period: Duration::from_secs(2 * 60 * 60),
         }
     }
@@ -112,6 +112,24 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 message: error.message,
             })?;
         }
+        for discovery in report.worktree_discoveries {
+            match discovery {
+                WorktreeDiscovery::Success { primary, linked } => {
+                    self.store.replace_linked_worktrees(&primary, &linked)?;
+                }
+                WorktreeDiscovery::Failure { primary, message } => {
+                    self.store
+                        .mark_worktree_discovery_failed(&primary, now, &message)?;
+                    self.store.record_error(&ErrorRecord {
+                        id: 0,
+                        ts: now,
+                        category: "scan".to_string(),
+                        path: Some(primary.to_string_lossy().into_owned()),
+                        message,
+                    })?;
+                }
+            }
+        }
         for path in report.projects {
             if let Err(err) = self.store.upsert_project(&path, now) {
                 self.store.record_error(&ErrorRecord {
@@ -153,7 +171,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let scan_error_since = started
             .checked_sub(self.opts.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let mut scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        scan_errors.extend(self.store.blocked_linked_worktrees()?);
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -294,7 +313,20 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     fn scheduler_status_or_initialize(&self) -> Result<SchedulerStatus> {
-        if let Some(status) = self.store.scheduler_status()? {
+        if let Some(mut status) = self.store.scheduler_status()? {
+            let next_scan_at = clamp_next_scan_at(
+                status.next_scan_at,
+                SystemTime::now(),
+                self.opts.scan_interval,
+            );
+            if next_scan_at != status.next_scan_at {
+                status.next_scan_at = next_scan_at;
+                self.store.record_scheduler_status(
+                    status.updated_at,
+                    status.next_clean_at,
+                    status.next_scan_at,
+                )?;
+            }
             return Ok(status);
         }
 
@@ -318,6 +350,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         )?;
         Ok(status)
     }
+}
+
+pub fn clamp_next_scan_at(
+    persisted: SystemTime,
+    now: SystemTime,
+    interval: Duration,
+) -> SystemTime {
+    persisted.min(now + interval)
 }
 
 fn wait_until_or_shutdown(deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
