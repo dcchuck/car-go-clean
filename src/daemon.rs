@@ -120,13 +120,6 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 WorktreeDiscovery::Failure { primary, message } => {
                     self.store
                         .mark_worktree_discovery_failed(&primary, now, &message)?;
-                    self.store.record_error(&ErrorRecord {
-                        id: 0,
-                        ts: now,
-                        category: "scan".to_string(),
-                        path: Some(primary.to_string_lossy().into_owned()),
-                        message,
-                    })?;
                 }
             }
         }

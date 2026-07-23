@@ -163,7 +163,7 @@ fn default_clean_interval() -> Duration {
 }
 
 fn default_scan_interval() -> Duration {
-    Duration::from_secs(7 * 24 * 60 * 60)
+    Duration::from_secs(24 * 60 * 60)
 }
 
 fn default_target_quiet_period() -> Duration {

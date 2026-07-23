@@ -641,6 +641,14 @@ fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() 
         daemon_options,
     );
     failed_scan.scan_cycle().unwrap();
+    let scan_errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(scan_errors.len(), 1);
+    assert_eq!(scan_errors[0].category, "scan");
+    assert_eq!(scan_errors[0].message, "git failed");
+    assert_eq!(
+        store.blocked_linked_worktrees().unwrap(),
+        vec![linked.canonicalize().unwrap()]
+    );
     let result = failed_scan
         .run_cycle_with_safety(
             SafetyOptions {

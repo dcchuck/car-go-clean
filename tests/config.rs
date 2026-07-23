@@ -12,7 +12,7 @@ fn default_config_scans_home_and_has_intervals() {
     assert_eq!(cfg.scan_dirs, vec![PathBuf::from(home)]);
     assert!(cfg.project_dirs.is_empty());
     assert_eq!(cfg.clean_interval, Duration::from_secs(24 * 60 * 60));
-    assert_eq!(cfg.scan_interval, Duration::from_secs(7 * 24 * 60 * 60));
+    assert_eq!(cfg.scan_interval, Duration::from_secs(24 * 60 * 60));
     assert_eq!(cfg.log_level, "info");
     assert!(cfg.excludes.contains(&"target".to_string()));
 }
