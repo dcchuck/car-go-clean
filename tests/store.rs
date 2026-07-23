@@ -144,6 +144,41 @@ fn upsert_project_preserves_discovery_and_updates_last_seen() {
 }
 
 #[test]
+fn replacing_project_path_deduplicates_metadata_and_provenance() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let old = Path::new("/workspace/legacy-alias");
+    let new = Path::new("/workspace/canonical");
+    let linked = PathBuf::from("/workspace/feature");
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+    let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(300);
+
+    store.upsert_project(old, t0).unwrap();
+    store.upsert_project(new, t1).unwrap();
+    store.upsert_project(old, t2).unwrap();
+    store.mark_project_cleaned(old, t2).unwrap();
+    store
+        .replace_linked_worktrees(old, &[linked.clone()])
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(old, t2, "git failed")
+        .unwrap();
+
+    store.replace_project_path(old, new).unwrap();
+
+    let projects = store.all_projects().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].path, new.to_str().unwrap());
+    assert_eq!(projects[0].discovered_at, t0);
+    assert_eq!(projects[0].last_seen_at, t2);
+    assert_eq!(projects[0].last_cleaned_at, Some(t2));
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![new.to_path_buf(), linked]
+    );
+}
+
+#[test]
 fn records_runs_clean_events_errors_and_stats() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);

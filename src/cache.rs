@@ -1,5 +1,5 @@
 use crate::store::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub struct Cache<'a> {
@@ -23,6 +23,13 @@ impl<'a> Cache<'a> {
             if !self.verify(&path)? {
                 self.store.remove_project(&path)?;
                 removed.push(path);
+                continue;
+            }
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("canonicalize cached project {}", path.display()))?;
+            if canonical != path {
+                self.store.replace_project_path(&path, &canonical)?;
             }
         }
         Ok(removed)

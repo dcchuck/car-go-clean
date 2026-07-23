@@ -246,6 +246,76 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_project_path(&self, old_path: &Path, new_path: &Path) -> Result<()> {
+        let old_path = path_to_string(old_path)?;
+        let new_path = path_to_string(new_path)?;
+        if old_path == new_path {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "
+            INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
+            SELECT ?2, discovered_at, last_seen_at, last_cleaned_at
+            FROM projects
+            WHERE path=?1
+            ON CONFLICT(path) DO UPDATE SET
+                discovered_at = MIN(projects.discovered_at, excluded.discovered_at),
+                last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at),
+                last_cleaned_at = CASE
+                    WHEN projects.last_cleaned_at IS NULL THEN excluded.last_cleaned_at
+                    WHEN excluded.last_cleaned_at IS NULL THEN projects.last_cleaned_at
+                    ELSE MAX(projects.last_cleaned_at, excluded.last_cleaned_at)
+                END
+            ",
+            params![old_path, new_path],
+        )?;
+        tx.execute(
+            "
+            INSERT OR IGNORE INTO linked_worktrees (primary_path, linked_path)
+            SELECT
+                CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END,
+                CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+            FROM linked_worktrees
+            WHERE (primary_path=?1 OR linked_path=?1)
+              AND CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END
+                  <> CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+            ",
+            params![old_path, new_path],
+        )?;
+        tx.execute(
+            "DELETE FROM linked_worktrees WHERE primary_path=?1 OR linked_path=?1",
+            [&old_path],
+        )?;
+        tx.execute(
+            "
+            INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
+            SELECT ?2, failed_at, message
+            FROM worktree_discovery_failures
+            WHERE primary_path=?1
+            ON CONFLICT(primary_path) DO UPDATE SET
+                failed_at = MAX(
+                    worktree_discovery_failures.failed_at,
+                    excluded.failed_at
+                ),
+                message = CASE
+                    WHEN excluded.failed_at >= worktree_discovery_failures.failed_at
+                    THEN excluded.message
+                    ELSE worktree_discovery_failures.message
+                END
+            ",
+            params![old_path, new_path],
+        )?;
+        tx.execute(
+            "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+            [&old_path],
+        )?;
+        tx.execute("DELETE FROM projects WHERE path=?1", [&old_path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
         let primary = path_to_string(primary)?;
         let linked: BTreeSet<_> = linked

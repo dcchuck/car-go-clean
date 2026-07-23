@@ -87,7 +87,8 @@ impl GitWorktreeResolver for SystemGitWorktreeResolver {
 }
 
 impl SystemGitWorktreeResolver {
-    fn worktree_paths_from_output(
+    #[doc(hidden)]
+    pub fn worktree_paths_from_output(
         &self,
         primary: &Path,
         output: &Output,
@@ -164,13 +165,16 @@ impl Scanner {
             )?;
         }
         for project in &self.opts.project_dirs {
-            self.add_configured_project(
-                project,
-                &canonical_roots,
-                &mut found,
-                &mut worktree_discoveries,
-                &mut errors,
-            );
+            if has_cargo_toml(project) {
+                self.add_cargo_project(
+                    project,
+                    &canonical_roots,
+                    false,
+                    &mut found,
+                    &mut worktree_discoveries,
+                    &mut errors,
+                );
+            }
         }
         Ok(ScanReport {
             projects: found.into_iter().collect(),
@@ -179,17 +183,15 @@ impl Scanner {
         })
     }
 
-    fn add_configured_project(
+    fn add_cargo_project(
         &self,
         project: &Path,
         canonical_roots: &[PathBuf],
+        honor_excludes: bool,
         found: &mut BTreeSet<PathBuf>,
         outcomes: &mut Vec<WorktreeDiscovery>,
         errors: &mut Vec<ScanError>,
     ) {
-        if !has_cargo_toml(project) {
-            return;
-        }
         let project = match fs::canonicalize(project) {
             Ok(project) => project,
             Err(err) => {
@@ -198,10 +200,14 @@ impl Scanner {
             }
         };
         if project.to_str().is_none() {
-            errors.push(non_utf8_scan_error(&project));
             if project.join(".git").is_dir() {
                 record_discovery_failure(&project, non_utf8_discovery_message(), outcomes, errors);
+            } else {
+                errors.push(non_utf8_scan_error(&project));
             }
+            return;
+        }
+        if (honor_excludes && self.should_skip(&project)) || !has_cargo_toml(&project) {
             return;
         }
         found.insert(project.clone());
@@ -230,19 +236,7 @@ impl Scanner {
             return Ok(());
         }
         if has_cargo_toml(dir) {
-            if dir.join(".git").is_dir() {
-                let primary = match fs::canonicalize(dir) {
-                    Ok(primary) => primary,
-                    Err(err) => {
-                        errors.push(scan_error(dir, err));
-                        return Ok(());
-                    }
-                };
-                found.insert(primary.clone());
-                self.discover_linked_worktrees(&primary, canonical_roots, found, outcomes, errors);
-            } else {
-                found.insert(dir.to_path_buf());
-            }
+            self.add_cargo_project(dir, canonical_roots, true, found, outcomes, errors);
             return Ok(());
         }
         let ignores = ignores_for(dir, parent_ignores);
@@ -377,28 +371,19 @@ fn parse_git_worktree_porcelain(
 
     let mut paths = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut in_record = false;
+    let mut record: Option<PorcelainWorktreeRecord> = None;
     let mut primary_records = 0;
     for field in output[..output.len() - 1].split(|byte| *byte == 0) {
         if field.is_empty() {
-            if !in_record {
-                return Err(GitWorktreeError::new(
-                    "git worktree list returned an empty or malformed record",
-                ));
-            }
-            in_record = false;
-            continue;
-        }
-
-        if !in_record {
-            let Some(path) = field.strip_prefix(b"worktree ") else {
-                return Err(GitWorktreeError::new(
-                    "git worktree list record does not start with a worktree path",
+            let Some(record) = record.take() else {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned an empty record",
                 ));
             };
-            let path = git_path_from_bytes(path)?;
+            record.validate()?;
+            let path = record.path;
             if !seen.insert(path.clone()) {
-                return Err(GitWorktreeError::new(
+                return Err(malformed_worktree_output(
                     "git worktree list returned a duplicate worktree path",
                 ));
             }
@@ -407,30 +392,177 @@ fn parse_git_worktree_porcelain(
             } else {
                 paths.push(path);
             }
-            in_record = true;
-        } else if field == b"worktree" || field.starts_with(b"worktree ") {
-            return Err(GitWorktreeError::new(
-                "git worktree list returned multiple worktree paths in one record",
-            ));
+            continue;
+        }
+
+        if let Some(record) = record.as_mut() {
+            record.add_field(field)?;
+        } else {
+            let Some(path) = field.strip_prefix(b"worktree ") else {
+                return Err(malformed_worktree_output(
+                    "git worktree list record does not start with a worktree path",
+                ));
+            };
+            let path = git_path_from_bytes(path)?;
+            if !path.is_absolute() {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned a relative worktree path",
+                ));
+            }
+            record = Some(PorcelainWorktreeRecord::new(path));
         }
     }
 
-    if in_record {
-        return Err(GitWorktreeError::new(
+    if record.is_some() {
+        return Err(malformed_worktree_output(
             "git worktree list returned a record without a terminating separator",
         ));
     }
     if seen.is_empty() {
-        return Err(GitWorktreeError::new(
+        return Err(malformed_worktree_output(
             "git worktree list returned no worktree records",
         ));
     }
     if primary_records != 1 {
-        return Err(GitWorktreeError::new(
+        return Err(malformed_worktree_output(
             "git worktree list did not include exactly one queried primary checkout",
         ));
     }
     Ok(paths)
+}
+
+#[derive(Debug)]
+struct PorcelainWorktreeRecord {
+    path: PathBuf,
+    head: bool,
+    branch: bool,
+    detached: bool,
+    bare: bool,
+    locked: bool,
+    prunable: bool,
+}
+
+impl PorcelainWorktreeRecord {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            head: false,
+            branch: false,
+            detached: false,
+            bare: false,
+            locked: false,
+            prunable: false,
+        }
+    }
+
+    fn add_field(&mut self, field: &[u8]) -> Result<(), GitWorktreeError> {
+        if let Some(object_id) = field.strip_prefix(b"HEAD ") {
+            if self.head
+                || self.branch
+                || self.detached
+                || self.bare
+                || self.locked
+                || self.prunable
+                || !valid_git_object_id(object_id)
+            {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned a duplicate or malformed HEAD field",
+                ));
+            }
+            self.head = true;
+        } else if let Some(branch) = field.strip_prefix(b"branch ") {
+            if !self.head
+                || self.branch
+                || self.detached
+                || self.bare
+                || self.locked
+                || self.prunable
+                || branch.is_empty()
+            {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned a duplicate or empty branch field",
+                ));
+            }
+            self.branch = true;
+        } else if field == b"detached" {
+            if !self.head
+                || self.branch
+                || self.detached
+                || self.bare
+                || self.locked
+                || self.prunable
+            {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned a duplicate detached field",
+                ));
+            }
+            self.detached = true;
+        } else if field == b"bare" {
+            if self.head
+                || self.branch
+                || self.detached
+                || self.bare
+                || self.locked
+                || self.prunable
+            {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned a duplicate bare field",
+                ));
+            }
+            self.bare = true;
+        } else if valid_optional_marker(field, b"locked") {
+            if !self.core_complete() || self.locked || self.prunable {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned an out-of-order or duplicate locked field",
+                ));
+            }
+            self.locked = true;
+        } else if valid_optional_marker(field, b"prunable") {
+            if !self.core_complete() || self.prunable {
+                return Err(malformed_worktree_output(
+                    "git worktree list returned an out-of-order or duplicate prunable field",
+                ));
+            }
+            self.prunable = true;
+        } else {
+            return Err(malformed_worktree_output(
+                "git worktree list returned an unknown or malformed field",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), GitWorktreeError> {
+        if self.core_complete() {
+            Ok(())
+        } else {
+            Err(malformed_worktree_output(
+                "git worktree list returned an incomplete or contradictory record",
+            ))
+        }
+    }
+
+    fn core_complete(&self) -> bool {
+        let valid_bare = self.bare && !self.head && !self.branch && !self.detached;
+        let valid_checkout = !self.bare && self.head && (self.branch ^ self.detached);
+        valid_bare || valid_checkout
+    }
+}
+
+fn valid_git_object_id(value: &[u8]) -> bool {
+    matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn valid_optional_marker(field: &[u8], marker: &[u8]) -> bool {
+    field == marker
+        || field
+            .strip_prefix(marker)
+            .and_then(|suffix| suffix.strip_prefix(b" "))
+            .is_some_and(|reason| !reason.is_empty())
+}
+
+fn malformed_worktree_output(message: &str) -> GitWorktreeError {
+    GitWorktreeError::new(message)
 }
 
 fn git_path_from_bytes(record: &[u8]) -> Result<PathBuf, GitWorktreeError> {
@@ -535,12 +667,63 @@ mod worktree_porcelain_tests {
     #[test]
     fn parser_accepts_complete_records_with_whitespace_and_newlines() {
         let primary = Path::new("/workspace/main checkout");
-        let output = b"worktree /workspace/main checkout\0HEAD abc\0branch refs/heads/main\0\0worktree /workspace/feature\ncheckout\0HEAD def\0detached\0\0";
+        let output = b"worktree /workspace/main checkout\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0\0worktree /workspace/feature\ncheckout\0HEAD abcdefabcdefabcdefabcdefabcdefabcdefabcd\0detached\0locked acceptance reason\0prunable missing gitdir\0\0";
 
         assert_eq!(
             parse_git_worktree_porcelain(primary, output).unwrap(),
             vec![PathBuf::from("/workspace/feature\ncheckout")]
         );
+    }
+
+    #[test]
+    fn parser_accepts_complete_bare_record() {
+        let primary = Path::new("/workspace/repo.git");
+        let output = b"worktree /workspace/repo.git\0bare\0locked\0\0";
+
+        assert!(parse_git_worktree_porcelain(primary, output)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parser_rejects_incomplete_or_contradictory_record_fields() {
+        let primary = Path::new("/workspace/main");
+        let oid = b"0123456789012345678901234567890123456789";
+        let mut cases = vec![
+            b"worktree /workspace/main\0\0".to_vec(),
+            b"worktree relative\0bare\0\0".to_vec(),
+            b"worktree /workspace/main\0HEAD abc\0branch refs/heads/main\0\0".to_vec(),
+            b"worktree /workspace/main\0HEAD 0123456789012345678901234567890123456789\0\0"
+                .to_vec(),
+            b"worktree /workspace/main\0HEAD 0123456789012345678901234567890123456789\0branch \0\0"
+                .to_vec(),
+            b"worktree /workspace/main\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0detached\0\0"
+                .to_vec(),
+            b"worktree /workspace/main\0bare\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0\0"
+                .to_vec(),
+            b"worktree /workspace/main\0bare\0unknown value\0\0".to_vec(),
+            b"worktree /workspace/main\0bare\0locked \0\0".to_vec(),
+            b"worktree /workspace/main\0bare\0prunable \0\0".to_vec(),
+            b"worktree /workspace/main\0bare\0bare\0\0".to_vec(),
+            b"worktree /workspace/main\0bare\0locked\0locked reason\0\0".to_vec(),
+            b"worktree /workspace/main\0locked\0bare\0\0".to_vec(),
+            b"worktree /workspace/main\0bare\0prunable reason\0locked reason\0\0".to_vec(),
+            b"worktree /workspace/main\0branch refs/heads/main\0HEAD 0123456789012345678901234567890123456789\0\0"
+                .to_vec(),
+        ];
+        let mut duplicate_head = b"worktree /workspace/main\0HEAD ".to_vec();
+        duplicate_head.extend_from_slice(oid);
+        duplicate_head.extend_from_slice(b"\0HEAD ");
+        duplicate_head.extend_from_slice(oid);
+        duplicate_head.extend_from_slice(b"\0detached\0\0");
+        cases.push(duplicate_head);
+
+        for output in cases {
+            assert!(
+                parse_git_worktree_porcelain(primary, &output).is_err(),
+                "unexpectedly accepted {output:?}"
+            );
+        }
     }
 
     #[test]
@@ -584,9 +767,8 @@ mod worktree_porcelain_tests {
         let primary = Path::new("/workspace/main");
         let success = Output {
             status: ExitStatus::from_raw(0),
-            stdout:
-                b"worktree /workspace/main\0HEAD abc\0\0worktree /workspace/feature\0HEAD def\0\0"
-                    .to_vec(),
+            stdout: b"worktree /workspace/main\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0\0worktree /workspace/feature\0HEAD abcdefabcdefabcdefabcdefabcdefabcdefabcd\0detached\0\0"
+                .to_vec(),
             stderr: Vec::new(),
         };
         let failure = Output {
@@ -613,8 +795,7 @@ mod worktree_porcelain_tests {
         use std::os::unix::ffi::OsStringExt;
 
         let primary = Path::new("/workspace/main");
-        let output =
-            b"worktree /workspace/main\0HEAD abc\0\0worktree /workspace/\xff\0HEAD def\0\0";
+        let output = b"worktree /workspace/main\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0\0worktree /workspace/\xff\0HEAD abcdefabcdefabcdefabcdefabcdefabcdefabcd\0detached\0\0";
         let parsed = parse_git_worktree_porcelain(primary, output).unwrap();
 
         assert_eq!(

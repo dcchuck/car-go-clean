@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -12,7 +12,9 @@ use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
 use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::safety::SafetyOptions;
-use car_go_clean::scanner::{GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions};
+use car_go_clean::scanner::{
+    GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, SystemGitWorktreeResolver,
+};
 use car_go_clean::store::{ErrorRecord, Store};
 
 fn write_file(path: &Path, body: &[u8]) {
@@ -42,6 +44,71 @@ fn cache_verify_and_sync_remove_dead_projects() {
     let removed = cache.sync_on_disk().unwrap();
     assert_eq!(removed, vec![PathBuf::from("/definitely/not/here")]);
     assert_eq!(store.all_projects().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_does_not_clean_a_persisted_alias_of_a_managed_cache_project() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Library/Caches/cached-project");
+    let alias = root.path().join("legacy-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    symlink(&project, &alias).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&alias, SystemTime::now()).unwrap();
+
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![alias.clone()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    assert_eq!(store.all_projects().unwrap().len(), 2);
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()]
+    );
 }
 
 #[derive(Clone, Default)]
@@ -102,6 +169,29 @@ impl FakeWorktreeResolver {
 impl GitWorktreeResolver for FakeWorktreeResolver {
     fn linked_worktrees(&self, _primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError> {
         self.result.clone().map_err(GitWorktreeError::new)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct SuccessfulOutputResolver {
+    stdout: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl GitWorktreeResolver for SuccessfulOutputResolver {
+    fn linked_worktrees(&self, primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError> {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        SystemGitWorktreeResolver.worktree_paths_from_output(
+            primary,
+            &Output {
+                status: ExitStatus::from_raw(0),
+                stdout: self.stdout.clone(),
+                stderr: Vec::new(),
+            },
+        )
     }
 }
 
@@ -807,6 +897,63 @@ fn daemon_non_utf8_discovery_failure_preserves_prior_association_and_block() {
             primary.canonicalize().unwrap(),
             saved.canonicalize().unwrap()
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_successful_git_output_preserves_prior_association_and_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/saved");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+    let successful = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            options.clone(),
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+    successful.scan_cycle().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "prior failure")
+        .unwrap();
+
+    let mut malformed = b"worktree ".to_vec();
+    malformed.extend_from_slice(canonical_primary.as_os_str().as_encoded_bytes());
+    malformed.extend_from_slice(b"\0\0");
+    let malformed_scan = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            options,
+            Arc::new(SuccessfulOutputResolver { stdout: malformed }),
+        ),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    malformed_scan.scan_cycle().unwrap();
+
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_primary, canonical_linked]
     );
 }
 

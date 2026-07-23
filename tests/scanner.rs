@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
+use car_go_clean::safety::{
+    review_project, CleanDecision, ProjectClass, SafetyOptions, SkipReason,
+};
 use car_go_clean::scanner::{
     GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, WorktreeDiscovery,
 };
@@ -72,7 +76,10 @@ fn scan_finds_cargo_toml_and_stops_descending() {
 
     assert_eq!(
         got,
-        vec![root.path().join("deep/x/y"), root.path().join("proj-a")]
+        vec![
+            root.path().join("deep/x/y").canonicalize().unwrap(),
+            root.path().join("proj-a").canonicalize().unwrap(),
+        ]
     );
 }
 
@@ -94,6 +101,43 @@ fn scan_includes_project_dirs_that_contain_cargo_toml() {
         scanner.scan().unwrap(),
         vec![root.path().canonicalize().unwrap()]
     );
+}
+
+#[test]
+fn configured_project_dir_remains_explicit_when_its_name_is_excluded_from_scans() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("explicit-project");
+    write_file(&project.join("Cargo.toml"), "[package]\n");
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![],
+        project_dirs: vec![project.clone()],
+        excludes: vec!["explicit-project".to_string()],
+    });
+
+    assert_eq!(
+        scanner.scan().unwrap(),
+        vec![project.canonicalize().unwrap()]
+    );
+}
+
+#[test]
+fn configured_non_projects_remain_silently_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let non_project = root.path().join("non-project");
+    fs::create_dir_all(&non_project).unwrap();
+    let missing = root.path().join("missing");
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![],
+        project_dirs: vec![non_project, missing],
+        excludes: vec![],
+    });
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert!(report.projects.is_empty());
+    assert!(report.errors.is_empty());
+    assert!(report.worktree_discoveries.is_empty());
 }
 
 #[test]
@@ -178,7 +222,10 @@ fn scan_respects_gitignore_files_in_scan_roots() {
         excludes: vec![],
     });
 
-    assert_eq!(scanner.scan().unwrap(), vec![root.path().join("kept")]);
+    assert_eq!(
+        scanner.scan().unwrap(),
+        vec![root.path().join("kept").canonicalize().unwrap()]
+    );
 }
 
 #[test]
@@ -205,7 +252,13 @@ fn scan_includes_cache_and_container_project_roots_when_not_excluded() {
         excludes: vec![],
     });
 
-    assert_eq!(scanner.scan().unwrap(), vec![bun_cache, orb_stack_cache]);
+    assert_eq!(
+        scanner.scan().unwrap(),
+        vec![
+            bun_cache.canonicalize().unwrap(),
+            orb_stack_cache.canonicalize().unwrap()
+        ]
+    );
 }
 
 #[test]
@@ -228,7 +281,11 @@ fn multi_component_excludes_skip_matching_subtrees() {
 
     assert_eq!(
         scanner.scan().unwrap(),
-        vec![root.path().join("Library/Other/kept-crate")]
+        vec![root
+            .path()
+            .join("Library/Other/kept-crate")
+            .canonicalize()
+            .unwrap()]
     );
 }
 
@@ -255,7 +312,10 @@ fn scan_skips_unreadable_directories_and_reports_errors() {
     let report = scanner.scan_with_errors().unwrap();
 
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(report.projects, vec![root.path().join("kept")]);
+    assert_eq!(
+        report.projects,
+        vec![root.path().join("kept").canonicalize().unwrap()]
+    );
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].path, blocked);
     assert!(report.errors[0].message.contains("Permission denied"));
@@ -477,9 +537,53 @@ fn scan_does_not_resolve_worktrees_for_linked_checkout_git_file() {
     );
 
     let report = scanner.scan_with_errors().unwrap();
-    assert_eq!(report.projects, vec![linked_checkout]);
+    assert_eq!(
+        report.projects,
+        vec![linked_checkout.canonicalize().unwrap()]
+    );
     assert!(report.worktree_discoveries.is_empty());
     assert!(resolver.calls().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_canonicalizes_non_git_alias_before_managed_cache_classification() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Library/Caches/cached-project");
+    let alias = root.path().join("workspace-alias");
+    write_file(&project.join("Cargo.toml"), "[package]\n");
+    write_file(&project.join("target/debug/blob.bin"), "payload");
+    symlink(&project, &alias).unwrap();
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![alias],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical = project.canonicalize().unwrap();
+
+    assert_eq!(report.projects, vec![canonical.clone()]);
+    let review = review_project(
+        &report.projects[0],
+        &[],
+        &[],
+        SystemTime::now() + Duration::from_secs(1),
+        &SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(review.class, ProjectClass::ManagedCache);
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::ManagedCache)
+    );
 }
 
 #[cfg(unix)]
