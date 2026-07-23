@@ -178,6 +178,44 @@ fn replacing_project_path_deduplicates_metadata_and_provenance() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn normalizing_resolvable_orphan_alias_rekeys_provenance_before_success() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().join("canonical");
+    let alias = root.path().join("orphan-alias");
+    let stale = root.path().join("stale-linked");
+    let current = root.path().join("current-linked");
+    fs::create_dir_all(&canonical).unwrap();
+    symlink(&canonical, &alias).unwrap();
+    let canonical = canonical.canonicalize().unwrap();
+
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    store
+        .replace_linked_worktrees(&alias, &[stale.clone()])
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&alias, SystemTime::UNIX_EPOCH, "legacy failure")
+        .unwrap();
+
+    store.normalize_resolvable_project_aliases().unwrap();
+    store
+        .replace_linked_worktrees(&canonical, &[current.clone()])
+        .unwrap();
+
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    store
+        .mark_worktree_discovery_failed(&canonical, SystemTime::UNIX_EPOCH, "new failure")
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical, current]
+    );
+}
+
 #[test]
 fn records_runs_clean_events_errors_and_stats() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));

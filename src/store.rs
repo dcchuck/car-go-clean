@@ -1,6 +1,6 @@
 use crate::safety::ReviewSummary;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -254,64 +254,46 @@ impl Store {
         }
 
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        replace_project_path_in_transaction(&tx, &old_path, &new_path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn normalize_resolvable_project_aliases(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
             "
-            INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
-            SELECT ?2, discovered_at, last_seen_at, last_cleaned_at
-            FROM projects
-            WHERE path=?1
-            ON CONFLICT(path) DO UPDATE SET
-                discovered_at = MIN(projects.discovered_at, excluded.discovered_at),
-                last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at),
-                last_cleaned_at = CASE
-                    WHEN projects.last_cleaned_at IS NULL THEN excluded.last_cleaned_at
-                    WHEN excluded.last_cleaned_at IS NULL THEN projects.last_cleaned_at
-                    ELSE MAX(projects.last_cleaned_at, excluded.last_cleaned_at)
-                END
+            SELECT path FROM projects
+            UNION
+            SELECT primary_path FROM linked_worktrees
+            UNION
+            SELECT linked_path FROM linked_worktrees
+            UNION
+            SELECT primary_path FROM worktree_discovery_failures
+            ORDER BY 1
             ",
-            params![old_path, new_path],
         )?;
-        tx.execute(
-            "
-            INSERT OR IGNORE INTO linked_worktrees (primary_path, linked_path)
-            SELECT
-                CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END,
-                CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
-            FROM linked_worktrees
-            WHERE (primary_path=?1 OR linked_path=?1)
-              AND CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END
-                  <> CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
-            ",
-            params![old_path, new_path],
-        )?;
-        tx.execute(
-            "DELETE FROM linked_worktrees WHERE primary_path=?1 OR linked_path=?1",
-            [&old_path],
-        )?;
-        tx.execute(
-            "
-            INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
-            SELECT ?2, failed_at, message
-            FROM worktree_discovery_failures
-            WHERE primary_path=?1
-            ON CONFLICT(primary_path) DO UPDATE SET
-                failed_at = MAX(
-                    worktree_discovery_failures.failed_at,
-                    excluded.failed_at
-                ),
-                message = CASE
-                    WHEN excluded.failed_at >= worktree_discovery_failures.failed_at
-                    THEN excluded.message
-                    ELSE worktree_discovery_failures.message
-                END
-            ",
-            params![old_path, new_path],
-        )?;
-        tx.execute(
-            "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
-            [&old_path],
-        )?;
-        tx.execute("DELETE FROM projects WHERE path=?1", [&old_path])?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let identities = collect_rows(rows)?;
+        drop(stmt);
+
+        let mut replacements = Vec::new();
+        for identity in identities {
+            let Ok(canonical) = fs::canonicalize(Path::new(&identity)) else {
+                continue;
+            };
+            let canonical = path_to_string(&canonical)?;
+            if identity != canonical {
+                replacements.push((identity, canonical));
+            }
+        }
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (alias, canonical) in replacements {
+            replace_project_path_in_transaction(&tx, &alias, &canonical)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -323,15 +305,24 @@ impl Store {
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
         let tx = self.conn.unchecked_transaction()?;
+        let previous_linked = {
+            let mut stmt =
+                tx.prepare("SELECT linked_path FROM linked_worktrees WHERE primary_path=?1")?;
+            let rows = stmt.query_map([&primary], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?.into_iter().collect::<BTreeSet<_>>()
+        };
         tx.execute(
             "DELETE FROM linked_worktrees WHERE primary_path=?1",
             [&primary],
         )?;
-        for linked_path in linked {
+        for linked_path in &linked {
             tx.execute(
                 "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
                 params![primary, linked_path],
             )?;
+        }
+        for stale_path in previous_linked.difference(&linked) {
+            tx.execute("DELETE FROM projects WHERE path=?1", [stale_path])?;
         }
         tx.execute(
             "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
@@ -706,6 +697,72 @@ impl Store {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn replace_project_path_in_transaction(
+    tx: &Transaction<'_>,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "
+        INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
+        SELECT ?2, discovered_at, last_seen_at, last_cleaned_at
+        FROM projects
+        WHERE path=?1
+        ON CONFLICT(path) DO UPDATE SET
+            discovered_at = MIN(projects.discovered_at, excluded.discovered_at),
+            last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at),
+            last_cleaned_at = CASE
+                WHEN projects.last_cleaned_at IS NULL THEN excluded.last_cleaned_at
+                WHEN excluded.last_cleaned_at IS NULL THEN projects.last_cleaned_at
+                ELSE MAX(projects.last_cleaned_at, excluded.last_cleaned_at)
+            END
+        ",
+        params![old_path, new_path],
+    )?;
+    tx.execute(
+        "
+        INSERT OR IGNORE INTO linked_worktrees (primary_path, linked_path)
+        SELECT
+            CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END,
+            CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+        FROM linked_worktrees
+        WHERE (primary_path=?1 OR linked_path=?1)
+          AND CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END
+              <> CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+        ",
+        params![old_path, new_path],
+    )?;
+    tx.execute(
+        "DELETE FROM linked_worktrees WHERE primary_path=?1 OR linked_path=?1",
+        [old_path],
+    )?;
+    tx.execute(
+        "
+        INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
+        SELECT ?2, failed_at, message
+        FROM worktree_discovery_failures
+        WHERE primary_path=?1
+        ON CONFLICT(primary_path) DO UPDATE SET
+            failed_at = MAX(
+                worktree_discovery_failures.failed_at,
+                excluded.failed_at
+            ),
+            message = CASE
+                WHEN excluded.failed_at >= worktree_discovery_failures.failed_at
+                THEN excluded.message
+                ELSE worktree_discovery_failures.message
+            END
+        ",
+        params![old_path, new_path],
+    )?;
+    tx.execute(
+        "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+        [old_path],
+    )?;
+    tx.execute("DELETE FROM projects WHERE path=?1", [old_path])?;
+    Ok(())
 }
 
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {

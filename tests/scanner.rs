@@ -272,6 +272,10 @@ fn multi_component_excludes_skip_matching_subtrees() {
         &root.path().join("Library/Other/kept-crate/Cargo.toml"),
         "[package]\nname='kept-crate'\nversion='0.1.0'\n",
     );
+    write_file(
+        &root.path().join("Library/CachesExtra/also-kept/Cargo.toml"),
+        "[package]\nname='also-kept'\nversion='0.1.0'\n",
+    );
 
     let scanner = Scanner::new(ScannerOptions {
         roots: vec![root.path().to_path_buf()],
@@ -281,11 +285,16 @@ fn multi_component_excludes_skip_matching_subtrees() {
 
     assert_eq!(
         scanner.scan().unwrap(),
-        vec![root
-            .path()
-            .join("Library/Other/kept-crate")
-            .canonicalize()
-            .unwrap()]
+        vec![
+            root.path()
+                .join("Library/CachesExtra/also-kept")
+                .canonicalize()
+                .unwrap(),
+            root.path()
+                .join("Library/Other/kept-crate")
+                .canonicalize()
+                .unwrap(),
+        ]
     );
 }
 
@@ -408,6 +417,43 @@ fn scan_rejects_configured_excluded_linked_worktree() {
 
     let report = scanner.scan_with_errors().unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![],
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_rejects_git_candidates_beneath_a_multi_component_exclusion_after_canonicalization() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let excluded = root.path().join("Library/Caches/team/worktree");
+    let alias = root.path().join("worktree-alias");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&excluded.join("Cargo.toml"), "[workspace]\n");
+    symlink(&excluded, &alias).unwrap();
+    let resolver = FakeResolver::paths(vec![excluded.clone(), alias]);
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec!["Library/Caches".to_string()],
+        },
+        Arc::new(resolver),
+    );
+
+    let canonical_primary = primary.canonicalize().unwrap();
+    let report = scanner.scan_with_errors().unwrap();
+
     assert_eq!(report.projects, vec![canonical_primary.clone()]);
     assert_eq!(
         report.worktree_discoveries,

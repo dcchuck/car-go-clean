@@ -114,6 +114,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 message: error.message,
             })?;
         }
+        self.store.normalize_resolvable_project_aliases()?;
         for discovery in report.worktree_discoveries {
             match discovery {
                 WorktreeDiscovery::Success { primary, linked } => {

@@ -341,21 +341,13 @@ impl Scanner {
     }
 
     fn should_skip(&self, path: &Path) -> bool {
-        let base = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        if base == "target" {
+        if path_matches_exclude(path, "target") {
             return true;
         }
-        self.opts.excludes.iter().any(|exclude| {
-            !exclude.is_empty()
-                && (base == exclude
-                    || path_ends_with(path, exclude)
-                    || path
-                        .components()
-                        .any(|component| component.as_os_str() == exclude.as_str()))
-        })
+        self.opts
+            .excludes
+            .iter()
+            .any(|exclude| path_matches_exclude(path, exclude))
     }
 }
 
@@ -616,14 +608,30 @@ fn non_utf8_scan_error(path: &Path) -> ScanError {
     }
 }
 
-fn path_ends_with(path: &Path, exclude: &str) -> bool {
+fn path_matches_exclude(path: &Path, exclude: &str) -> bool {
     let exclude = Path::new(exclude);
-    let exclude_parts: Vec<_> = exclude.components().collect();
+    if exclude.as_os_str().is_empty() {
+        return false;
+    }
+    if exclude.is_absolute() {
+        if path.starts_with(exclude) {
+            return true;
+        }
+        return fs::canonicalize(exclude)
+            .is_ok_and(|canonical_exclude| path.starts_with(canonical_exclude));
+    }
+
+    let exclude_parts: Vec<_> = exclude
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect();
     if exclude_parts.is_empty() {
         return false;
     }
     let path_parts: Vec<_> = path.components().collect();
-    path_parts.ends_with(&exclude_parts)
+    path_parts
+        .windows(exclude_parts.len())
+        .any(|window| window == exclude_parts)
 }
 
 fn has_cargo_toml(dir: &Path) -> bool {
