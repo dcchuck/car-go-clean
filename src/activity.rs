@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::fs;
 use std::path::{Path, PathBuf};
 use sysinfo::System;
 
@@ -60,8 +61,54 @@ pub fn process_matches_project(cwd: Option<&Path>, args: &[PathBuf], project: &P
     }
 
     let target = project.join("target");
-    args.iter()
+    if args
+        .iter()
         .any(|arg| argument_references_path(arg, project) || argument_references_path(arg, &target))
+    {
+        return true;
+    }
+
+    let Ok(canonical_project) = fs::canonicalize(project) else {
+        return false;
+    };
+    if cwd
+        .and_then(|cwd| fs::canonicalize(cwd).ok())
+        .is_some_and(|cwd| path_is_within(&cwd, &canonical_project))
+    {
+        return true;
+    }
+
+    args.iter().any(|arg| {
+        canonical_argument_path(arg, cwd)
+            .is_some_and(|arg| path_is_within(&arg, &canonical_project))
+    })
+}
+
+fn canonical_argument_path(arg: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let path = explicit_argument_path(arg).or_else(|| raw_argument_path(arg, cwd))?;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd?.join(path)
+    };
+    fs::canonicalize(path).ok()
+}
+
+fn explicit_argument_path(arg: &Path) -> Option<&Path> {
+    let arg = arg.to_str()?;
+    ["--manifest-path=", "--target-dir="]
+        .iter()
+        .find_map(|prefix| arg.strip_prefix(prefix))
+        .filter(|path| !path.is_empty())
+        .map(Path::new)
+}
+
+fn raw_argument_path<'a>(arg: &'a Path, cwd: Option<&Path>) -> Option<&'a Path> {
+    if arg.is_absolute() || (cwd.is_some() && arg.components().count() > 1) {
+        Some(arg)
+    } else {
+        None
+    }
 }
 
 fn argument_references_path(arg: &Path, root: &Path) -> bool {

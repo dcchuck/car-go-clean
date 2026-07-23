@@ -121,6 +121,80 @@ fn process_command_arguments_can_match_project_or_target_paths() {
         "--manifest-path=/Users/me/src/app\u{00e9}/Cargo.toml",
     )];
     assert!(!process_matches_project(None, &args, project));
+
+    let args = vec![PathBuf::from("cargo"), PathBuf::from("--version")];
+    assert!(!process_matches_project(None, &args, project));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_spelled_process_paths_match_canonical_project_activity() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/debug/server"), &[0; 4096]);
+    symlink(&project, &alias).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+    let alias_binary = alias.join("target/debug/server");
+
+    assert!(process_matches_project(
+        None,
+        std::slice::from_ref(&alias_binary),
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(&alias),
+        &[],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("project-alias/target/debug/server")],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        None,
+        &[PathBuf::from(format!(
+            "--manifest-path={}",
+            alias.join("Cargo.toml").display()
+        ))],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        None,
+        &[PathBuf::from(format!(
+            "--target-dir={}",
+            alias.join("target").display()
+        ))],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        None,
+        &[alias.join("target/debug/nonexistent")],
+        &canonical_project
+    ));
+
+    let signals = activity_signals_for_process(
+        42,
+        None,
+        &[alias_binary],
+        std::slice::from_ref(&canonical_project),
+    );
+    let review = review_project(
+        &canonical_project,
+        &[],
+        &signals,
+        SystemTime::now() + Duration::from_secs(3 * 60 * 60),
+        &options(),
+    )
+    .unwrap();
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::ActiveProcess)
+    );
 }
 
 #[test]

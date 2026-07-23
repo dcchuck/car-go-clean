@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use car_go_clean::activity::NoopProcessInspector;
+use car_go_clean::activity::{
+    activity_signals_for_process, NoopProcessInspector, ProcessInspector,
+};
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
@@ -419,6 +421,25 @@ struct FakeCall {
     envs: Vec<(String, Option<String>)>,
 }
 
+#[derive(Clone)]
+struct ArgumentProcessInspector {
+    argument: PathBuf,
+}
+
+impl ProcessInspector for ArgumentProcessInspector {
+    fn active_projects(
+        &self,
+        projects: &[PathBuf],
+    ) -> anyhow::Result<Vec<car_go_clean::activity::ActivitySignal>> {
+        Ok(activity_signals_for_process(
+            42,
+            None,
+            std::slice::from_ref(&self.argument),
+            projects,
+        ))
+    }
+}
+
 impl CommandRunner for FakeRunner {
     fn run(&self, dir: &Path, cmd: &mut Command) -> anyhow::Result<CleanOutcome> {
         self.calls.lock().unwrap().push(FakeCall {
@@ -519,6 +540,63 @@ fn cleaner_measures_bytes_and_skips_missing_target() {
     assert!(result.bytes_before >= 4096);
     assert_eq!(result.bytes_after, 0);
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/debug/server"), &[0; 2048]);
+    symlink(&project, &alias).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_project, SystemTime::now())
+        .unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &ArgumentProcessInspector {
+                argument: alias.join("target/debug/server"),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[test]
