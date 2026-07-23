@@ -227,22 +227,8 @@ impl Store {
 
     pub fn remove_project(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path_to_string(path.as_ref())?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "
-            DELETE FROM linked_worktrees
-            WHERE (primary_path=?1 OR linked_path=?1)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM worktree_discovery_failures
-                  WHERE worktree_discovery_failures.primary_path =
-                        linked_worktrees.primary_path
-              )
-            ",
-            [&path],
-        )?;
-        tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
-        tx.commit()?;
+        self.conn
+            .execute("DELETE FROM projects WHERE path=?1", [&path])?;
         Ok(())
     }
 
@@ -299,8 +285,21 @@ impl Store {
     }
 
     pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
+        self.replace_linked_worktrees_with_exclusions(primary, linked, &[])
+    }
+
+    pub fn replace_linked_worktrees_with_exclusions(
+        &self,
+        primary: &Path,
+        linked: &[PathBuf],
+        excluded: &[PathBuf],
+    ) -> Result<()> {
         let primary = path_to_string(primary)?;
         let linked: BTreeSet<_> = linked
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?;
+        let excluded: BTreeSet<_> = excluded
             .iter()
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
@@ -323,6 +322,9 @@ impl Store {
         }
         for stale_path in previous_linked.difference(&linked) {
             tx.execute("DELETE FROM projects WHERE path=?1", [stale_path])?;
+        }
+        for excluded_path in excluded {
+            tx.execute("DELETE FROM projects WHERE path=?1", [excluded_path])?;
         }
         tx.execute(
             "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",

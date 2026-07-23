@@ -51,7 +51,7 @@ fn linked_worktree_failure_blocks_cached_children_until_success() {
 }
 
 #[test]
-fn removing_project_removes_linked_worktree_provenance() {
+fn removing_project_preserves_linked_worktree_provenance() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let primary = Path::new("/workspace/main");
     let linked = PathBuf::from("/workspace/main/.worktrees/feature");
@@ -59,7 +59,13 @@ fn removing_project_removes_linked_worktree_provenance() {
         .replace_linked_worktrees(primary, &[linked.clone()])
         .unwrap();
     store.remove_project(primary).unwrap();
-    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    store
+        .mark_worktree_discovery_failed(primary, SystemTime::UNIX_EPOCH, "git failed")
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![primary.to_path_buf(), linked]
+    );
 }
 
 #[test]

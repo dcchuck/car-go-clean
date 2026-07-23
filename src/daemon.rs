@@ -117,8 +117,13 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self.store.normalize_resolvable_project_aliases()?;
         for discovery in report.worktree_discoveries {
             match discovery {
-                WorktreeDiscovery::Success { primary, linked } => {
-                    self.store.replace_linked_worktrees(&primary, &linked)?;
+                WorktreeDiscovery::Success {
+                    primary,
+                    linked,
+                    excluded,
+                } => {
+                    self.store
+                        .replace_linked_worktrees_with_exclusions(&primary, &linked, &excluded)?;
                 }
                 WorktreeDiscovery::Failure { primary, message } => {
                     self.store

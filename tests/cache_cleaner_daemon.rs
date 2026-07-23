@@ -46,6 +46,287 @@ fn cache_verify_and_sync_remove_dead_projects() {
     assert_eq!(store.all_projects().unwrap().len(), 1);
 }
 
+#[test]
+fn cache_eviction_preserves_association_for_a_later_discovery_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = root.path().join("linked");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let successful = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            options.clone(),
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    successful.scan_cycle().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+
+    fs::remove_dir_all(&primary).unwrap();
+    Cache::new(&store).sync_on_disk().unwrap();
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![canonical_linked.to_string_lossy().into_owned()]
+    );
+
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    let failed = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            options.clone(),
+            Arc::new(FakeWorktreeResolver::failure("git failed")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    failed.scan_cycle().unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_linked.clone(), canonical_primary.clone()]
+    );
+    let failed_result = failed
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(failed_result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let successful = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            options,
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    successful.scan_cycle().unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    let successful_result = successful
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(successful_result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.calls.lock().unwrap()[0].dir, canonical_linked);
+}
+
+#[test]
+fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let excluded = root.path().join("excluded/team/worktree");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&excluded.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&excluded.join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_excluded = excluded.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE linked_worktrees;
+            DROP TABLE worktree_discovery_failures;
+            DELETE FROM schema_version WHERE version >= 4;
+            DELETE FROM projects;
+            ",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for path in [&canonical_primary, &canonical_excluded] {
+            conn.execute(
+                "
+                INSERT INTO projects (path, discovered_at, last_seen_at)
+                VALUES (?1, ?2, ?2)
+                ",
+                rusqlite::params![path.to_str().unwrap(), now],
+            )
+            .unwrap();
+        }
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    assert!(store.table_exists("linked_worktrees").unwrap());
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec!["excluded/team".to_string()],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![excluded])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.path)
+            .collect::<Vec<_>>(),
+        vec![canonical_primary.to_string_lossy().into_owned()]
+    );
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: true,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn successful_exclusion_reconciliation_preserves_explicit_project_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let explicit = root.path().join("excluded/team/worktree");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&explicit.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&explicit.join("target/blob.bin"), &[0; 2048]);
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_explicit = explicit.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![explicit.clone()],
+                excludes: vec!["excluded/team".to_string()],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![explicit])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    assert!(store
+        .all_projects()
+        .unwrap()
+        .iter()
+        .any(|project| project.path == canonical_explicit.to_string_lossy()));
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::now(), "git failed")
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_explicit.clone(), canonical_primary]
+    );
+    daemon.scan_cycle().unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.calls.lock().unwrap()[0].dir, canonical_explicit);
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_does_not_clean_a_persisted_alias_of_a_managed_cache_project() {

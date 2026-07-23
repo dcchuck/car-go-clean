@@ -38,6 +38,7 @@ pub enum WorktreeDiscovery {
     Success {
         primary: PathBuf,
         linked: Vec<PathBuf>,
+        excluded: Vec<PathBuf>,
     },
     Failure {
         primary: PathBuf,
@@ -304,6 +305,7 @@ impl Scanner {
                     return;
                 }
                 let mut linked = BTreeSet::new();
+                let mut excluded = BTreeSet::new();
                 for candidate in candidates {
                     let Ok(candidate) = fs::canonicalize(candidate) else {
                         continue;
@@ -321,9 +323,14 @@ impl Scanner {
                         || !canonical_roots
                             .iter()
                             .any(|root| candidate.starts_with(root))
-                        || self.should_skip(&candidate)
-                        || !has_cargo_toml(&candidate)
                     {
+                        continue;
+                    }
+                    if self.should_skip(&candidate) && !self.is_explicit_project(&candidate) {
+                        excluded.insert(candidate);
+                        continue;
+                    }
+                    if !has_cargo_toml(&candidate) {
                         continue;
                     }
                     found.insert(candidate.clone());
@@ -332,6 +339,7 @@ impl Scanner {
                 outcomes.push(WorktreeDiscovery::Success {
                     primary: primary.to_path_buf(),
                     linked: linked.into_iter().collect(),
+                    excluded: excluded.into_iter().collect(),
                 });
             }
             Err(err) => {
@@ -348,6 +356,14 @@ impl Scanner {
             .excludes
             .iter()
             .any(|exclude| path_matches_exclude(path, exclude))
+    }
+
+    fn is_explicit_project(&self, path: &Path) -> bool {
+        self.opts
+            .project_dirs
+            .iter()
+            .filter_map(|project| fs::canonicalize(project).ok())
+            .any(|project| project == path)
     }
 }
 
