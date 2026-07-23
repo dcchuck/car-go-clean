@@ -1,7 +1,43 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use car_go_clean::scanner::{Scanner, ScannerOptions};
+use car_go_clean::scanner::{
+    GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, WorktreeDiscovery,
+};
+
+#[derive(Clone)]
+struct FakeResolver {
+    result: Result<Vec<PathBuf>, String>,
+    calls: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl FakeResolver {
+    fn paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            result: Ok(paths),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn failure(message: &str) -> Self {
+        Self {
+            result: Err(message.to_string()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Vec<PathBuf> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl GitWorktreeResolver for FakeResolver {
+    fn linked_worktrees(&self, primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError> {
+        self.calls.lock().unwrap().push(primary.to_path_buf());
+        self.result.clone().map_err(GitWorktreeError::new)
+    }
+}
 
 fn write_file(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -157,4 +193,225 @@ fn scan_skips_unreadable_directories_and_reports_errors() {
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].path, blocked);
     assert!(report.errors[0].message.contains("Permission denied"));
+}
+
+#[test]
+fn scan_discovers_ignored_in_scope_linked_worktree_once() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&primary.join(".gitignore"), ".worktrees/\n");
+    write_file(&linked.join("Cargo.toml"), "[workspace]\n");
+    let resolver = FakeResolver::paths(vec![linked.clone(), linked.clone()]);
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+    assert_eq!(
+        report.projects,
+        vec![canonical_primary.clone(), canonical_linked.clone()]
+    );
+    assert_eq!(resolver.calls(), vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![canonical_linked],
+        }]
+    );
+}
+
+#[test]
+fn scan_rejects_linked_worktree_outside_canonical_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&outside.path().join("Cargo.toml"), "[workspace]\n");
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::paths(vec![outside.path().to_path_buf()])),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![],
+        }]
+    );
+}
+
+#[test]
+fn scan_rejects_configured_excluded_linked_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/excluded");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), "[workspace]\n");
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec!["excluded".to_string()],
+        },
+        Arc::new(FakeResolver::paths(vec![linked])),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![],
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_rejects_linked_worktree_symlink_that_resolves_outside_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked_symlink = primary.join(".worktrees/feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(linked_symlink.parent().unwrap()).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&outside.path().join("Cargo.toml"), "[workspace]\n");
+    symlink(outside.path(), &linked_symlink).unwrap();
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::paths(vec![linked_symlink])),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![],
+        }]
+    );
+}
+
+#[test]
+fn scan_skips_linked_worktree_without_direct_cargo_toml() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(&linked).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&linked.join("nested/Cargo.toml"), "[workspace]\n");
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::paths(vec![linked])),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![],
+        }]
+    );
+}
+
+#[test]
+fn scan_records_resolver_failure_and_retains_primary_project() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::failure("git failed")),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Failure {
+            primary: canonical_primary.clone(),
+            message: "git failed".to_string(),
+        }]
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].path, canonical_primary);
+    assert_eq!(report.errors[0].message, "git failed");
+}
+
+#[test]
+fn scan_does_not_resolve_worktrees_for_linked_checkout_git_file() {
+    let root = tempfile::tempdir().unwrap();
+    let linked_checkout = root.path().join("feature");
+    write_file(&linked_checkout.join("Cargo.toml"), "[workspace]\n");
+    write_file(
+        &linked_checkout.join(".git"),
+        "gitdir: ../router/.git/worktrees/feature\n",
+    );
+    let resolver = FakeResolver::paths(vec![]);
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert_eq!(report.projects, vec![linked_checkout]);
+    assert!(report.worktree_discoveries.is_empty());
+    assert!(resolver.calls().is_empty());
 }

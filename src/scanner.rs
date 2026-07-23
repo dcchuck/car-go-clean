@@ -1,8 +1,10 @@
 use anyhow::Result;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -12,15 +14,17 @@ pub struct ScannerOptions {
     pub excludes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Scanner {
     opts: ScannerOptions,
+    worktree_resolver: Arc<dyn GitWorktreeResolver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub projects: Vec<PathBuf>,
     pub errors: Vec<ScanError>,
+    pub worktree_discoveries: Vec<WorktreeDiscovery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,9 +33,97 @@ pub struct ScanError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeDiscovery {
+    Success {
+        primary: PathBuf,
+        linked: Vec<PathBuf>,
+    },
+    Failure {
+        primary: PathBuf,
+        message: String,
+    },
+}
+
+pub trait GitWorktreeResolver {
+    fn linked_worktrees(&self, primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemGitWorktreeResolver;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorktreeError {
+    message: String,
+}
+
+impl GitWorktreeError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GitWorktreeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GitWorktreeError {}
+
+impl GitWorktreeResolver for SystemGitWorktreeResolver {
+    fn linked_worktrees(&self, primary: &Path) -> Result<Vec<PathBuf>, GitWorktreeError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(primary)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .map_err(|err| GitWorktreeError::new(format!("failed to run git: {err}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let message = if stderr.is_empty() {
+                format!("git worktree list failed with status {}", output.status)
+            } else {
+                format!("git worktree list failed: {stderr}")
+            };
+            return Err(GitWorktreeError::new(message));
+        }
+
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|record| record.strip_prefix(b"worktree "))
+            .map(git_path_from_bytes)
+            .collect()
+    }
+}
+
+impl fmt::Debug for Scanner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Scanner")
+            .field("opts", &self.opts)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Scanner {
     pub fn new(opts: ScannerOptions) -> Self {
-        Self { opts }
+        Self::with_worktree_resolver(opts, Arc::new(SystemGitWorktreeResolver))
+    }
+
+    pub fn with_worktree_resolver(
+        opts: ScannerOptions,
+        resolver: Arc<dyn GitWorktreeResolver>,
+    ) -> Self {
+        Self {
+            opts,
+            worktree_resolver: resolver,
+        }
     }
 
     pub fn scan(&self) -> Result<Vec<PathBuf>> {
@@ -41,8 +133,22 @@ impl Scanner {
     pub fn scan_with_errors(&self) -> Result<ScanReport> {
         let mut found = BTreeSet::new();
         let mut errors = Vec::new();
+        let mut worktree_discoveries = Vec::new();
+        let canonical_roots: Vec<_> = self
+            .opts
+            .roots
+            .iter()
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .collect();
         for root in &self.opts.roots {
-            self.walk(root, &[], &mut found, &mut errors)?;
+            self.walk(
+                root,
+                &[],
+                &canonical_roots,
+                &mut found,
+                &mut worktree_discoveries,
+                &mut errors,
+            )?;
         }
         for project in &self.opts.project_dirs {
             if has_cargo_toml(project) {
@@ -52,6 +158,7 @@ impl Scanner {
         Ok(ScanReport {
             projects: found.into_iter().collect(),
             errors,
+            worktree_discoveries,
         })
     }
 
@@ -59,7 +166,9 @@ impl Scanner {
         &self,
         dir: &Path,
         parent_ignores: &[Arc<Gitignore>],
+        canonical_roots: &[PathBuf],
         found: &mut BTreeSet<PathBuf>,
+        outcomes: &mut Vec<WorktreeDiscovery>,
         errors: &mut Vec<ScanError>,
     ) -> Result<()> {
         let meta = match fs::metadata(dir) {
@@ -73,7 +182,13 @@ impl Scanner {
             return Ok(());
         }
         if has_cargo_toml(dir) {
-            found.insert(dir.to_path_buf());
+            if dir.join(".git").is_dir() {
+                let primary = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                found.insert(primary.clone());
+                self.discover_linked_worktrees(&primary, canonical_roots, found, outcomes, errors);
+            } else {
+                found.insert(dir.to_path_buf());
+            }
             return Ok(());
         }
         let ignores = ignores_for(dir, parent_ignores);
@@ -100,10 +215,67 @@ impl Scanner {
                 }
             };
             if file_type.is_dir() && !file_type.is_symlink() {
-                self.walk(&entry.path(), &ignores, found, errors)?;
+                self.walk(
+                    &entry.path(),
+                    &ignores,
+                    canonical_roots,
+                    found,
+                    outcomes,
+                    errors,
+                )?;
             }
         }
         Ok(())
+    }
+
+    fn discover_linked_worktrees(
+        &self,
+        primary: &Path,
+        canonical_roots: &[PathBuf],
+        found: &mut BTreeSet<PathBuf>,
+        outcomes: &mut Vec<WorktreeDiscovery>,
+        errors: &mut Vec<ScanError>,
+    ) {
+        if !primary.join(".git").is_dir() {
+            return;
+        }
+
+        match self.worktree_resolver.linked_worktrees(primary) {
+            Ok(candidates) => {
+                let mut linked = BTreeSet::new();
+                for candidate in candidates {
+                    let Ok(candidate) = fs::canonicalize(candidate) else {
+                        continue;
+                    };
+                    if candidate == primary
+                        || !canonical_roots
+                            .iter()
+                            .any(|root| candidate.starts_with(root))
+                        || self.should_skip(&candidate)
+                        || !has_cargo_toml(&candidate)
+                    {
+                        continue;
+                    }
+                    found.insert(candidate.clone());
+                    linked.insert(candidate);
+                }
+                outcomes.push(WorktreeDiscovery::Success {
+                    primary: primary.to_path_buf(),
+                    linked: linked.into_iter().collect(),
+                });
+            }
+            Err(err) => {
+                let message = err.to_string();
+                outcomes.push(WorktreeDiscovery::Failure {
+                    primary: primary.to_path_buf(),
+                    message: message.clone(),
+                });
+                errors.push(ScanError {
+                    path: primary.to_path_buf(),
+                    message,
+                });
+            }
+        }
     }
 
     fn should_skip(&self, path: &Path) -> bool {
@@ -122,6 +294,30 @@ impl Scanner {
                         .components()
                         .any(|component| component.as_os_str() == exclude.as_str()))
         })
+    }
+}
+
+fn git_path_from_bytes(record: &[u8]) -> Result<PathBuf, GitWorktreeError> {
+    if record.is_empty() {
+        return Err(GitWorktreeError::new(
+            "git worktree list returned an empty worktree path",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        Ok(PathBuf::from(OsString::from_vec(record.to_vec())))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let path = String::from_utf8(record.to_vec()).map_err(|_| {
+            GitWorktreeError::new("git worktree list returned a non-UTF-8 worktree path")
+        })?;
+        Ok(PathBuf::from(path))
     }
 }
 
