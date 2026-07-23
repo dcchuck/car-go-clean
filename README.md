@@ -50,10 +50,10 @@ it also discovers linked Rust worktrees that Git reports within the configured
 scan roots. This includes Git-reported worktrees hidden by ignore rules;
 configured exclusions and the normal cleaning safeguards still apply.
 
-If Git worktree discovery fails for a primary checkout, only linked worktrees
-previously discovered from that checkout are temporarily blocked from cleanup.
-A later successful discovery replaces the saved association and removes that
-temporary block.
+If Git worktree discovery fails for a primary checkout, the failure is recorded
+as a scan error for the primary, so its ordinary scan-error safety gate applies.
+Previously discovered linked worktrees from that checkout remain blocked until
+a later successful discovery replaces the saved association.
 
 ## Safe Cleaning Model
 
