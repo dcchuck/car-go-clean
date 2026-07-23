@@ -671,11 +671,13 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
     let project = root.path().join("canonical-project");
     let alias = root.path().join("project-alias");
     let manifest_link = root.path().join("manifest-link");
+    let target_link = root.path().join("target-link");
     write_file(&project.join("Cargo.toml"), b"[package]\n");
     write_file(&project.join("target/libdep.rlib"), &[0; 2048]);
     write_file(&project.join("target/app"), &[0; 2048]);
     symlink(&project, &alias).unwrap();
     symlink(alias.join("Cargo.toml"), &manifest_link).unwrap();
+    symlink(alias.join("target"), &target_link).unwrap();
     let canonical_project = project.canonicalize().unwrap();
 
     let db_dir = tempfile::tempdir().unwrap();
@@ -703,6 +705,22 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
         },
     );
     let argument_sets = [
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--emit"),
+            PathBuf::from(format!(
+                "link={}",
+                alias.join("target/future-output").display()
+            )),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("-Ldependency=target-link"),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--library-path=target-link"),
+        ],
         vec![
             PathBuf::from("rustc"),
             PathBuf::from("-L"),
@@ -1854,6 +1872,108 @@ fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery()
     runner.calls.lock().unwrap().clear();
 
     symlink(&linked, &linked_alias).unwrap();
+    let repaired_state = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options,
+            Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+    repaired_state.scan_cycle().unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+
+    let repaired = repaired_state
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(repaired.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = root.path().join("linked");
+    let unrelated = root.path().join("unrelated");
+    let linked_alias = root.path().join("linked-alias");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("target/blob.bin"), &[0; 2048]);
+    symlink(&linked, &linked_alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_linked, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&linked_alias))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::now(),
+            "active legacy failure",
+        )
+        .unwrap();
+    fs::remove_file(&linked_alias).unwrap();
+    symlink(&unrelated, &linked_alias).unwrap();
+
+    let runner = FakeRunner::default();
+    let daemon_options = DaemonOptions {
+        target_quiet_period: Duration::ZERO,
+        ..DaemonOptions::default()
+    };
+    let scanner_options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+    let failed_state = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            scanner_options.clone(),
+            Arc::new(FakeWorktreeResolver::failure("still failing")),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        daemon_options,
+    );
+
+    let result = failed_state
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+
     let repaired_state = Daemon::new(
         &store,
         Cache::new(&store),

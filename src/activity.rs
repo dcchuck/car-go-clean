@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use sysinfo::System;
@@ -115,11 +116,25 @@ fn canonical_arguments_match_project(
                 nested_rust_paths_match(value, RustPathSyntax::Emit, cwd, canonical_project)
             }),
             _ => {
-                option.strip_prefix("--extern=").is_some_and(|value| {
-                    nested_rust_value_matches(value, RustPathSyntax::Extern, cwd, canonical_project)
-                }) || option.strip_prefix("--emit=").is_some_and(|value| {
-                    nested_rust_value_matches(value, RustPathSyntax::Emit, cwd, canonical_project)
-                })
+                combined_rust_library_search_path(option)
+                    .and_then(|value| canonicalize_argument_path(value, cwd))
+                    .is_some_and(|value| path_is_within(&value, canonical_project))
+                    || option.strip_prefix("--extern=").is_some_and(|value| {
+                        nested_rust_value_matches(
+                            value,
+                            RustPathSyntax::Extern,
+                            cwd,
+                            canonical_project,
+                        )
+                    })
+                    || option.strip_prefix("--emit=").is_some_and(|value| {
+                        nested_rust_value_matches(
+                            value,
+                            RustPathSyntax::Emit,
+                            cwd,
+                            canonical_project,
+                        )
+                    })
             }
         }
     })
@@ -131,12 +146,22 @@ fn canonical_argument_path(arg: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn canonicalize_argument_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
-    let path = if path.is_absolute() {
+    let mut path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd?.join(path)
     };
-    fs::canonicalize(path).ok()
+    let mut unresolved_suffix = Vec::<OsString>::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(&path) {
+            for component in unresolved_suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        unresolved_suffix.push(path.file_name()?.to_os_string());
+        path = path.parent()?.to_path_buf();
+    }
 }
 
 fn split_path_option_value(value: &Path) -> Option<&Path> {
@@ -161,6 +186,14 @@ fn rust_library_search_path(value: &Path) -> Option<&Path> {
         return None;
     }
     Some(Path::new(path))
+}
+
+fn combined_rust_library_search_path(argument: &str) -> Option<&Path> {
+    let value = argument
+        .strip_prefix("--library-path=")
+        .or_else(|| argument.strip_prefix("-L"))?;
+    let value = split_path_option_value(Path::new(value))?;
+    rust_library_search_path(value)
 }
 
 #[derive(Clone, Copy)]
@@ -216,6 +249,9 @@ fn nested_rust_path(value: &str, syntax: RustPathSyntax) -> Option<&Path> {
 
 fn explicit_argument_path(arg: &Path) -> Option<&Path> {
     let arg = arg.to_str()?;
+    if arg.starts_with("-L") || arg.starts_with("--library-path=") {
+        return None;
+    }
     let (option, value) = arg.split_once('=')?;
     if value.is_empty() {
         return None;

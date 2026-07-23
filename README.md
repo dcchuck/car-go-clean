@@ -56,10 +56,10 @@ scan-error behavior. Independently, the canonical primary and exactly the
 linked worktrees saved for it remain blocked until a later successful discovery
 replaces the association. That persistent block normally does not extend to
 ancestors, siblings, or other projects. As a conservative exceptional fallback,
-if an identity in the active failure's persisted association can no longer be
-resolved, all cached projects are temporarily blocked until successful discovery
-replaces that association. An explicit forced run still bypasses either durable
-block.
+if an identity in the active failure's persisted association is unresolvable or
+no longer canonical—for example, because a saved alias changed targets—all
+cached projects are temporarily blocked until successful discovery replaces
+that association. An explicit forced run still bypasses either durable block.
 
 ## Safe Cleaning Model
 

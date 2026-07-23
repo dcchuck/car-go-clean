@@ -246,6 +246,7 @@ impl Store {
     }
 
     pub fn normalize_resolvable_project_aliases(&self) -> Result<()> {
+        let active_failure_identities = self.active_worktree_discovery_identities()?;
         let mut stmt = self.conn.prepare(
             "
             SELECT path FROM projects
@@ -264,6 +265,9 @@ impl Store {
 
         let mut replacements = Vec::new();
         for identity in identities {
+            if active_failure_identities.contains(&identity) {
+                continue;
+            }
             let Ok(canonical) = fs::canonicalize(Path::new(&identity)) else {
                 continue;
             };
@@ -304,6 +308,7 @@ impl Store {
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
         let tx = self.conn.unchecked_transaction()?;
+        normalize_failed_primary_aliases_for_success(&tx, &primary)?;
         let previous_linked = {
             let mut stmt =
                 tx.prepare("SELECT linked_path FROM linked_worktrees WHERE primary_path=?1")?;
@@ -354,6 +359,29 @@ impl Store {
     }
 
     pub fn blocked_worktree_discovery_paths(&self) -> Result<Vec<PathBuf>> {
+        let blocked = self
+            .active_worktree_discovery_identities()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+
+        if blocked
+            .iter()
+            .all(|path| fs::canonicalize(path).is_ok_and(|canonical| canonical == path.as_path()))
+        {
+            return Ok(blocked);
+        }
+
+        let mut fail_closed = blocked.into_iter().collect::<BTreeSet<_>>();
+        fail_closed.extend(
+            self.all_projects()?
+                .into_iter()
+                .map(|project| PathBuf::from(project.path)),
+        );
+        Ok(fail_closed.into_iter().collect())
+    }
+
+    fn active_worktree_discovery_identities(&self) -> Result<BTreeSet<String>> {
         let mut stmt = self.conn.prepare(
             "
             SELECT blocked_path
@@ -369,24 +397,8 @@ impl Store {
             ORDER BY blocked_path
             ",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let path: String = row.get(0)?;
-            Ok(PathBuf::from(path))
-        })?;
-        let blocked = collect_rows(rows)?;
-        drop(stmt);
-
-        if blocked.iter().all(|path| fs::canonicalize(path).is_ok()) {
-            return Ok(blocked);
-        }
-
-        let mut fail_closed = blocked.into_iter().collect::<BTreeSet<_>>();
-        fail_closed.extend(
-            self.all_projects()?
-                .into_iter()
-                .map(|project| PathBuf::from(project.path)),
-        );
-        Ok(fail_closed.into_iter().collect())
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(collect_rows(rows)?.into_iter().collect())
     }
 
     pub fn mark_project_cleaned(&self, path: impl AsRef<Path>, when: SystemTime) -> Result<()> {
@@ -777,6 +789,32 @@ fn replace_project_path_in_transaction(
         [old_path],
     )?;
     tx.execute("DELETE FROM projects WHERE path=?1", [old_path])?;
+    Ok(())
+}
+
+fn normalize_failed_primary_aliases_for_success(
+    tx: &Transaction<'_>,
+    canonical_primary: &str,
+) -> Result<()> {
+    let aliases = {
+        let mut stmt = tx.prepare(
+            "SELECT primary_path FROM worktree_discovery_failures ORDER BY primary_path",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)?
+    };
+
+    for alias in aliases {
+        if alias == canonical_primary {
+            continue;
+        }
+        let Ok(canonical) = fs::canonicalize(Path::new(&alias)) else {
+            continue;
+        };
+        if path_to_string(&canonical)? == canonical_primary {
+            replace_project_path_in_transaction(tx, &alias, canonical_primary)?;
+        }
+    }
     Ok(())
 }
 

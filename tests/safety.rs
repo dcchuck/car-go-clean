@@ -197,7 +197,7 @@ fn symlink_spelled_process_paths_match_canonical_project_activity() {
         &[PathBuf::from("--color=always")],
         &canonical_project
     ));
-    assert!(!process_matches_project(
+    assert!(process_matches_project(
         None,
         &[alias.join("target/debug/nonexistent")],
         &canonical_project
@@ -262,6 +262,17 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
         &[PathBuf::from("--out-dir"), PathBuf::from("target-link")],
         &canonical_project
     ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[
+            PathBuf::from("--emit"),
+            PathBuf::from(format!(
+                "link={}",
+                alias.join("target/future-output").display()
+            ))
+        ],
+        &canonical_project
+    ));
 
     let library_args = vec![
         PathBuf::from("-L"),
@@ -274,10 +285,20 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
     ));
     assert!(process_matches_project(
         Some(root.path()),
+        &[PathBuf::from("-Ldependency=target-link")],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
         &[
             PathBuf::from("--library-path"),
             PathBuf::from("target-link")
         ],
+        &canonical_project
+    ));
+    assert!(process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--library-path=target-link")],
         &canonical_project
     ));
 
@@ -308,7 +329,6 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
         &[PathBuf::from(format!("--emit={emit_value}"))],
         &canonical_project
     ));
-
     assert!(!process_matches_project(
         Some(root.path()),
         &[PathBuf::from("--manifest-path"), PathBuf::from("--version")],
@@ -340,6 +360,32 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
     assert!(!process_matches_project(
         Some(root.path()),
         &[PathBuf::from("-L"), PathBuf::from("dependency=missing")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("-Linvalid=target-link")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!(
+            "-Linvalid={}",
+            alias.join("target").display()
+        ))],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from("--library-path=--version")],
+        &canonical_project
+    ));
+    assert!(!process_matches_project(
+        Some(root.path()),
+        &[PathBuf::from(format!(
+            "--emit=link={}",
+            root.path().join("unrelated/future-output").display()
+        ))],
         &canonical_project
     ));
 
