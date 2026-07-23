@@ -6,8 +6,8 @@ use car_go_clean::activity::{
     activity_signals_for_process, path_is_within, process_matches_project, ActivitySignal,
 };
 use car_go_clean::safety::{
-    classify_project, review_project, review_summary, CleanDecision, ProjectClass, ReviewSummary,
-    SafetyOptions, SkipReason,
+    classify_project, review_project, review_project_with_discovery_blocks, review_summary,
+    CleanDecision, ProjectClass, ReviewSummary, SafetyOptions, SkipReason,
 };
 
 fn write_file(path: &Path, body: &[u8]) {
@@ -240,6 +240,96 @@ fn related_scan_error_is_skipped_but_unrelated_error_is_not() {
 
     let related = vec![project.path().join("target/debug")];
     let review = review_project(project.path(), &related, &[], now, &options()).unwrap();
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::ScanError)
+    );
+}
+
+#[test]
+fn discovery_failure_blocks_only_exact_saved_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/feature");
+    let sibling = primary.join(".worktrees/sibling");
+    for project in [&primary, &linked, &sibling] {
+        write_file(&project.join("Cargo.toml"), b"[package]\n");
+        write_file(&project.join("target/debug/blob.bin"), &[0; 4096]);
+    }
+    let now = SystemTime::now() + Duration::from_secs(3 * 60 * 60);
+    let blocked = vec![primary.clone(), linked.clone()];
+
+    for project in [&primary, &linked] {
+        let review =
+            review_project_with_discovery_blocks(project, &[], &blocked, &[], now, &options())
+                .unwrap();
+        assert_eq!(
+            review.decision,
+            CleanDecision::Skipped(SkipReason::ScanError)
+        );
+    }
+
+    let review =
+        review_project_with_discovery_blocks(&sibling, &[], &blocked, &[], now, &options())
+            .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+
+    let review = review_project_with_discovery_blocks(
+        &sibling,
+        &[],
+        std::slice::from_ref(&primary),
+        &[],
+        now,
+        &options(),
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+}
+
+#[test]
+fn force_bypasses_exact_discovery_failure_block() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+    let mut opts = options();
+    opts.force = true;
+
+    let review = review_project_with_discovery_blocks(
+        project.path(),
+        &[],
+        &[project.path().to_path_buf()],
+        &[],
+        SystemTime::now(),
+        &opts,
+    )
+    .unwrap();
+
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_discovery_block_matches_a_legacy_symlink_project_alias() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical");
+    let alias = root.path().join("legacy-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/debug/blob.bin"), &[0; 4096]);
+    symlink(&project, &alias).unwrap();
+    let blocked = vec![project.canonicalize().unwrap()];
+
+    let review = review_project_with_discovery_blocks(
+        &alias,
+        &[],
+        &blocked,
+        &[],
+        SystemTime::now() + Duration::from_secs(3 * 60 * 60),
+        &options(),
+    )
+    .unwrap();
+
     assert_eq!(
         review.decision,
         CleanDecision::Skipped(SkipReason::ScanError)

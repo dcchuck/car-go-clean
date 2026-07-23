@@ -51,9 +51,11 @@ scan roots. This includes Git-reported worktrees hidden by ignore rules;
 configured exclusions and the normal cleaning safeguards still apply.
 
 If Git worktree discovery fails for a primary checkout, the failure is recorded
-as a scan error for the primary, so its ordinary scan-error safety gate applies.
-Previously discovered linked worktrees from that checkout remain blocked until
-a later successful discovery replaces the saved association.
+as an ordinary scan error, which retains the usual recent, hierarchical
+scan-error behavior. Independently, the canonical primary and exactly the
+linked worktrees saved for it remain blocked until a later successful discovery
+replaces the association. That persistent block does not extend to ancestors,
+siblings, or other projects, and an explicit forced run still bypasses it.
 
 ## Safe Cleaning Model
 

@@ -6,8 +6,8 @@ use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
 use crate::safety::{
-    review_project, review_summary, CleanDecision, ProjectClass, ProjectReview, SafetyOptions,
-    SkipReason,
+    review_project_with_discovery_blocks, review_summary, CleanDecision, ProjectClass,
+    ProjectReview, SafetyOptions, SkipReason,
 };
 use crate::scanner::{Scanner, ScannerOptions};
 use crate::store::{ErrorRecord, Store};
@@ -497,14 +497,16 @@ fn project_reviews(
         .checked_sub(scan_interval)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let scan_errors = store.scan_error_paths_since(scan_error_since)?;
+    let discovery_blocks = store.blocked_worktree_discovery_paths()?;
     let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
 
     let reviews = projects
         .iter()
         .map(|project| {
-            review_project(
+            review_project_with_discovery_blocks(
                 Path::new(&project.path),
                 &scan_errors,
+                &discovery_blocks,
                 &activity,
                 now,
                 safety,
@@ -668,7 +670,7 @@ fn record_review_diagnostics(store: &Store, reviews: &[ProjectReview]) -> Result
                 id: 0,
                 ts: now,
                 category: "review".to_string(),
-                path: Some(review.target_path.to_string_lossy().into_owned()),
+                path: review.target_path.to_str().map(str::to_owned),
                 message: "target read error: unable to read direct target directory".to_string(),
             })?;
         }

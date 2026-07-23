@@ -167,6 +167,62 @@ fn run_dry_run_reports_without_invoking_cargo_clean() {
     assert!(project.join("target/debug/blob.bin").exists());
 }
 
+#[test]
+fn non_forced_cli_reviews_honor_durable_discovery_blocks_and_force_bypasses_them() {
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("tree/router");
+    fs::create_dir_all(project.join("target/debug")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/debug/blob.bin"), vec![0; 4096]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("tree").display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let canonical = project.canonicalize().unwrap();
+    store.upsert_project(&canonical, SystemTime::now()).unwrap();
+    store.replace_linked_worktrees(&canonical, &[]).unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical, SystemTime::now(), "git failed")
+        .unwrap();
+
+    for args in [
+        vec!["projects", "--all"],
+        vec!["run", "--dry-run"],
+        vec!["status", "--refresh"],
+    ] {
+        let mut cmd = Command::cargo_bin("car-go-clean").unwrap();
+        cmd.args(args)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .assert()
+            .success()
+            .stdout(contains("scan_error"));
+    }
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--force"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 1"));
+}
+
 #[cfg(unix)]
 #[test]
 fn run_dry_run_records_unreadable_targets_in_error_logs() {

@@ -90,7 +90,73 @@ fn scan_includes_project_dirs_that_contain_cargo_toml() {
         excludes: vec![],
     });
 
-    assert_eq!(scanner.scan().unwrap(), vec![root.path().to_path_buf()]);
+    assert_eq!(
+        scanner.scan().unwrap(),
+        vec![root.path().canonicalize().unwrap()]
+    );
+}
+
+#[test]
+fn configured_primary_project_discovers_ignored_linked_worktrees() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary.join(".worktrees/feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&primary.join(".gitignore"), ".worktrees/\n");
+    write_file(&linked.join("Cargo.toml"), "[workspace]\n");
+    let resolver = FakeResolver::paths(vec![linked.clone()]);
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![primary.clone()],
+            excludes: vec![],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_linked = linked.canonicalize().unwrap();
+    let report = scanner.scan_with_errors().unwrap();
+    assert_eq!(
+        report.projects,
+        vec![canonical_primary.clone(), canonical_linked.clone()]
+    );
+    assert_eq!(resolver.calls(), vec![canonical_primary.clone()]);
+    assert_eq!(
+        report.worktree_discoveries,
+        vec![WorktreeDiscovery::Success {
+            primary: canonical_primary,
+            linked: vec![canonical_linked],
+        }]
+    );
+}
+
+#[test]
+fn configured_linked_checkout_does_not_query_git_as_a_primary() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = root.path().join("feature");
+    write_file(&linked.join("Cargo.toml"), "[workspace]\n");
+    write_file(
+        &linked.join(".git"),
+        "gitdir: ../router/.git/worktrees/feature\n",
+    );
+    let resolver = FakeResolver::paths(vec![]);
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![linked.clone()],
+            excludes: vec![],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert_eq!(report.projects, vec![linked.canonicalize().unwrap()]);
+    assert!(report.worktree_discoveries.is_empty());
+    assert!(resolver.calls().is_empty());
 }
 
 #[test]
@@ -414,4 +480,38 @@ fn scan_does_not_resolve_worktrees_for_linked_checkout_git_file() {
     assert_eq!(report.projects, vec![linked_checkout]);
     assert!(report.worktree_discoveries.is_empty());
     assert!(resolver.calls().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_rejects_non_utf8_linked_path_as_discovery_failure() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = primary
+        .join(".worktrees")
+        .join(OsString::from_vec(b"\xff".to_vec()));
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::paths(vec![linked])),
+    );
+
+    let canonical_primary = primary.canonicalize().unwrap();
+    let report = scanner.scan_with_errors().unwrap();
+    assert_eq!(report.projects, vec![canonical_primary.clone()]);
+    assert!(matches!(
+        report.worktree_discoveries.as_slice(),
+        [WorktreeDiscovery::Failure { primary, message }]
+            if primary == &canonical_primary && message.contains("non-UTF-8")
+    ));
+    assert_eq!(report.errors[0].path, canonical_primary);
 }

@@ -128,6 +128,17 @@ pub fn review_project(
     now: SystemTime,
     opts: &SafetyOptions,
 ) -> Result<ProjectReview> {
+    review_project_with_discovery_blocks(project, scan_error_paths, &[], activity, now, opts)
+}
+
+pub fn review_project_with_discovery_blocks(
+    project: &Path,
+    scan_error_paths: &[PathBuf],
+    discovery_blocked_paths: &[PathBuf],
+    activity: &[ActivitySignal],
+    now: SystemTime,
+    opts: &SafetyOptions,
+) -> Result<ProjectReview> {
     let class = classify_project(project);
     let target_path = project.join("target");
 
@@ -178,7 +189,10 @@ pub fn review_project(
         }
     }
 
-    if !opts.force && has_related_scan_error(project, &target_path, scan_error_paths) {
+    if !opts.force
+        && (has_related_scan_error(project, &target_path, scan_error_paths)
+            || has_exact_discovery_block(project, discovery_blocked_paths))
+    {
         return Ok(review(
             project,
             class,
@@ -336,6 +350,21 @@ fn has_related_scan_error(
     scan_error_paths.iter().any(|scan_error_path| {
         path_is_within(scan_error_path, project) || path_is_within(scan_error_path, target_path)
     })
+}
+
+fn has_exact_discovery_block(project: &Path, discovery_blocked_paths: &[PathBuf]) -> bool {
+    if discovery_blocked_paths
+        .iter()
+        .any(|blocked| blocked == project)
+    {
+        return true;
+    }
+    let Ok(canonical_project) = fs::canonicalize(project) else {
+        return false;
+    };
+    discovery_blocked_paths
+        .iter()
+        .any(|blocked| blocked == &canonical_project)
 }
 
 fn has_project_activity(project: &Path, activity: &[ActivitySignal]) -> bool {

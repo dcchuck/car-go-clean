@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +82,16 @@ impl GitWorktreeResolver for SystemGitWorktreeResolver {
             .output()
             .map_err(|err| GitWorktreeError::new(format!("failed to run git: {err}")))?;
 
+        self.worktree_paths_from_output(primary, &output)
+    }
+}
+
+impl SystemGitWorktreeResolver {
+    fn worktree_paths_from_output(
+        &self,
+        primary: &Path,
+        output: &Output,
+    ) -> Result<Vec<PathBuf>, GitWorktreeError> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stderr = stderr.trim();
@@ -93,12 +103,7 @@ impl GitWorktreeResolver for SystemGitWorktreeResolver {
             return Err(GitWorktreeError::new(message));
         }
 
-        output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter_map(|record| record.strip_prefix(b"worktree "))
-            .map(git_path_from_bytes)
-            .collect()
+        parse_git_worktree_porcelain(primary, &output.stdout)
     }
 }
 
@@ -134,12 +139,20 @@ impl Scanner {
         let mut found = BTreeSet::new();
         let mut errors = Vec::new();
         let mut worktree_discoveries = Vec::new();
-        let canonical_roots: Vec<_> = self
+        let mut canonical_roots: Vec<_> = self
             .opts
             .roots
             .iter()
             .filter_map(|root| fs::canonicalize(root).ok())
             .collect();
+        canonical_roots.extend(
+            self.opts
+                .project_dirs
+                .iter()
+                .filter_map(|project| fs::canonicalize(project).ok()),
+        );
+        canonical_roots.sort();
+        canonical_roots.dedup();
         for root in &self.opts.roots {
             self.walk(
                 root,
@@ -151,15 +164,50 @@ impl Scanner {
             )?;
         }
         for project in &self.opts.project_dirs {
-            if has_cargo_toml(project) {
-                found.insert(project.clone());
-            }
+            self.add_configured_project(
+                project,
+                &canonical_roots,
+                &mut found,
+                &mut worktree_discoveries,
+                &mut errors,
+            );
         }
         Ok(ScanReport {
             projects: found.into_iter().collect(),
             errors,
             worktree_discoveries,
         })
+    }
+
+    fn add_configured_project(
+        &self,
+        project: &Path,
+        canonical_roots: &[PathBuf],
+        found: &mut BTreeSet<PathBuf>,
+        outcomes: &mut Vec<WorktreeDiscovery>,
+        errors: &mut Vec<ScanError>,
+    ) {
+        if !has_cargo_toml(project) {
+            return;
+        }
+        let project = match fs::canonicalize(project) {
+            Ok(project) => project,
+            Err(err) => {
+                errors.push(scan_error(project, err));
+                return;
+            }
+        };
+        if project.to_str().is_none() {
+            errors.push(non_utf8_scan_error(&project));
+            if project.join(".git").is_dir() {
+                record_discovery_failure(&project, non_utf8_discovery_message(), outcomes, errors);
+            }
+            return;
+        }
+        found.insert(project.clone());
+        if project.join(".git").is_dir() {
+            self.discover_linked_worktrees(&project, canonical_roots, found, outcomes, errors);
+        }
     }
 
     fn walk(
@@ -248,11 +296,33 @@ impl Scanner {
 
         match self.worktree_resolver.linked_worktrees(primary) {
             Ok(candidates) => {
+                if primary.to_str().is_none()
+                    || candidates
+                        .iter()
+                        .any(|candidate| candidate.to_str().is_none())
+                {
+                    record_discovery_failure(
+                        primary,
+                        non_utf8_discovery_message(),
+                        outcomes,
+                        errors,
+                    );
+                    return;
+                }
                 let mut linked = BTreeSet::new();
                 for candidate in candidates {
                     let Ok(candidate) = fs::canonicalize(candidate) else {
                         continue;
                     };
+                    if candidate.to_str().is_none() {
+                        record_discovery_failure(
+                            primary,
+                            non_utf8_discovery_message(),
+                            outcomes,
+                            errors,
+                        );
+                        return;
+                    }
                     if candidate == primary
                         || !canonical_roots
                             .iter()
@@ -271,15 +341,7 @@ impl Scanner {
                 });
             }
             Err(err) => {
-                let message = err.to_string();
-                outcomes.push(WorktreeDiscovery::Failure {
-                    primary: primary.to_path_buf(),
-                    message: message.clone(),
-                });
-                errors.push(ScanError {
-                    path: primary.to_path_buf(),
-                    message,
-                });
+                record_discovery_failure(primary, &err.to_string(), outcomes, errors);
             }
         }
     }
@@ -303,6 +365,74 @@ impl Scanner {
     }
 }
 
+fn parse_git_worktree_porcelain(
+    primary: &Path,
+    output: &[u8],
+) -> Result<Vec<PathBuf>, GitWorktreeError> {
+    if output.is_empty() || !output.ends_with(&[0]) {
+        return Err(GitWorktreeError::new(
+            "git worktree list returned truncated porcelain output",
+        ));
+    }
+
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut in_record = false;
+    let mut primary_records = 0;
+    for field in output[..output.len() - 1].split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if !in_record {
+                return Err(GitWorktreeError::new(
+                    "git worktree list returned an empty or malformed record",
+                ));
+            }
+            in_record = false;
+            continue;
+        }
+
+        if !in_record {
+            let Some(path) = field.strip_prefix(b"worktree ") else {
+                return Err(GitWorktreeError::new(
+                    "git worktree list record does not start with a worktree path",
+                ));
+            };
+            let path = git_path_from_bytes(path)?;
+            if !seen.insert(path.clone()) {
+                return Err(GitWorktreeError::new(
+                    "git worktree list returned a duplicate worktree path",
+                ));
+            }
+            if path == primary {
+                primary_records += 1;
+            } else {
+                paths.push(path);
+            }
+            in_record = true;
+        } else if field == b"worktree" || field.starts_with(b"worktree ") {
+            return Err(GitWorktreeError::new(
+                "git worktree list returned multiple worktree paths in one record",
+            ));
+        }
+    }
+
+    if in_record {
+        return Err(GitWorktreeError::new(
+            "git worktree list returned a record without a terminating separator",
+        ));
+    }
+    if seen.is_empty() {
+        return Err(GitWorktreeError::new(
+            "git worktree list returned no worktree records",
+        ));
+    }
+    if primary_records != 1 {
+        return Err(GitWorktreeError::new(
+            "git worktree list did not include exactly one queried primary checkout",
+        ));
+    }
+    Ok(paths)
+}
+
 fn git_path_from_bytes(record: &[u8]) -> Result<PathBuf, GitWorktreeError> {
     if record.is_empty() {
         return Err(GitWorktreeError::new(
@@ -324,6 +454,33 @@ fn git_path_from_bytes(record: &[u8]) -> Result<PathBuf, GitWorktreeError> {
             GitWorktreeError::new("git worktree list returned a non-UTF-8 worktree path")
         })?;
         Ok(PathBuf::from(path))
+    }
+}
+
+fn record_discovery_failure(
+    primary: &Path,
+    message: &str,
+    outcomes: &mut Vec<WorktreeDiscovery>,
+    errors: &mut Vec<ScanError>,
+) {
+    outcomes.push(WorktreeDiscovery::Failure {
+        primary: primary.to_path_buf(),
+        message: message.to_string(),
+    });
+    errors.push(ScanError {
+        path: primary.to_path_buf(),
+        message: message.to_string(),
+    });
+}
+
+fn non_utf8_discovery_message() -> &'static str {
+    "git worktree discovery returned a non-UTF-8 path that cannot be persisted safely"
+}
+
+fn non_utf8_scan_error(path: &Path) -> ScanError {
+    ScanError {
+        path: path.to_path_buf(),
+        message: "project path is non-UTF-8 and cannot be persisted safely".to_string(),
     }
 }
 
@@ -365,4 +522,104 @@ fn is_ignored(ignores: &[Arc<Gitignore>], path: &Path, is_dir: bool) -> bool {
     ignores
         .iter()
         .any(|ignore| ignore.matched_path_or_any_parents(path, is_dir).is_ignore())
+}
+
+#[cfg(test)]
+mod worktree_porcelain_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(unix)]
+    use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn parser_accepts_complete_records_with_whitespace_and_newlines() {
+        let primary = Path::new("/workspace/main checkout");
+        let output = b"worktree /workspace/main checkout\0HEAD abc\0branch refs/heads/main\0\0worktree /workspace/feature\ncheckout\0HEAD def\0detached\0\0";
+
+        assert_eq!(
+            parse_git_worktree_porcelain(primary, output).unwrap(),
+            vec![PathBuf::from("/workspace/feature\ncheckout")]
+        );
+    }
+
+    #[test]
+    fn parser_rejects_truncated_or_structurally_invalid_output() {
+        let primary = Path::new("/workspace/main");
+        for output in [
+            b"".as_slice(),
+            b"worktree /workspace/main",
+            b"worktree /workspace/main\0HEAD abc\0",
+            b"HEAD abc\0\0",
+            b"worktree \0\0",
+            b"worktree /workspace/main\0worktree /workspace/linked\0\0",
+            b"worktree /workspace/other\0HEAD abc\0\0",
+            b"worktree /workspace/main\0HEAD abc\0\0worktree /workspace/main\0HEAD def\0\0",
+        ] {
+            assert!(
+                parse_git_worktree_porcelain(primary, output).is_err(),
+                "unexpectedly accepted {output:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_resolver_output_boundary_rejects_malformed_success_output() {
+        let output = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"worktree /workspace/main".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert!(SystemGitWorktreeResolver
+            .worktree_paths_from_output(Path::new("/workspace/main"), &output)
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_resolver_output_boundary_returns_only_linked_paths_and_rejects_failure_status() {
+        let resolver = SystemGitWorktreeResolver;
+        let primary = Path::new("/workspace/main");
+        let success = Output {
+            status: ExitStatus::from_raw(0),
+            stdout:
+                b"worktree /workspace/main\0HEAD abc\0\0worktree /workspace/feature\0HEAD def\0\0"
+                    .to_vec(),
+            stderr: Vec::new(),
+        };
+        let failure = Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"fatal: broken".to_vec(),
+        };
+
+        assert_eq!(
+            resolver
+                .worktree_paths_from_output(primary, &success)
+                .unwrap(),
+            vec![PathBuf::from("/workspace/feature")]
+        );
+        assert!(resolver
+            .worktree_paths_from_output(primary, &failure)
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_preserves_non_utf8_paths_at_the_git_boundary() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let primary = Path::new("/workspace/main");
+        let output =
+            b"worktree /workspace/main\0HEAD abc\0\0worktree /workspace/\xff\0HEAD def\0\0";
+        let parsed = parse_git_worktree_porcelain(primary, output).unwrap();
+
+        assert_eq!(
+            parsed[0],
+            PathBuf::from(OsString::from_vec(b"/workspace/\xff".to_vec()))
+        );
+    }
 }

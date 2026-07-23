@@ -42,12 +42,12 @@ fn linked_worktree_failure_blocks_cached_children_until_success() {
         .mark_worktree_discovery_failed(primary, now, "git failed")
         .unwrap();
     assert_eq!(
-        store.blocked_linked_worktrees().unwrap(),
-        vec![linked.clone()]
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![primary.to_path_buf(), linked.clone()]
     );
 
     store.replace_linked_worktrees(primary, &[linked]).unwrap();
-    assert!(store.blocked_linked_worktrees().unwrap().is_empty());
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
 }
 
 #[test]
@@ -59,7 +59,72 @@ fn removing_project_removes_linked_worktree_provenance() {
         .replace_linked_worktrees(primary, &[linked.clone()])
         .unwrap();
     store.remove_project(primary).unwrap();
-    assert!(store.blocked_linked_worktrees().unwrap().is_empty());
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+}
+
+#[test]
+fn removing_failed_primary_project_preserves_durable_association_until_success() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let primary = Path::new("/workspace/main");
+    let linked = PathBuf::from("/workspace/feature");
+    store
+        .replace_linked_worktrees(primary, &[linked.clone()])
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(primary, SystemTime::UNIX_EPOCH, "git failed")
+        .unwrap();
+
+    store.remove_project(primary).unwrap();
+
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![linked, primary.to_path_buf()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_provenance_is_rejected_before_replacing_existing_failure_state() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let primary = Path::new("/workspace/main");
+    let linked = PathBuf::from("/workspace/main/.worktrees/saved");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store
+        .replace_linked_worktrees(primary, &[linked.clone()])
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(primary, now, "git failed")
+        .unwrap();
+
+    let first = PathBuf::from(OsString::from_vec(
+        b"/workspace/main/.worktrees/\xff".to_vec(),
+    ));
+    let second = PathBuf::from(OsString::from_vec(
+        b"/workspace/main/.worktrees/\xfe".to_vec(),
+    ));
+    assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+    assert!(store.replace_linked_worktrees(primary, &[first]).is_err());
+    assert!(store.replace_linked_worktrees(primary, &[second]).is_err());
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![primary.to_path_buf(), linked]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_project_path_is_not_persisted_under_a_lossy_alias() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let path = PathBuf::from(OsString::from_vec(b"/workspace/\xff".to_vec()));
+
+    assert!(store.upsert_project(&path, SystemTime::UNIX_EPOCH).is_err());
+    assert!(store.all_projects().unwrap().is_empty());
 }
 
 #[test]

@@ -2,7 +2,9 @@ use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
 use crate::logging::Logger;
-use crate::safety::{review_project, review_summary, CleanDecision, SafetyOptions};
+use crate::safety::{
+    review_project_with_discovery_blocks, review_summary, CleanDecision, SafetyOptions,
+};
 use crate::scanner::{Scanner, WorktreeDiscovery};
 use crate::store::{CleanEvent, ErrorRecord, SchedulerStatus, Store};
 use anyhow::Result;
@@ -108,7 +110,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 id: 0,
                 ts: now,
                 category: "scan".to_string(),
-                path: Some(error.path.to_string_lossy().into_owned()),
+                path: error.path.to_str().map(str::to_owned),
                 message: error.message,
             })?;
         }
@@ -129,7 +131,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     id: 0,
                     ts: now,
                     category: "cache".to_string(),
-                    path: Some(path.to_string_lossy().into_owned()),
+                    path: path.to_str().map(str::to_owned),
                     message: err.to_string(),
                 })?;
             }
@@ -164,8 +166,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let scan_error_since = started
             .checked_sub(self.opts.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mut scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
-        scan_errors.extend(self.store.blocked_linked_worktrees()?);
+        let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -176,7 +178,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 
         for project in &projects {
             let path = PathBuf::from(&project.path);
-            let review = review_project(&path, &scan_errors, &activity, started, &safety)?;
+            let review = review_project_with_discovery_blocks(
+                &path,
+                &scan_errors,
+                &discovery_blocks,
+                &activity,
+                started,
+                &safety,
+            )?;
             let should_clean = review.decision == CleanDecision::Cleanable;
             if review.decision == CleanDecision::Skipped(crate::safety::SkipReason::TargetReadError)
             {
@@ -184,7 +193,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     id: 0,
                     ts: SystemTime::now(),
                     category: "review".to_string(),
-                    path: Some(review.target_path.to_string_lossy().into_owned()),
+                    path: review.target_path.to_str().map(str::to_owned),
                     message: "target read error: unable to read direct target directory"
                         .to_string(),
                 })?;

@@ -212,7 +212,7 @@ impl Store {
     }
 
     pub fn upsert_project(&self, path: impl AsRef<Path>, now: SystemTime) -> Result<()> {
-        let path = path_to_string(path.as_ref());
+        let path = path_to_string(path.as_ref())?;
         let now = to_epoch(now)?;
         self.conn.execute(
             "
@@ -226,14 +226,19 @@ impl Store {
     }
 
     pub fn remove_project(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path_to_string(path.as_ref());
+        let path = path_to_string(path.as_ref())?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM linked_worktrees WHERE primary_path=?1 OR linked_path=?1",
-            [&path],
-        )?;
-        tx.execute(
-            "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+            "
+            DELETE FROM linked_worktrees
+            WHERE (primary_path=?1 OR linked_path=?1)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM worktree_discovery_failures
+                  WHERE worktree_discovery_failures.primary_path =
+                        linked_worktrees.primary_path
+              )
+            ",
             [&path],
         )?;
         tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
@@ -242,8 +247,11 @@ impl Store {
     }
 
     pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
-        let primary = path_to_string(primary);
-        let linked: BTreeSet<_> = linked.iter().map(|path| path_to_string(path)).collect();
+        let primary = path_to_string(primary)?;
+        let linked: BTreeSet<_> = linked
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM linked_worktrees WHERE primary_path=?1",
@@ -277,19 +285,25 @@ impl Store {
                 failed_at = excluded.failed_at,
                 message = excluded.message
             ",
-            params![path_to_string(primary), to_epoch(now)?, message],
+            params![path_to_string(primary)?, to_epoch(now)?, message],
         )?;
         Ok(())
     }
 
-    pub fn blocked_linked_worktrees(&self) -> Result<Vec<PathBuf>> {
+    pub fn blocked_worktree_discovery_paths(&self) -> Result<Vec<PathBuf>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT linked_path
-            FROM linked_worktrees
-            INNER JOIN worktree_discovery_failures
-                ON linked_worktrees.primary_path = worktree_discovery_failures.primary_path
-            ORDER BY linked_path
+            SELECT blocked_path
+            FROM (
+                SELECT primary_path AS blocked_path
+                FROM worktree_discovery_failures
+                UNION
+                SELECT linked_path AS blocked_path
+                FROM linked_worktrees
+                INNER JOIN worktree_discovery_failures
+                    ON linked_worktrees.primary_path = worktree_discovery_failures.primary_path
+            )
+            ORDER BY blocked_path
             ",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -302,7 +316,7 @@ impl Store {
     pub fn mark_project_cleaned(&self, path: impl AsRef<Path>, when: SystemTime) -> Result<()> {
         self.conn.execute(
             "UPDATE projects SET last_cleaned_at=?1 WHERE path=?2",
-            params![to_epoch(when)?, path_to_string(path.as_ref())],
+            params![to_epoch(when)?, path_to_string(path.as_ref())?],
         )?;
         Ok(())
     }
@@ -645,8 +659,10 @@ fn collect_rows<T>(
     Ok(out)
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
 fn to_epoch(time: SystemTime) -> Result<i64> {
