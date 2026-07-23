@@ -270,6 +270,53 @@ fn retargeted_failed_primary_alias_is_not_claimed_by_success_at_its_new_target()
 
 #[cfg(unix)]
 #[test]
+fn retargeted_trusted_association_primary_is_not_normalized_to_its_new_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let replacement = root.path().join("replacement");
+    let child = root.path().join("child");
+    for path in [&original, &replacement, &child] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_replacement = replacement.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    store
+        .replace_linked_worktrees(&canonical_original, std::slice::from_ref(&canonical_child))
+        .unwrap();
+
+    fs::remove_dir(&canonical_original).unwrap();
+    symlink(&canonical_replacement, &canonical_original).unwrap();
+    store.normalize_resolvable_project_aliases().unwrap();
+
+    store
+        .replace_linked_worktrees(
+            &canonical_replacement,
+            std::slice::from_ref(&canonical_child),
+        )
+        .unwrap();
+
+    fs::remove_file(&canonical_original).unwrap();
+    fs::create_dir(&canonical_original).unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_original,
+            SystemTime::UNIX_EPOCH,
+            "original failed",
+        )
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_child, canonical_original]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_success() {
     use std::os::unix::fs::symlink;
 
@@ -339,6 +386,104 @@ fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_succ
     let blocked = store.blocked_worktree_discovery_paths().unwrap();
     assert!(blocked.contains(&alias));
     assert!(blocked.contains(&canonical_child));
+}
+
+#[cfg(unix)]
+fn assert_v4_alias_association_blocks_child_after_fresh_primary_failure(retarget: bool) {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let replacement = root.path().join("replacement");
+    let alias = root.path().join("legacy-primary-alias");
+    let child = root.path().join("child");
+    for path in [&primary, &replacement, &child] {
+        fs::create_dir_all(path).unwrap();
+    }
+    symlink(&primary, &alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (4);
+        CREATE TABLE projects (
+            path TEXT PRIMARY KEY,
+            discovered_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_cleaned_at INTEGER
+        );
+        CREATE TABLE linked_worktrees (
+            primary_path TEXT NOT NULL,
+            linked_path TEXT NOT NULL,
+            PRIMARY KEY (primary_path, linked_path)
+        );
+        CREATE TABLE worktree_discovery_failures (
+            primary_path TEXT PRIMARY KEY,
+            failed_at INTEGER NOT NULL,
+            message TEXT NOT NULL
+        );
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (path, discovered_at, last_seen_at) VALUES (?1, 0, 0)",
+        [canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+        rusqlite::params![alias.to_str().unwrap(), canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    fs::remove_file(&alias).unwrap();
+    if retarget {
+        symlink(&replacement, &alias).unwrap();
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::UNIX_EPOCH, "fresh failure")
+        .unwrap();
+
+    let blocked = store.blocked_worktree_discovery_paths().unwrap();
+    assert!(blocked.contains(&canonical_primary));
+    assert!(blocked.contains(&canonical_child));
+
+    store
+        .replace_linked_worktrees(&canonical_primary, &[])
+        .unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::UNIX_EPOCH,
+            "later fresh failure",
+        )
+        .unwrap();
+    assert!(store
+        .blocked_worktree_discovery_paths()
+        .unwrap()
+        .contains(&canonical_child));
+}
+
+#[cfg(unix)]
+#[test]
+fn migrated_v4_broken_primary_association_blocks_child_after_fresh_failure() {
+    assert_v4_alias_association_blocks_child_after_fresh_primary_failure(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrated_v4_retargeted_primary_association_blocks_child_after_fresh_failure() {
+    assert_v4_alias_association_blocks_child_after_fresh_primary_failure(true);
 }
 
 #[test]

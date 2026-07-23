@@ -522,6 +522,130 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
 
 #[cfg(unix)]
 #[test]
+fn cli_blocks_v4_primary_alias_associations_after_fresh_canonical_failure() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for retarget in [false, true] {
+        let work = tempfile::tempdir().unwrap();
+        let primary = work.path().join("primary");
+        let replacement = work.path().join("replacement");
+        let alias = work.path().join("legacy-primary-alias");
+        let child = work.path().join("child");
+        for checkout in [&primary, &replacement] {
+            fs::create_dir_all(checkout.join(".git")).unwrap();
+            fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
+        }
+        fs::create_dir_all(child.join("target")).unwrap();
+        fs::write(child.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(child.join("target/blob.bin"), vec![0; 2048]).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        symlink(&primary, &alias).unwrap();
+        let canonical_primary = primary.canonicalize().unwrap();
+        let canonical_child = child.canonicalize().unwrap();
+
+        let state = work.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let db_path = state.join("state.db");
+        {
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            store
+                .upsert_project(&canonical_child, SystemTime::now())
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                DROP TABLE linked_worktrees;
+                CREATE TABLE linked_worktrees (
+                    primary_path TEXT NOT NULL,
+                    linked_path TEXT NOT NULL,
+                    PRIMARY KEY (primary_path, linked_path)
+                );
+                CREATE INDEX idx_linked_worktrees_linked
+                    ON linked_worktrees(linked_path);
+                DROP TABLE worktree_discovery_failures;
+                CREATE TABLE worktree_discovery_failures (
+                    primary_path TEXT PRIMARY KEY,
+                    failed_at INTEGER NOT NULL,
+                    message TEXT NOT NULL
+                );
+                DELETE FROM schema_version WHERE version >= 5;
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+                rusqlite::params![alias.to_str().unwrap(), canonical_child.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        fs::remove_file(&alias).unwrap();
+        if retarget {
+            symlink(&replacement, &alias).unwrap();
+        }
+        {
+            let store = Store::open(&db_path).unwrap();
+            store.migrate().unwrap();
+            store
+                .mark_worktree_discovery_failed(
+                    &canonical_primary,
+                    SystemTime::now(),
+                    "fresh canonical failure",
+                )
+                .unwrap();
+        }
+
+        let config = work.path().join("config.toml");
+        fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+        let bin_dir = work.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let marker = work.path().join("cargo-ran");
+        let fake_cargo = bin_dir.join("cargo");
+        fs::write(
+            &fake_cargo,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nif [ \"$1\" = clean ]; then rm -rf target; fi\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = bin_dir.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .args(["projects", "--all"])
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .assert()
+            .success()
+            .stdout(contains("skipped:scan_error"))
+            .stdout(contains(canonical_child.display().to_string()));
+
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("run")
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("PATH", &path)
+            .assert()
+            .success()
+            .stdout(contains("cleaned=0"));
+        assert!(!marker.exists());
+        assert!(child.join("target/blob.bin").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dry_run_records_unreadable_targets_in_error_logs() {
     use std::os::unix::fs::PermissionsExt;
 

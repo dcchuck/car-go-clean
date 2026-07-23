@@ -243,6 +243,54 @@ impl Store {
             tx.execute("INSERT INTO schema_version (version) VALUES (5)", [])?;
             tx.commit()?;
         }
+        if current < 6 {
+            let tx = self.conn.unchecked_transaction()?;
+            let has_canonical_primary_path = {
+                let mut stmt = tx.prepare("PRAGMA table_info(linked_worktrees)")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                collect_rows(rows)?
+                    .into_iter()
+                    .any(|column| column == "canonical_primary_path")
+            };
+            if !has_canonical_primary_path {
+                tx.execute(
+                    "
+                    ALTER TABLE linked_worktrees
+                    ADD COLUMN canonical_primary_path TEXT
+                    ",
+                    [],
+                )?;
+            }
+            let legacy_primaries = {
+                let mut stmt = tx.prepare(
+                    "
+                    SELECT DISTINCT primary_path
+                    FROM linked_worktrees
+                    WHERE canonical_primary_path IS NULL
+                    ORDER BY primary_path
+                    ",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                collect_rows(rows)?
+            };
+            for primary in legacy_primaries {
+                let Ok(canonical) = fs::canonicalize(Path::new(&primary)) else {
+                    continue;
+                };
+                if path_to_string(&canonical)? == primary {
+                    tx.execute(
+                        "
+                        UPDATE linked_worktrees
+                        SET canonical_primary_path=?1
+                        WHERE primary_path=?1 AND canonical_primary_path IS NULL
+                        ",
+                        [&primary],
+                    )?;
+                }
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (6)", [])?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -294,7 +342,7 @@ impl Store {
     }
 
     pub fn normalize_resolvable_project_aliases(&self) -> Result<()> {
-        let active_failure_identities = self.active_worktree_discovery_identities()?;
+        let frozen_identities = self.frozen_worktree_identities()?;
         let mut stmt = self.conn.prepare(
             "
             SELECT path FROM projects
@@ -313,7 +361,7 @@ impl Store {
 
         let mut replacements = Vec::new();
         for identity in identities {
-            if active_failure_identities.contains(&identity) {
+            if frozen_identities.contains(&identity) {
                 continue;
             }
             let Ok(canonical) = fs::canonicalize(Path::new(&identity)) else {
@@ -338,7 +386,7 @@ impl Store {
 
     pub fn is_active_worktree_discovery_identity(&self, path: &Path) -> Result<bool> {
         let path = path_to_string(path)?;
-        Ok(self.active_worktree_discovery_identities()?.contains(&path))
+        Ok(self.frozen_worktree_identities()?.contains(&path))
     }
 
     pub fn replace_linked_worktrees(&self, primary: &Path, linked: &[PathBuf]) -> Result<()> {
@@ -361,7 +409,15 @@ impl Store {
         excluded: &[PathBuf],
         out_of_scope: &[PathBuf],
     ) -> Result<()> {
-        let primary = path_to_string(primary)?;
+        let persisted_primary = path_to_string(primary)?;
+        let canonical_primary = fs::canonicalize(primary)
+            .ok()
+            .map(|canonical| path_to_string(&canonical))
+            .transpose()?;
+        let primary = canonical_primary
+            .as_deref()
+            .unwrap_or(&persisted_primary)
+            .to_owned();
         let linked: BTreeSet<_> = linked
             .iter()
             .map(|path| path_to_string(path))
@@ -375,36 +431,56 @@ impl Store {
             .map(|path| path_to_string(path))
             .collect::<Result<_>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        normalize_failed_primary_aliases_for_success(&tx, &primary)?;
-        let has_untrusted_exact_failure = tx.query_row(
+        if canonical_primary.is_some() {
+            normalize_failed_primary_aliases_for_success(&tx, &primary)?;
+            rekey_trusted_linked_associations_for_success(&tx, &primary)?;
+        }
+        let has_untrusted_failure = tx.query_row(
             "
             SELECT EXISTS(
                 SELECT 1
                 FROM worktree_discovery_failures
-                WHERE primary_path=?1 AND canonical_primary_path IS NULL
+                WHERE canonical_primary_path IS NULL
             )
             ",
-            [&primary],
+            [],
             |row| row.get::<_, bool>(0),
         )?;
-        if has_untrusted_exact_failure {
+        if has_untrusted_failure {
             tx.commit()?;
             return Ok(());
         }
         let previous_linked = {
-            let mut stmt =
-                tx.prepare("SELECT linked_path FROM linked_worktrees WHERE primary_path=?1")?;
+            let mut stmt = tx.prepare(
+                "
+                SELECT linked_path
+                FROM linked_worktrees
+                WHERE canonical_primary_path=?1
+                   OR (canonical_primary_path IS NULL AND primary_path=?1)
+                ",
+            )?;
             let rows = stmt.query_map([&primary], |row| row.get::<_, String>(0))?;
             collect_rows(rows)?.into_iter().collect::<BTreeSet<_>>()
         };
         tx.execute(
-            "DELETE FROM linked_worktrees WHERE primary_path=?1",
+            "
+            DELETE FROM linked_worktrees
+            WHERE canonical_primary_path=?1
+               OR (canonical_primary_path IS NULL AND primary_path=?1)
+            ",
             [&primary],
         )?;
         for linked_path in &linked {
             tx.execute(
-                "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
-                params![primary, linked_path],
+                "
+                INSERT INTO linked_worktrees (
+                    primary_path,
+                    linked_path,
+                    canonical_primary_path
+                )
+                VALUES (?1, ?2, ?3)
+                ",
+                params![primary, linked_path, canonical_primary.as_deref()],
             )?;
         }
         for stale_path in previous_linked.difference(&linked) {
@@ -474,6 +550,19 @@ impl Store {
             [],
             |row| row.get::<_, bool>(0),
         )?;
+        let has_untrusted_association_during_failure = self.conn.query_row(
+            "
+            SELECT
+                EXISTS(SELECT 1 FROM worktree_discovery_failures)
+                AND EXISTS(
+                    SELECT 1
+                    FROM linked_worktrees
+                    WHERE canonical_primary_path IS NULL
+                )
+            ",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
         let blocked = self
             .trusted_worktree_discovery_paths()?
             .into_iter()
@@ -481,6 +570,7 @@ impl Store {
             .collect::<Vec<_>>();
 
         if !has_untrusted_failure
+            && !has_untrusted_association_during_failure
             && blocked.iter().all(|path| {
                 fs::canonicalize(path).is_ok_and(|canonical| canonical == path.as_path())
             })
@@ -513,7 +603,10 @@ impl Store {
                 SELECT linked_path AS blocked_path
                 FROM linked_worktrees
                 INNER JOIN worktree_discovery_failures
-                    ON linked_worktrees.primary_path = worktree_discovery_failures.primary_path
+                    ON linked_worktrees.canonical_primary_path
+                        = worktree_discovery_failures.canonical_primary_path
+                WHERE linked_worktrees.canonical_primary_path IS NOT NULL
+                  AND worktree_discovery_failures.canonical_primary_path IS NOT NULL
             )
             ORDER BY blocked_path
             ",
@@ -533,13 +626,47 @@ impl Store {
                 SELECT linked_path AS blocked_path
                 FROM linked_worktrees
                 INNER JOIN worktree_discovery_failures
-                    ON linked_worktrees.primary_path = worktree_discovery_failures.primary_path
+                    ON linked_worktrees.canonical_primary_path
+                        = worktree_discovery_failures.canonical_primary_path
+                WHERE linked_worktrees.canonical_primary_path IS NOT NULL
+                  AND worktree_discovery_failures.canonical_primary_path IS NOT NULL
+                UNION
+                SELECT primary_path AS blocked_path
+                FROM linked_worktrees
+                WHERE canonical_primary_path IS NULL
+                  AND EXISTS(SELECT 1 FROM worktree_discovery_failures)
+                UNION
+                SELECT linked_path AS blocked_path
+                FROM linked_worktrees
+                WHERE canonical_primary_path IS NULL
+                  AND EXISTS(SELECT 1 FROM worktree_discovery_failures)
             )
             ORDER BY blocked_path
             ",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(collect_rows(rows)?.into_iter().collect())
+    }
+
+    fn frozen_worktree_identities(&self) -> Result<BTreeSet<String>> {
+        let mut frozen = self.active_worktree_discovery_identities()?;
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT identity
+            FROM (
+                SELECT primary_path AS identity
+                FROM linked_worktrees
+                UNION
+                SELECT linked_path AS identity
+                FROM linked_worktrees
+                WHERE canonical_primary_path IS NULL
+            )
+            ORDER BY identity
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        frozen.extend(collect_rows(rows)?);
+        Ok(frozen)
     }
 
     pub fn mark_project_cleaned(&self, path: impl AsRef<Path>, when: SystemTime) -> Result<()> {
@@ -891,14 +1018,26 @@ fn replace_project_path_in_transaction(
     )?;
     tx.execute(
         "
-        INSERT OR IGNORE INTO linked_worktrees (primary_path, linked_path)
+        INSERT INTO linked_worktrees (
+            primary_path,
+            linked_path,
+            canonical_primary_path
+        )
         SELECT
             CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END,
-            CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+            CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END,
+            canonical_primary_path
         FROM linked_worktrees
         WHERE (primary_path=?1 OR linked_path=?1)
           AND CASE WHEN primary_path=?1 THEN ?2 ELSE primary_path END
               <> CASE WHEN linked_path=?1 THEN ?2 ELSE linked_path END
+        ON CONFLICT(primary_path, linked_path) DO UPDATE SET
+            canonical_primary_path = CASE
+                WHEN linked_worktrees.canonical_primary_path
+                    = excluded.canonical_primary_path
+                THEN linked_worktrees.canonical_primary_path
+                ELSE NULL
+            END
         ",
         params![old_path, new_path],
     )?;
@@ -974,16 +1113,25 @@ fn rekey_trusted_failed_primary_for_success(
 ) -> Result<()> {
     tx.execute(
         "
-        INSERT OR IGNORE INTO linked_worktrees (primary_path, linked_path)
-        SELECT ?2, linked_path
+        INSERT OR IGNORE INTO linked_worktrees (
+            primary_path,
+            linked_path,
+            canonical_primary_path
+        )
+        SELECT ?2, linked_path, canonical_primary_path
         FROM linked_worktrees
-        WHERE primary_path=?1 AND linked_path<>?2
+        WHERE primary_path=?1
+          AND canonical_primary_path=?2
+          AND linked_path<>?2
         ",
         params![old_primary, canonical_primary],
     )?;
     tx.execute(
-        "DELETE FROM linked_worktrees WHERE primary_path=?1",
-        [old_primary],
+        "
+        DELETE FROM linked_worktrees
+        WHERE primary_path=?1 AND canonical_primary_path=?2
+        ",
+        params![old_primary, canonical_primary],
     )?;
     tx.execute(
         "
@@ -1020,6 +1168,50 @@ fn rekey_trusted_failed_primary_for_success(
         [old_primary],
     )?;
     tx.execute("DELETE FROM projects WHERE path=?1", [old_primary])?;
+    Ok(())
+}
+
+fn rekey_trusted_linked_associations_for_success(
+    tx: &Transaction<'_>,
+    canonical_primary: &str,
+) -> Result<()> {
+    let aliases = {
+        let mut stmt = tx.prepare(
+            "
+            SELECT DISTINCT primary_path
+            FROM linked_worktrees
+            WHERE canonical_primary_path=?1 AND primary_path<>?1
+            ORDER BY primary_path
+            ",
+        )?;
+        let rows = stmt.query_map([canonical_primary], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)?
+    };
+    for alias in aliases {
+        tx.execute(
+            "
+            INSERT OR IGNORE INTO linked_worktrees (
+                primary_path,
+                linked_path,
+                canonical_primary_path
+            )
+            SELECT ?2, linked_path, canonical_primary_path
+            FROM linked_worktrees
+            WHERE primary_path=?1
+              AND canonical_primary_path=?2
+              AND linked_path<>?2
+            ",
+            params![&alias, canonical_primary],
+        )?;
+        tx.execute(
+            "
+            DELETE FROM linked_worktrees
+            WHERE primary_path=?1 AND canonical_primary_path=?2
+            ",
+            params![&alias, canonical_primary],
+        )?;
+        tx.execute("DELETE FROM projects WHERE path=?1", [&alias])?;
+    }
     Ok(())
 }
 

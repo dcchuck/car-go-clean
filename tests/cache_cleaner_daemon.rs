@@ -2220,6 +2220,128 @@ fn daemon_migrated_broken_primary_alias_stays_fail_closed_after_primary_success(
 }
 
 #[cfg(unix)]
+fn assert_daemon_blocks_v4_alias_association_after_fresh_failure(retarget: bool) {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let replacement = root.path().join("replacement");
+    let alias = root.path().join("legacy-primary-alias");
+    let child = root.path().join("child");
+    for checkout in [&primary, &replacement] {
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        write_file(&checkout.join("Cargo.toml"), b"[workspace]\n");
+    }
+    write_file(&child.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&child.join("target/blob.bin"), &[0; 2048]);
+    symlink(&primary, &alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_project(&canonical_child, SystemTime::now())
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE linked_worktrees;
+            CREATE TABLE linked_worktrees (
+                primary_path TEXT NOT NULL,
+                linked_path TEXT NOT NULL,
+                PRIMARY KEY (primary_path, linked_path)
+            );
+            CREATE INDEX idx_linked_worktrees_linked
+                ON linked_worktrees(linked_path);
+            DROP TABLE worktree_discovery_failures;
+            CREATE TABLE worktree_discovery_failures (
+                primary_path TEXT PRIMARY KEY,
+                failed_at INTEGER NOT NULL,
+                message TEXT NOT NULL
+            );
+            DELETE FROM schema_version WHERE version >= 5;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+            rusqlite::params![alias.to_str().unwrap(), canonical_child.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+
+    fs::remove_file(&alias).unwrap();
+    if retarget {
+        symlink(&replacement, &alias).unwrap();
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store
+        .mark_worktree_discovery_failed(
+            &canonical_primary,
+            SystemTime::now(),
+            "fresh canonical failure",
+        )
+        .unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(child.join("target/blob.bin").exists());
+    assert!(store
+        .blocked_worktree_discovery_paths()
+        .unwrap()
+        .contains(&canonical_child));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_blocks_v4_broken_primary_association_after_fresh_failure() {
+    assert_daemon_blocks_v4_alias_association_after_fresh_failure(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_blocks_v4_retargeted_primary_association_after_fresh_failure() {
+    assert_daemon_blocks_v4_alias_association_after_fresh_failure(true);
+}
+
+#[cfg(unix)]
 #[test]
 fn failed_discovery_blocks_canonical_child_from_alias_only_provenance() {
     use std::os::unix::fs::symlink;
