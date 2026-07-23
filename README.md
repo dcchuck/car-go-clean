@@ -42,8 +42,18 @@ Example:
 scan_dirs = ["~"]
 target_quiet_period = "2h"
 clean_interval = "24h"
-scan_interval = "7d"
+scan_interval = "1d"
 ```
+
+The default scan interval is one day. When a scan finds a primary Git checkout,
+it also discovers linked Rust worktrees that Git reports within the configured
+scan roots. This includes Git-reported worktrees hidden by ignore rules;
+configured exclusions and the normal cleaning safeguards still apply.
+
+If Git worktree discovery fails for a primary checkout, only linked worktrees
+previously discovered from that checkout are temporarily blocked from cleanup.
+A later successful discovery replaces the saved association and removes that
+temporary block.
 
 ## Safe Cleaning Model
 
