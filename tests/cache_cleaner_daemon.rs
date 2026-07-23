@@ -971,6 +971,118 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_skips_non_utf8_nested_rust_argument_paths_with_outside_cwd() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
+
+    fn prefixed_path(prefix: &[u8], path: &Path) -> PathBuf {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(path.as_os_str().as_bytes());
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let outside_cwd = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/existing"), &[0; 2048]);
+    symlink(&project, &alias).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+    let future = alias
+        .join("target")
+        .join(OsString::from_vec(b"future-output-\xff".to_vec()));
+    let target = alias
+        .join("target")
+        .join(OsString::from_vec(b"search-path-\xfe".to_vec()));
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_project, SystemTime::now())
+        .unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let argument_sets = vec![
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--extern"),
+            prefixed_path(b"dep=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--extern=dep=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--emit"),
+            prefixed_path(b"link=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--emit=link=", &future),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("-L"),
+            prefixed_path(b"dependency=", &target),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"-Ldependency=", &target),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            PathBuf::from("--library-path"),
+            prefixed_path(b"dependency=", &target),
+        ],
+        vec![
+            PathBuf::from("rustc"),
+            prefixed_path(b"--library-path=dependency=", &target),
+        ],
+    ];
+
+    for arguments in argument_sets {
+        let result = daemon
+            .run_cycle_with_safety(
+                SafetyOptions {
+                    target_quiet_period: Duration::ZERO,
+                    include_managed_cache: false,
+                    include_active: false,
+                    force: false,
+                },
+                &ArgumentsProcessInspector {
+                    arguments,
+                    cwd: Some(outside_cwd.path().to_path_buf()),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.cleaned, 0);
+        assert_eq!(result.skipped, 1);
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
 #[test]
 fn cleaner_forces_reviewed_direct_target_dir() {
     let project = tempfile::tempdir().unwrap();
@@ -1862,6 +1974,7 @@ fn successful_canonical_discovery_clears_alias_keyed_failure_and_stale_provenanc
     store
         .mark_worktree_discovery_failed(&alias, SystemTime::now(), "legacy failure")
         .unwrap();
+    fs::remove_file(&alias).unwrap();
 
     let runner = FakeRunner {
         delete_target: true,
@@ -1920,6 +2033,190 @@ fn successful_canonical_discovery_clears_alias_keyed_failure_and_stale_provenanc
         store.blocked_worktree_discovery_paths().unwrap(),
         vec![current.canonicalize().unwrap(), canonical_primary]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_success_at_retargeted_primary_alias_destination_preserves_original_failure() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let replacement = root.path().join("replacement");
+    let alias = root.path().join("primary-alias");
+    let child = root.path().join("original-child");
+    for primary in [&original, &replacement] {
+        fs::create_dir_all(primary.join(".git")).unwrap();
+        write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    }
+    write_file(&child.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&child.join("target/blob.bin"), &[0; 2048]);
+    symlink(&original, &alias).unwrap();
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_replacement = replacement.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(&canonical_child, SystemTime::now())
+        .unwrap();
+    store
+        .replace_linked_worktrees(&alias, std::slice::from_ref(&canonical_child))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&alias, SystemTime::now(), "original failure")
+        .unwrap();
+    fs::remove_file(&alias).unwrap();
+    symlink(&replacement, &alias).unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![],
+                project_dirs: vec![canonical_replacement.clone()],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    let mut expected_blocks = vec![canonical_child.clone(), canonical_original];
+    expected_blocks.sort();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        expected_blocks
+    );
+    assert!(store
+        .all_projects()
+        .unwrap()
+        .iter()
+        .any(|project| project.path == canonical_child.to_string_lossy()));
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_migrated_broken_primary_alias_stays_fail_closed_after_primary_success() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let alias = root.path().join("legacy-primary-alias");
+    let child = root.path().join("child");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&child.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&child.join("target/blob.bin"), &[0; 2048]);
+    symlink(&primary, &alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_project(&canonical_child, SystemTime::now())
+            .unwrap();
+        store
+            .replace_linked_worktrees(&alias, std::slice::from_ref(&canonical_child))
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            DROP TABLE worktree_discovery_failures;
+            CREATE TABLE worktree_discovery_failures (
+                primary_path TEXT PRIMARY KEY,
+                failed_at INTEGER NOT NULL,
+                message TEXT NOT NULL
+            );
+            DELETE FROM schema_version WHERE version >= 5;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "
+            INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
+            VALUES (?1, 0, 'legacy failure')
+            ",
+            [alias.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+    fs::remove_file(&alias).unwrap();
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![],
+                project_dirs: vec![canonical_primary.clone()],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::paths(vec![])),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+    let blocked = store.blocked_worktree_discovery_paths().unwrap();
+    assert!(blocked.contains(&canonical_primary));
+    assert!(blocked.contains(&canonical_child));
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[cfg(unix)]

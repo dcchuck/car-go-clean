@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -31,22 +32,27 @@ fn open_creates_file_and_migrations_create_tables() {
 #[test]
 fn linked_worktree_failure_blocks_cached_children_until_success() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
-    let primary = Path::new("/workspace/main");
-    let linked = PathBuf::from("/workspace/main/.worktrees/feature");
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("main");
+    let linked = root.path().join("feature");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&linked).unwrap();
+    let primary = primary.canonicalize().unwrap();
+    let linked = linked.canonicalize().unwrap();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
 
     store
-        .replace_linked_worktrees(primary, std::slice::from_ref(&linked))
+        .replace_linked_worktrees(&primary, std::slice::from_ref(&linked))
         .unwrap();
     store
-        .mark_worktree_discovery_failed(primary, now, "git failed")
+        .mark_worktree_discovery_failed(&primary, now, "git failed")
         .unwrap();
     assert_eq!(
         store.blocked_worktree_discovery_paths().unwrap(),
-        vec![primary.to_path_buf(), linked.clone()]
+        vec![linked.clone(), primary.clone()]
     );
 
-    store.replace_linked_worktrees(primary, &[linked]).unwrap();
+    store.replace_linked_worktrees(&primary, &[linked]).unwrap();
     assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
 }
 
@@ -220,6 +226,147 @@ fn normalizing_resolvable_orphan_alias_rekeys_provenance_before_success() {
         store.blocked_worktree_discovery_paths().unwrap(),
         vec![canonical, current]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn retargeted_failed_primary_alias_is_not_claimed_by_success_at_its_new_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let replacement = root.path().join("replacement");
+    let alias = root.path().join("primary-alias");
+    let child = root.path().join("original-child");
+    for path in [&original, &replacement, &child] {
+        fs::create_dir_all(path).unwrap();
+    }
+    symlink(&original, &alias).unwrap();
+    let canonical_original = original.canonicalize().unwrap();
+    let canonical_replacement = replacement.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    store
+        .upsert_project(&canonical_child, SystemTime::UNIX_EPOCH)
+        .unwrap();
+    store
+        .replace_linked_worktrees(&alias, std::slice::from_ref(&canonical_child))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&alias, SystemTime::UNIX_EPOCH, "git failed")
+        .unwrap();
+
+    fs::remove_file(&alias).unwrap();
+    symlink(&replacement, &alias).unwrap();
+    store
+        .replace_linked_worktrees(&canonical_replacement, &[])
+        .unwrap();
+
+    let mut expected = vec![canonical_child, canonical_original];
+    expected.sort();
+    assert_eq!(store.blocked_worktree_discovery_paths().unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_success() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let alias = root.path().join("legacy-primary-alias");
+    let child = root.path().join("child");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&child).unwrap();
+    symlink(&primary, &alias).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (4);
+        CREATE TABLE projects (
+            path TEXT PRIMARY KEY,
+            discovered_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_cleaned_at INTEGER
+        );
+        CREATE TABLE linked_worktrees (
+            primary_path TEXT NOT NULL,
+            linked_path TEXT NOT NULL,
+            PRIMARY KEY (primary_path, linked_path)
+        );
+        CREATE TABLE worktree_discovery_failures (
+            primary_path TEXT PRIMARY KEY,
+            failed_at INTEGER NOT NULL,
+            message TEXT NOT NULL
+        );
+        ",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (path, discovered_at, last_seen_at) VALUES (?1, 0, 0)",
+        [canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO linked_worktrees (primary_path, linked_path) VALUES (?1, ?2)",
+        rusqlite::params![alias.to_str().unwrap(), canonical_child.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "
+        INSERT INTO worktree_discovery_failures (primary_path, failed_at, message)
+        VALUES (?1, 0, 'legacy failure')
+        ",
+        [alias.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    fs::remove_file(&alias).unwrap();
+
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, &[])
+        .unwrap();
+
+    let blocked = store.blocked_worktree_discovery_paths().unwrap();
+    assert!(blocked.contains(&alias));
+    assert!(blocked.contains(&canonical_child));
+}
+
+#[test]
+fn fresh_canonical_primary_failure_clears_on_canonical_success() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let child = root.path().join("child");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&child).unwrap();
+    let canonical_primary = primary.canonicalize().unwrap();
+    let canonical_child = child.canonicalize().unwrap();
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_child))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, SystemTime::UNIX_EPOCH, "git failed")
+        .unwrap();
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![canonical_child.clone(), canonical_primary.clone()]
+    );
+
+    store
+        .replace_linked_worktrees(&canonical_primary, &[canonical_child])
+        .unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
 }
 
 #[test]

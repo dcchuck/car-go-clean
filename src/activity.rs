@@ -1,6 +1,10 @@
 use anyhow::Result;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use sysinfo::System;
 
@@ -93,6 +97,9 @@ fn canonical_arguments_match_project(
         {
             return true;
         }
+        if rust_option_argument_matches(arg, args.get(index + 1), cwd, canonical_project) {
+            return true;
+        }
 
         let Some(option) = arg.to_str() else {
             return false;
@@ -103,39 +110,7 @@ fn canonical_arguments_match_project(
                 .and_then(|value| split_path_option_value(value))
                 .and_then(|value| canonicalize_argument_path(value, cwd))
                 .is_some_and(|value| path_is_within(&value, canonical_project)),
-            "-L" | "--library-path" => args
-                .get(index + 1)
-                .and_then(|value| split_path_option_value(value))
-                .and_then(rust_library_search_path)
-                .and_then(|value| canonicalize_argument_path(value, cwd))
-                .is_some_and(|value| path_is_within(&value, canonical_project)),
-            "--extern" => args.get(index + 1).is_some_and(|value| {
-                nested_rust_paths_match(value, RustPathSyntax::Extern, cwd, canonical_project)
-            }),
-            "--emit" => args.get(index + 1).is_some_and(|value| {
-                nested_rust_paths_match(value, RustPathSyntax::Emit, cwd, canonical_project)
-            }),
-            _ => {
-                combined_rust_library_search_path(option)
-                    .and_then(|value| canonicalize_argument_path(value, cwd))
-                    .is_some_and(|value| path_is_within(&value, canonical_project))
-                    || option.strip_prefix("--extern=").is_some_and(|value| {
-                        nested_rust_value_matches(
-                            value,
-                            RustPathSyntax::Extern,
-                            cwd,
-                            canonical_project,
-                        )
-                    })
-                    || option.strip_prefix("--emit=").is_some_and(|value| {
-                        nested_rust_value_matches(
-                            value,
-                            RustPathSyntax::Emit,
-                            cwd,
-                            canonical_project,
-                        )
-                    })
-            }
+            _ => false,
         }
     })
 }
@@ -171,6 +146,165 @@ fn split_path_option_value(value: &Path) -> Option<&Path> {
     Some(value)
 }
 
+fn rust_option_argument_matches(
+    argument: &Path,
+    next: Option<&PathBuf>,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    #[cfg(unix)]
+    {
+        rust_option_argument_matches_unix(argument, next, cwd, canonical_project)
+    }
+    #[cfg(not(unix))]
+    {
+        rust_option_argument_matches_portable(argument, next, cwd, canonical_project)
+    }
+}
+
+#[cfg(unix)]
+fn rust_option_argument_matches_unix(
+    argument: &Path,
+    next: Option<&PathBuf>,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    let argument = argument.as_os_str().as_bytes();
+    match argument {
+        b"-L" | b"--library-path" => next
+            .and_then(|value| rust_library_search_path_bytes(value.as_os_str().as_bytes()))
+            .is_some_and(|path| native_path_matches(path, cwd, canonical_project)),
+        b"--extern" => next.is_some_and(|value| {
+            nested_rust_bytes_match(
+                value.as_os_str().as_bytes(),
+                RustPathSyntax::Extern,
+                cwd,
+                canonical_project,
+            )
+        }),
+        b"--emit" => next.is_some_and(|value| {
+            nested_rust_bytes_match(
+                value.as_os_str().as_bytes(),
+                RustPathSyntax::Emit,
+                cwd,
+                canonical_project,
+            )
+        }),
+        _ => {
+            argument
+                .strip_prefix(b"--library-path=")
+                .or_else(|| argument.strip_prefix(b"-L"))
+                .and_then(rust_library_search_path_bytes)
+                .is_some_and(|path| native_path_matches(path, cwd, canonical_project))
+                || argument.strip_prefix(b"--extern=").is_some_and(|value| {
+                    nested_rust_bytes_match(value, RustPathSyntax::Extern, cwd, canonical_project)
+                })
+                || argument.strip_prefix(b"--emit=").is_some_and(|value| {
+                    nested_rust_bytes_match(value, RustPathSyntax::Emit, cwd, canonical_project)
+                })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn native_path_matches(path: &[u8], cwd: Option<&Path>, canonical_project: &Path) -> bool {
+    canonicalize_argument_path(Path::new(OsStr::from_bytes(path)), cwd)
+        .is_some_and(|path| path_is_within(&path, canonical_project))
+}
+
+#[cfg(unix)]
+fn rust_library_search_path_bytes(value: &[u8]) -> Option<&[u8]> {
+    if value.is_empty() || value.starts_with(b"-") {
+        return None;
+    }
+    let Some(separator) = value.iter().position(|byte| *byte == b'=') else {
+        return Some(value);
+    };
+    let kind = &value[..separator];
+    let path = &value[separator + 1..];
+    let valid_kind = matches!(
+        kind,
+        b"dependency" | b"crate" | b"native" | b"framework" | b"all"
+    );
+    (valid_kind && !path.is_empty()).then_some(path)
+}
+
+#[cfg(unix)]
+fn nested_rust_bytes_match(
+    value: &[u8],
+    syntax: RustPathSyntax,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    match syntax {
+        RustPathSyntax::Extern => nested_rust_path_bytes(value, syntax)
+            .is_some_and(|path| native_path_matches(path, cwd, canonical_project)),
+        RustPathSyntax::Emit => value
+            .split(|byte| *byte == b',')
+            .filter_map(|value| nested_rust_path_bytes(value, syntax))
+            .any(|path| native_path_matches(path, cwd, canonical_project)),
+    }
+}
+
+#[cfg(unix)]
+fn nested_rust_path_bytes(value: &[u8], syntax: RustPathSyntax) -> Option<&[u8]> {
+    let separator = value.iter().position(|byte| *byte == b'=')?;
+    let kind = &value[..separator];
+    let path = &value[separator + 1..];
+    let valid_kind = match syntax {
+        RustPathSyntax::Extern => !kind.is_empty(),
+        RustPathSyntax::Emit => matches!(
+            kind,
+            b"asm"
+                | b"llvm-bc"
+                | b"llvm-ir"
+                | b"obj"
+                | b"metadata"
+                | b"link"
+                | b"dep-info"
+                | b"mir"
+        ),
+    };
+    (valid_kind && !path.is_empty()).then_some(path)
+}
+
+#[cfg(not(unix))]
+fn rust_option_argument_matches_portable(
+    argument: &Path,
+    next: Option<&PathBuf>,
+    cwd: Option<&Path>,
+    canonical_project: &Path,
+) -> bool {
+    let Some(argument) = argument.to_str() else {
+        return false;
+    };
+    match argument {
+        "-L" | "--library-path" => next
+            .and_then(|value| split_path_option_value(value))
+            .and_then(rust_library_search_path)
+            .and_then(|value| canonicalize_argument_path(value, cwd))
+            .is_some_and(|value| path_is_within(&value, canonical_project)),
+        "--extern" => next.is_some_and(|value| {
+            nested_rust_paths_match(value, RustPathSyntax::Extern, cwd, canonical_project)
+        }),
+        "--emit" => next.is_some_and(|value| {
+            nested_rust_paths_match(value, RustPathSyntax::Emit, cwd, canonical_project)
+        }),
+        _ => {
+            combined_rust_library_search_path(argument)
+                .and_then(|value| canonicalize_argument_path(value, cwd))
+                .is_some_and(|value| path_is_within(&value, canonical_project))
+                || argument.strip_prefix("--extern=").is_some_and(|value| {
+                    nested_rust_value_matches(value, RustPathSyntax::Extern, cwd, canonical_project)
+                })
+                || argument.strip_prefix("--emit=").is_some_and(|value| {
+                    nested_rust_value_matches(value, RustPathSyntax::Emit, cwd, canonical_project)
+                })
+        }
+    }
+}
+
+#[cfg(not(unix))]
 fn rust_library_search_path(value: &Path) -> Option<&Path> {
     let Some(value_str) = value.to_str() else {
         return Some(value);
@@ -188,6 +322,7 @@ fn rust_library_search_path(value: &Path) -> Option<&Path> {
     Some(Path::new(path))
 }
 
+#[cfg(not(unix))]
 fn combined_rust_library_search_path(argument: &str) -> Option<&Path> {
     let value = argument
         .strip_prefix("--library-path=")
@@ -202,6 +337,7 @@ enum RustPathSyntax {
     Emit,
 }
 
+#[cfg(not(unix))]
 fn nested_rust_paths_match(
     value: &Path,
     syntax: RustPathSyntax,
@@ -213,6 +349,7 @@ fn nested_rust_paths_match(
         .is_some_and(|value| nested_rust_value_matches(value, syntax, cwd, canonical_project))
 }
 
+#[cfg(not(unix))]
 fn nested_rust_value_matches(
     value: &str,
     syntax: RustPathSyntax,
@@ -232,6 +369,7 @@ fn nested_rust_value_matches(
     }
 }
 
+#[cfg(not(unix))]
 fn nested_rust_path(value: &str, syntax: RustPathSyntax) -> Option<&Path> {
     let (kind, path) = value.split_once('=')?;
     let valid_kind = match syntax {

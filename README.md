@@ -58,11 +58,14 @@ as an ordinary scan error, which retains the usual recent, hierarchical
 scan-error behavior. Independently, the canonical primary and exactly the
 linked worktrees saved for it remain blocked until a later successful discovery
 replaces the association. That persistent block normally does not extend to
-ancestors, siblings, or other projects. As a conservative exceptional fallback,
-if an identity in the active failure's persisted association is unresolvable or
-no longer canonical—for example, because a saved alias changed targets—all
-cached projects are temporarily blocked until successful discovery replaces
-that association. An explicit forced run still bypasses either durable block.
+ancestors, siblings, or other projects. New failures retain the primary's
+canonical identity at failure time, so a primary alias changing targets cannot
+transfer or clear the old failure. Migrated primary aliases without a
+trustworthy immutable identity are never inferred from their current target and
+remain globally fail-closed. As another conservative fallback, if a saved
+linked identity is unresolvable or no longer canonical, all cached projects are
+temporarily blocked until successful discovery safely replaces the association.
+An explicit forced run still bypasses either durable block.
 
 ## Safe Cleaning Model
 
@@ -77,6 +80,10 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 - No recent scan recorded a related unreadable path for the project.
 - No running process has a cwd or command argument inside the project or
   `target/`.
+
+On Unix, Rust compiler path options are parsed as native OS bytes, so non-UTF-8
+path suffixes in `--extern`, `--emit`, `-L`, and `--library-path` still protect
+the matching canonical project.
 
 The default `target_quiet_period` is `2h`.
 

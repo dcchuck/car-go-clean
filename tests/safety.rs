@@ -409,6 +409,62 @@ fn sequential_rust_path_arguments_match_canonical_project_activity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn nested_rust_options_preserve_non_utf8_path_suffixes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
+
+    fn prefixed_path(prefix: &[u8], path: &Path) -> PathBuf {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(path.as_os_str().as_bytes());
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let outside_cwd = tempfile::tempdir().unwrap();
+    let project = root.path().join("canonical-project");
+    let alias = root.path().join("project-alias");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/existing"), &[0; 1024]);
+    symlink(&project, &alias).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+    let future = alias
+        .join("target")
+        .join(OsString::from_vec(b"future-output-\xff".to_vec()));
+    let target = alias
+        .join("target")
+        .join(OsString::from_vec(b"search-path-\xfe".to_vec()));
+
+    let argument_sets = vec![
+        vec![PathBuf::from("--extern"), prefixed_path(b"dep=", &future)],
+        vec![prefixed_path(b"--extern=dep=", &future)],
+        vec![PathBuf::from("--emit"), prefixed_path(b"link=", &future)],
+        vec![prefixed_path(b"--emit=link=", &future)],
+        vec![PathBuf::from("-L"), prefixed_path(b"dependency=", &target)],
+        vec![prefixed_path(b"-Ldependency=", &target)],
+        vec![
+            PathBuf::from("--library-path"),
+            prefixed_path(b"dependency=", &target),
+        ],
+        vec![prefixed_path(b"--library-path=dependency=", &target)],
+    ];
+
+    for arguments in argument_sets {
+        assert!(process_matches_project(
+            Some(outside_cwd.path()),
+            &arguments,
+            &canonical_project
+        ));
+    }
+    assert!(!process_matches_project(
+        Some(outside_cwd.path()),
+        &[prefixed_path(b"-Linvalid=", &target)],
+        &canonical_project
+    ));
+}
+
 #[test]
 fn process_activity_marks_every_matching_nested_project() {
     let repo = tempfile::tempdir().unwrap();
