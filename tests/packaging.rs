@@ -33,11 +33,29 @@ fn source_checkout_launchd_installer_is_absent() {
 }
 
 #[test]
-fn release_packaging_documents_cargo_install_as_primary_channel() {
+fn readme_documents_binary_installs_and_explicit_service_activation() {
+    let readme = repo_file("README.md");
+
+    assert!(readme.contains("brew install dcchuck/tap/car-go-clean"));
+    assert!(readme.contains("car-go-clean-installer.sh"));
+    assert!(readme.contains("car-go-clean service install"));
+    assert!(readme.contains("car-go-clean service restart"));
+    assert!(readme.contains("does not start the daemon"));
+}
+
+#[test]
+fn release_packaging_documents_tagged_binary_distribution() {
     let release = repo_file("packaging/release/README.md");
 
-    assert!(release.contains("Primary distribution channel: `cargo install`"));
-    assert!(release.contains("Homebrew"));
+    assert!(release.contains("annotated `vX.Y.Z` Git tags"));
+    assert!(release.contains("dcchuck/homebrew-tap"));
+    assert!(release.contains("car-go-clean-installer.sh"));
+    assert!(release.contains("aarch64-apple-darwin"));
+    assert!(release.contains("x86_64-apple-darwin"));
+    assert!(release.contains("aarch64-unknown-linux-musl"));
+    assert!(release.contains("x86_64-unknown-linux-musl"));
+    assert!(release.contains("Neither binary installation path enables or starts the daemon"));
+    assert!(release.contains("cargo install --path ."));
 }
 
 #[test]

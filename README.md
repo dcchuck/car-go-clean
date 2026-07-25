@@ -7,7 +7,58 @@
 `car-go-clean` is a Rust CLI/daemon that finds Rust projects on disk, runs
 `cargo clean`, and tracks how much space was reclaimed.
 
-## Install From Source
+## Install
+
+On macOS or Linux, install the released binary with Homebrew:
+
+```sh
+brew install dcchuck/tap/car-go-clean
+brew upgrade car-go-clean
+```
+
+Or use the checksum-verifying shell installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
+```
+
+The installer supports macOS on Apple Silicon (`aarch64-apple-darwin`) and
+Intel (`x86_64-apple-darwin`), plus Linux ARM64
+(`aarch64-unknown-linux-musl`) and x86_64 (`x86_64-unknown-linux-musl`). It
+downloads the matching release archive and its `.sha256` file, verifies the
+SHA-256 checksum before replacing the binary, and does not require `sudo`.
+
+By default it installs to `$HOME/.local/bin`. Pin a release or choose another
+location when needed:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh \
+  | sh -s -- --version 0.2.0 --install-dir "$HOME/.local/bin"
+```
+
+Both installation paths install or upgrade only the binary; neither path starts
+the daemon. The binary installer does not start the daemon. Activate daemon
+management explicitly after installation.
+
+## Explicit Service Activation
+
+`car-go-clean` uses a per-user launchd service on macOS and a per-user systemd
+service on Linux. Installation does not enable either service. Manage it only
+when you choose to:
+
+```sh
+car-go-clean service install
+car-go-clean service status
+car-go-clean service restart
+car-go-clean service uninstall
+```
+
+After upgrading a binary, run `car-go-clean service restart` if you have
+already installed the service and want the daemon to use the new binary.
+
+## Developer Installation
 
 ```bash
 cargo install --path .
@@ -190,13 +241,10 @@ Validation points:
 
 ## Services And Packaging
 
-Service templates live in `packaging/systemd/` and `packaging/launchd/`.
-The launchd plist is a template; install it with
-`packaging/launchd/install.sh` so the binary and log paths are rendered for
-the current user. Override those paths with `CAR_GO_CLEAN_BIN` or
-`CAR_GO_CLEAN_LOG_DIR` when needed.
-Release notes and distribution-channel decisions live in `packaging/release/`;
-the primary install path is currently `cargo install`.
+The release binary does not create or start a background daemon. Use the
+explicit `car-go-clean service` commands above to manage the per-user launchd
+or systemd service. Service templates live in `packaging/systemd/` and
+`packaging/launchd/`; release packaging notes live in `packaging/release/`.
 
 The daemon persists its next clean and scan times in the state database. On
 restart, it resumes from that stored schedule instead of waiting a full interval
