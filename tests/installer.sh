@@ -7,7 +7,6 @@ work_dir=$(mktemp -d)
 fake_bin="$work_dir/bin"
 fixture_dir="$work_dir/fixture"
 fixture_archive="$work_dir/car-go-clean.tar.xz"
-fixture_sums="$work_dir/SHA256SUMS"
 curl_log="$work_dir/curl.log"
 expected_hash=fixture-sha256
 
@@ -20,15 +19,6 @@ mkdir -p "$fake_bin" "$fixture_dir" "$work_dir/home"
 printf '%s' 'new binary' > "$fixture_dir/car-go-clean"
 chmod +x "$fixture_dir/car-go-clean"
 tar -C "$fixture_dir" -cJf "$fixture_archive" car-go-clean
-
-for target in \
-    aarch64-apple-darwin \
-    x86_64-apple-darwin \
-    aarch64-unknown-linux-musl \
-    x86_64-unknown-linux-musl
-do
-    printf '%s  car-go-clean-0.2.0-%s.tar.xz\n' "$expected_hash" "$target" >> "$fixture_sums"
-done
 
 cat > "$fake_bin/uname" <<'EOF'
 #!/bin/sh
@@ -63,19 +53,21 @@ case "$url" in
         printf '%s' latest-meta > "$CURL_LOG"
         printf '%s' https://github.com/dcchuck/car-go-clean/releases/tag/v0.2.0
         ;;
-    */SHA256SUMS)
-        printf ' SHA256SUMS\n' >> "$CURL_LOG"
-        cp "$FIXTURE_SUMS" "$output"
-        ;;
     */car-go-clean-*.tar.xz)
-        archive=${url##*/}
-        tag=${url%/*}
-        tag=${tag##*/}
         if [ -s "$CURL_LOG" ]; then
             printf ' ' >> "$CURL_LOG"
         fi
-        printf '%s %s' "$tag" "$archive" >> "$CURL_LOG"
+        printf '%s' "$url" >> "$CURL_LOG"
         cp "$FIXTURE_ARCHIVE" "$output"
+        ;;
+    */car-go-clean-*.tar.xz.sha256)
+        checksum_name=${url##*/}
+        archive_name=${checksum_name%.sha256}
+        if [ -s "$CURL_LOG" ]; then
+            printf ' ' >> "$CURL_LOG"
+        fi
+        printf '%s' "$url" >> "$CURL_LOG"
+        printf '%s  %s\n' "$EXPECTED_HASH" "$archive_name" > "$output"
         ;;
     *)
         echo "unexpected curl URL: $url" >&2
@@ -105,7 +97,6 @@ run_installer() {
     HOME="$work_dir/home" \
     CURL_LOG="$curl_log" \
     FIXTURE_ARCHIVE="$fixture_archive" \
-    FIXTURE_SUMS="$fixture_sums" \
     EXPECTED_HASH="$expected_hash" \
     TEST_UNAME_S="${TEST_UNAME_S-Darwin}" \
     TEST_UNAME_M="${TEST_UNAME_M-arm64}" \
@@ -115,13 +106,13 @@ run_installer() {
 install_dir="$work_dir/default-install"
 run_installer --install-dir "$install_dir"
 test "$(cat "$install_dir/car-go-clean")" = "new binary"
-test "$(cat "$curl_log")" = "latest-meta v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS"
+test "$(cat "$curl_log")" = "latest-meta https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
 
 : > "$curl_log"
 versioned_dir="$work_dir/versioned-install"
 run_installer --version 0.2.0 --install-dir "$versioned_dir"
 test "$(cat "$versioned_dir/car-go-clean")" = "new binary"
-grep -qx 'v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS' "$curl_log"
+grep -qx 'https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256' "$curl_log"
 
 failed_dir="$work_dir/failed-install"
 mkdir -p "$failed_dir"
@@ -135,7 +126,7 @@ test "$(cat "$failed_dir/car-go-clean")" = "old binary"
 linux_dir="$work_dir/linux-install"
 CHECKSUM_MODE= TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 run_installer --install-dir "$linux_dir"
 test "$(cat "$linux_dir/car-go-clean")" = "new binary"
-test "$(cat "$curl_log")" = "latest-meta v0.2.0 car-go-clean-0.2.0-x86_64-unknown-linux-musl.tar.xz SHA256SUMS"
+test "$(cat "$curl_log")" = "latest-meta https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256"
 
 : > "$curl_log"
 if TEST_UNAME_S=FreeBSD TEST_UNAME_M=amd64 run_installer --install-dir "$work_dir/unsupported-install"; then

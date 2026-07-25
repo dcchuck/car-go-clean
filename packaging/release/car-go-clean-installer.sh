@@ -29,18 +29,33 @@ case "$version" in
     *) echo "--version must be X.Y.Z" >&2; exit 2 ;;
 esac
 
-release_version=${tag#v}
-archive_name="car-go-clean-$release_version-$target.tar.xz"
+archive_name="car-go-clean-$target.tar.xz"
+checksum_name="$archive_name.sha256"
 base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
 curl --proto '=https' --tlsv1.2 -fsSL -o "$work_dir/$archive_name" "$base_url/$archive_name"
-curl --proto '=https' --tlsv1.2 -fsSL -o "$work_dir/SHA256SUMS" "$base_url/SHA256SUMS"
+curl --proto '=https' --tlsv1.2 -fsSL -o "$work_dir/$checksum_name" "$base_url/$checksum_name"
 
-expected_hash=$(awk -v file="$archive_name" '$2 == file { print $1 }' "$work_dir/SHA256SUMS")
-hash_count=$(printf '%s\n' "$expected_hash" | awk 'NF { count++ } END { print count + 0 }')
-[ "$hash_count" -eq 1 ] && [ -n "$expected_hash" ] || {
+expected_hash=$(awk -v file="$archive_name" '
+    NF {
+        count++
+        if (count != 1 || NF != 2 || $2 != file) {
+            exit 1
+        }
+        print $1
+    }
+    END {
+        if (count != 1) {
+            exit 1
+        }
+    }
+' "$work_dir/$checksum_name") || {
+    echo "expected exactly one checksum for $archive_name" >&2
+    exit 1
+}
+[ -n "$expected_hash" ] || {
     echo "expected exactly one checksum for $archive_name" >&2
     exit 1
 }
