@@ -158,7 +158,7 @@ impl<R: CommandRunner> ServiceManager<R> {
             }
             ServicePlatform::Linux => {
                 self.require_systemd_user()?;
-                self.run_allow_failure(
+                let disable_output = self.run(
                     Path::new("systemctl"),
                     &[
                         OsString::from("--user"),
@@ -167,6 +167,21 @@ impl<R: CommandRunner> ServiceManager<R> {
                         OsString::from(UNIT),
                     ],
                 )?;
+                if !disable_output.success && !is_missing_systemd_unit(&disable_output) {
+                    return Err(anyhow!(
+                        "{} failed{}",
+                        command_description(
+                            Path::new("systemctl"),
+                            &[
+                                OsString::from("--user"),
+                                OsString::from("disable"),
+                                OsString::from("--now"),
+                                OsString::from(UNIT),
+                            ]
+                        ),
+                        format_command_error(&disable_output)
+                    ));
+                }
                 let unit = self.systemd_unit_path();
                 if unit.exists() {
                     fs::remove_file(&unit)
@@ -531,4 +546,12 @@ fn format_command_error(output: &CommandOutput) -> String {
     } else {
         format!(": {}", output.stderr.trim())
     }
+}
+
+fn is_missing_systemd_unit(output: &CommandOutput) -> bool {
+    let message = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    message.contains(&UNIT.to_ascii_lowercase())
+        && ["not found", "not loaded", "does not exist"]
+            .iter()
+            .any(|marker| message.contains(marker))
 }
