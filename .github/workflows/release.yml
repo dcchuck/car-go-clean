@@ -140,6 +140,14 @@ jobs:
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "car-go-clean").version')"
           test "$TAG" = "v$VERSION" || { echo "tag $TAG does not match Cargo.toml version $VERSION" >&2; exit 1; }
           test "$(git cat-file -t "refs/tags/$TAG")" = tag || { echo "release tag must be annotated" >&2; exit 1; }
+      - name: "Check formatting"
+        run: "cargo fmt --all -- --check"
+      - name: "Check Clippy"
+        run: "cargo clippy --all-targets --locked -- -D warnings"
+      - name: "Run locked tests"
+        run: "cargo test --locked"
+      - name: "Check shell installer"
+        run: "make test-installer"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -374,3 +382,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-release-verify:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit

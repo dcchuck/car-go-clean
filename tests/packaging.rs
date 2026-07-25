@@ -78,3 +78,20 @@ fn release_workflow_is_tag_only_and_uses_dist() {
     assert!(workflow.contains("\"attestations\": \"write\""));
     assert!(workflow.contains("Enforce annotated vX.Y.Z release tag"));
 }
+
+#[test]
+fn ci_and_release_verification_cover_installable_artifacts() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let release = repo_file(".github/workflows/release.yml");
+    let build_setup = repo_file(".github/release-build-setup.yml");
+    let verify = repo_file(".github/workflows/release-verify.yml");
+
+    assert!(ci.contains("cargo test --locked"));
+    assert!(ci.contains("cargo clippy --all-targets --locked -- -D warnings"));
+    assert!(ci.contains("make test-installer"));
+    assert!(build_setup.contains("cargo fmt --all -- --check"));
+    assert!(release.contains("publish-shell-installer"));
+    assert!(release.contains("Enforce annotated vX.Y.Z release tag"));
+    assert!(verify.contains("health --skip-cargo"));
+    assert!(verify.contains("brew audit --strict Formula/car-go-clean.rb"));
+}

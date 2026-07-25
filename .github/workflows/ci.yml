@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: axodotdev/cargo-dist@v0.32.0
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run locked tests
+        run: cargo test --locked
+      - name: Check shell installer
+        run: make test-installer
+      - name: Plan release artifacts
+        run: dist plan --tag v0.2.0 --output-format=json

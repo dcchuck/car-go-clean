@@ -1,0 +1,103 @@
+name: Verify released artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke test (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download and verify release archive
+        env:
+          PLAN: ${{ inputs.plan }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          TAG="$(jq -r '.announcement_tag' <<< "$PLAN")"
+          ARCHIVE="car-go-clean-${TARGET}.tar.xz"
+          CHECKSUM_FILE="${ARCHIVE}.sha256"
+          BASE_URL="https://github.com/dcchuck/car-go-clean/releases/download/$TAG"
+          curl --fail --location --remote-name "$BASE_URL/$CHECKSUM_FILE"
+          curl --fail --location --remote-name "$BASE_URL/$ARCHIVE"
+          EXPECTED_HASH="$(awk -v archive="$ARCHIVE" '
+            NF {
+              count++
+              if (count != 1 || NF != 2 || $2 != archive) {
+                exit 1
+              }
+              print $1
+            }
+            END {
+              if (count != 1) {
+                exit 1
+              }
+            }
+          ' "$CHECKSUM_FILE")"
+          test -n "$EXPECTED_HASH"
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            ACTUAL_HASH="$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')"
+          else
+            ACTUAL_HASH="$(sha256sum "$ARCHIVE" | awk '{ print $1 }')"
+          fi
+          test "$ACTUAL_HASH" = "$EXPECTED_HASH"
+          tar -xJf "$ARCHIVE"
+      - name: Smoke test executable
+        run: |
+          ./car-go-clean version
+          ./car-go-clean health --skip-cargo
+
+  formula:
+    name: Verify Homebrew formula
+    needs: smoke
+    runs-on: macos-14
+    steps:
+      - name: Clone public tap
+        run: git clone https://github.com/dcchuck/homebrew-tap
+      - name: Audit formula and release hashes
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          TAG="$(jq -r '.announcement_tag' <<< "$PLAN")"
+          FORMULA="homebrew-tap/Formula/car-go-clean.rb"
+          grep -Fq "$TAG" "$FORMULA"
+          cd homebrew-tap
+          FORMULA="Formula/car-go-clean.rb"
+          brew audit --strict Formula/car-go-clean.rb
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            ARCHIVE="car-go-clean-${TARGET}.tar.xz"
+            CHECKSUM="$(curl --fail --location --silent "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/${ARCHIVE}.sha256" | awk -v archive="$ARCHIVE" '
+              NF {
+                count++
+                if (count != 1 || NF != 2 || $2 != archive) {
+                  exit 1
+                }
+                print $1
+              }
+              END {
+                if (count != 1) {
+                  exit 1
+                }
+              }
+            ')"
+            test -n "$CHECKSUM"
+            grep -Fq "$CHECKSUM" "$FORMULA"
+          done
