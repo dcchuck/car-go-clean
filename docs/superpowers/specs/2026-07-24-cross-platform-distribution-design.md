@@ -43,9 +43,10 @@ matrix produces one archive per target:
 - `x86_64-unknown-linux-musl`
 
 The bundled SQLite dependency permits self-contained Linux artifacts. Each
-release contains the target archives, a `SHA256SUMS` manifest, and GitHub
-artifact provenance attestations. The release job verifies locked tests, Clippy
-with warnings denied, and an extracted-binary smoke check before publication.
+release contains the target archives, their cargo-dist-generated `.sha256`
+checksum assets, and GitHub artifact provenance attestations. The release job
+verifies locked tests, Clippy with warnings denied, and an extracted-binary
+smoke check before publication.
 
 ## User Installation
 
@@ -77,8 +78,8 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 ```
 
 It detects the supported OS and CPU, downloads the corresponding archive and
-`SHA256SUMS`, verifies the checksum, and atomically installs the binary to
-`~/.local/bin` by default. It supports `--version X.Y.Z` and
+its cargo-dist-generated `.sha256` asset, verifies the checksum, and atomically
+installs the binary to `~/.local/bin` by default. It supports `--version X.Y.Z` and
 `--install-dir PATH`. It never uses `sudo`, touches config/state, or starts a
 daemon. Unsupported platforms and checksum failures terminate before changing
 the installed binary.
@@ -131,7 +132,7 @@ Pull-request CI continues to run locked tests, formatting, and strict Clippy.
 Tag-release CI additionally validates:
 
 - Version/tag consistency.
-- All four archives and SHA-256 manifest entries.
+- All four archives and their matching SHA-256 assets.
 - Extracted-binary `version` and `health --skip-cargo` smoke checks.
 - Shell-installer target selection, checksum rejection, and atomic replacement.
 - launchd and systemd rendering using an absolute binary path.

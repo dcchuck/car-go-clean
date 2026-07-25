@@ -13,8 +13,8 @@
 - `Cargo.toml` remains the version source of truth; this implementation changes it from `0.1.0` to `0.2.0` and must not create or push the `v0.2.0` tag.
 - Releases run only for a pushed annotated SemVer tag named `vX.Y.Z` whose version exactly matches `Cargo.toml`; ordinary `main` pushes never publish.
 - Build exactly `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`.
-- Release archives, `SHA256SUMS`, and GitHub artifact provenance attestations are public GitHub Release assets.
-- The shell installer uses HTTPS, verifies `SHA256SUMS`, and replaces only the binary atomically after verification; it never invokes `sudo`, changes config/state, or starts a daemon.
+- Release archives, cargo-dist's per-archive `.sha256` checksum assets, and GitHub artifact provenance attestations are public GitHub Release assets.
+- The shell installer uses HTTPS, verifies the matching cargo-dist `.sha256` asset, and replaces only the binary atomically after verification; it never invokes `sudo`, changes config/state, or starts a daemon.
 - Homebrew installs only the binary. `service install` is the sole opt-in action that enables and starts a daemon.
 - Support only macOS and Linux in this release. On Linux, fail clearly when `systemctl --user` is unavailable; do not install another scheduler.
 - Preserve `$XDG_CONFIG_HOME/car-go-clean/config.toml` / `$HOME/.config/car-go-clean/config.toml` and `$XDG_STATE_HOME/car-go-clean` / `$HOME/.local/state/car-go-clean` without rewriting them.
@@ -56,7 +56,7 @@
 
 **Interfaces:**
 
-- Produces: a cargo-dist configuration that emits the four required target archives, `SHA256SUMS`, GitHub attestations, and a `dcchuck/homebrew-tap` formula.
+- Produces: a cargo-dist configuration that emits the four required unversioned target archives, each matching `.sha256` asset, GitHub attestations, and a `dcchuck/homebrew-tap` formula.
 - Produces: a tag workflow that accepts the unified cargo-dist announcement form `v<version>` and rejects any version mismatch during `dist plan --tag`.
 - Consumes: the package version from `Cargo.toml`; no independent release-version file is introduced.
 
@@ -213,7 +213,7 @@
 **Interfaces:**
 
 - Produces: `car-go-clean-installer.sh [--version X.Y.Z] [--install-dir PATH]`.
-- Consumes: cargo-dist release assets named `car-go-clean-<version>-<target>.tar.xz` and their `SHA256SUMS` entry.
+- Consumes: cargo-dist release assets named `car-go-clean-<target>.tar.xz` and their matching `.sha256` asset.
 - Produces: a release asset named `car-go-clean-installer.sh`, uploaded after cargo-dist has published the tag's archives.
 - Produces: `make test-installer`, which runs without network access.
 
@@ -224,10 +224,10 @@
   ```sh
   run_installer --install-dir "$install_dir"
   test "$(cat "$install_dir/car-go-clean")" = "new binary"
-  test "$(cat "$curl_log")" = "latest-meta v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS"
+  test "$(cat "$curl_log")" = "latest-meta v0.2.0 car-go-clean-aarch64-apple-darwin.tar.xz car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
 
   run_installer --version 0.2.0 --install-dir "$versioned_dir"
-  grep -qx 'v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS' "$curl_log"
+  grep -qx 'v0.2.0 car-go-clean-aarch64-apple-darwin.tar.xz car-go-clean-aarch64-apple-darwin.tar.xz.sha256' "$curl_log"
 
   printf '%s' 'old binary' > "$failed_dir/car-go-clean"
   if CHECKSUM_MODE=wrong run_installer --install-dir "$failed_dir"; then
@@ -278,7 +278,7 @@
   esac
   ```
 
-  Set `release_version=${tag#v}`, `archive_name="car-go-clean-$release_version-$target.tar.xz"`, and `base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"`. Download `SHA256SUMS` and `"$archive_name"` to a `mktemp -d` directory, and remove that directory with `trap 'rm -rf "$work_dir"' EXIT HUP INT TERM`. Extract the expected hash with `awk -v file="$archive_name" '$2 == file { print $1 }'`; require exactly one nonempty hash. Use `shasum -a 256` on macOS and `sha256sum` on Linux, compare exact digests, then extract with `tar -xJf`.
+  Set `archive_name="car-go-clean-$target.tar.xz"`, `checksum_name="$archive_name.sha256"`, and `base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"`. Download `"$checksum_name"` and `"$archive_name"` to a `mktemp -d` directory, and remove that directory with `trap 'rm -rf "$work_dir"' EXIT HUP INT TERM`. Extract the expected hash as the sole nonempty first field in `"$checksum_name"`; require exactly one nonempty hash. Use `shasum -a 256` on macOS and `sha256sum` on Linux, compare exact digests, then extract with `tar -xJf`.
 
   Require exactly one extracted `car-go-clean` regular executable. Run `mkdir -p "$install_dir"`, write it as `"$install_dir/.car-go-clean.$$"` with `install -m 755`, and use `mv -f` only after extraction and checksum validation complete. Print the final binary path and the reminder:
 
@@ -658,14 +658,14 @@
         runner: ubuntu-24.04
   ```
 
-  Each matrix job sets `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"` and `VERSION="${TAG#v}"`, downloads `car-go-clean-${VERSION}-${{ matrix.target }}.tar.xz` and `SHA256SUMS` from that GitHub Release, verifies the archive with `shasum -a 256 -c SHA256SUMS` on macOS or `sha256sum -c SHA256SUMS` on Linux, extracts it, then runs:
+  Each matrix job sets `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"`, downloads `car-go-clean-${{ matrix.target }}.tar.xz` and its matching `.sha256` asset from that GitHub Release, verifies the archive by extracting the sole nonempty checksum field and comparing it to `shasum -a 256` on macOS or `sha256sum` on Linux, extracts it, then runs:
 
   ```bash
   ./car-go-clean version
   ./car-go-clean health --skip-cargo
   ```
 
-  Add a formula job that clones `https://github.com/dcchuck/homebrew-tap`, runs `brew audit --strict Formula/car-go-clean.rb`, and checks the formula contains the current release tag and every SHA-256 listed for the macOS and Linux archive assets. The formula job must depend on all smoke jobs so the cargo-dist post-announce stage reports failure if any released binary or its generated formula fails verification.
+  Add a formula job that clones `https://github.com/dcchuck/homebrew-tap`, runs `brew audit --strict Formula/car-go-clean.rb`, and checks the formula contains the current release tag and every SHA-256 read from the four matching archive `.sha256` assets. The formula job must depend on all smoke jobs so the cargo-dist post-announce stage reports failure if any released binary or its generated formula fails verification.
 
   Register the post-announce verification workflow and regenerate the cargo-dist workflow:
 
@@ -759,7 +759,7 @@
     https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
   ```
 
-  Document `--version 0.2.0` and `--install-dir "$HOME/.local/bin"`, all four supported targets, and the `SHA256SUMS` verification behavior. State directly that both installation paths install or upgrade only the binary and do not start the daemon.
+  Document `--version 0.2.0` and `--install-dir "$HOME/.local/bin"`, all four supported targets, and matching `.sha256` verification behavior. State directly that both installation paths install or upgrade only the binary and do not start the daemon.
 
   Add a separate Explicit Service Activation section containing all four commands and the restart-after-upgrade rule:
 
@@ -786,7 +786,7 @@
   git push origin main v0.2.0
   ```
 
-  Document that the workflow publishes the four archives, `SHA256SUMS`, provenance attestations, `car-go-clean-installer.sh`, and the Homebrew formula; it does not publish to crates.io or enable any daemon. Link to the GitHub Release verification workflow and state that a failed post-publication check must be investigated before announcing the release.
+  Document that the workflow publishes the four archives, their matching `.sha256` checksum assets, provenance attestations, `car-go-clean-installer.sh`, and the Homebrew formula; it does not publish to crates.io or enable any daemon. Link to the GitHub Release verification workflow and state that a failed post-publication check must be investigated before announcing the release.
 
 - [ ] **Step 5: Update release packaging notes**
 
@@ -817,7 +817,7 @@
 
 ### Spec coverage
 
-- Public GitHub Release, four exact target triples, SHA-256 manifest, and provenance: Tasks 1 and 5.
+- Public GitHub Release, four exact target triples, per-archive SHA-256 assets, and provenance: Tasks 1 and 5.
 - Public `dcchuck/homebrew-tap`, formula publication, and least-privilege secret handling: Tasks 1 and 5.
 - HTTPS shell installer, OS/CPU selection, `--version`, `--install-dir`, checksum rejection, atomic replacement, no `sudo`, and no daemon start: Task 2.
 - Explicit macOS launchd and Linux systemd-user lifecycle with no alternative Linux scheduler: Tasks 3 and 4.
