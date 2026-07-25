@@ -29,8 +29,8 @@ Intel (`x86_64-apple-darwin`), plus Linux ARM64
 downloads the matching release archive and its `.sha256` file, verifies the
 SHA-256 checksum before replacing the binary, and does not require `sudo`.
 
-By default it installs to `$HOME/.local/bin`. Pin a release or choose another
-location when needed:
+By default it installs to `$HOME/.local/bin`. After a release such as `v0.2.0`
+has been published, pin it or choose another location when needed:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
