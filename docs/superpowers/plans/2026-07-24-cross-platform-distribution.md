@@ -92,11 +92,13 @@
   #[test]
   fn release_workflow_is_tag_only_and_uses_dist() {
       let workflow = repo_file(".github/workflows/release.yml");
-      assert!(workflow.contains("refs/tags/"));
+      assert!(workflow.contains("push:"));
+      assert!(workflow.contains("tags:"));
+      assert!(!workflow.contains("pull_request:"));
       assert!(workflow.contains("dist plan"));
       assert!(workflow.contains("dist build"));
       assert!(workflow.contains("HOMEBREW_TAP_TOKEN"));
-      assert!(workflow.contains("attestations: write"));
+      assert!(workflow.contains("\"attestations\": \"write\""));
   }
   ```
 
@@ -139,6 +141,7 @@
   ]
   checksum = "sha256"
   github-attestations = true
+  pr-run-mode = "skip"
   tap = "dcchuck/homebrew-tap"
   publish-jobs = ["homebrew"]
   ```
