@@ -5,8 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=CAR_GO_CLEAN_CONFIG=%h/.config/car-go-clean/config.toml
-ExecStart=/usr/bin/env car-go-clean daemon --config ${CAR_GO_CLEAN_CONFIG}
+ExecStart=__CAR_GO_CLEAN_BIN__ daemon
 Restart=on-failure
 RestartSec=30s
 

@@ -6,12 +6,10 @@ fn repo_file(path: &str) -> String {
 }
 
 #[test]
-fn systemd_service_runs_daemon_with_configurable_paths() {
+fn systemd_service_keeps_the_embedded_binary_placeholder() {
     let service = repo_file("packaging/systemd/car-go-clean.service");
 
-    assert!(service.contains("ExecStart="));
-    assert!(service.contains("car-go-clean daemon"));
-    assert!(service.contains("CAR_GO_CLEAN_CONFIG"));
+    assert!(service.contains("ExecStart=__CAR_GO_CLEAN_BIN__ daemon"));
 }
 
 #[test]
@@ -28,13 +26,10 @@ fn launchd_plist_runs_daemon_with_configurable_paths() {
 }
 
 #[test]
-fn launchd_installer_renders_user_specific_plist() {
-    let installer = repo_file("packaging/launchd/install.sh");
-
-    assert!(installer.contains("CAR_GO_CLEAN_BIN"));
-    assert!(installer.contains("CAR_GO_CLEAN_LOG_DIR"));
-    assert!(installer.contains("Library/LaunchAgents"));
-    assert!(installer.contains("launchctl bootstrap"));
+fn source_checkout_launchd_installer_is_absent() {
+    assert!(!Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("packaging/launchd/install.sh")
+        .exists());
 }
 
 #[test]

@@ -8,4 +8,5 @@ pub mod lockfile;
 pub mod logging;
 pub mod safety;
 pub mod scanner;
+pub mod service;
 pub mod store;
