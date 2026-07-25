@@ -25,8 +25,7 @@
 - `Cargo.toml`: package release metadata, v0.2.0, package-local cargo-dist eligibility, and cargo-dist's generated release profile.
 - `dist-workspace.toml`: cargo-dist 0.32's required workspace-level release targets, installers, GitHub attestation, tap, and publishing configuration.
 - `.github/workflows/release.yml`: cargo-dist-generated tag-only build, archive, checksum, attestation, GitHub Release, Homebrew publishing pipeline, and calls to tracked reusable jobs.
-- `.github/workflows/release-tag-gate.yml`: reusable pre-publish check that rejects lightweight, unprefixed, malformed, and Cargo-version-mismatched tags.
-- `.github/workflows/release-preflight.yml`: cargo-dist host-stage verification before publishing.
+- `.github/release-build-setup.yml`: cargo-dist build-setup steps that reject lightweight, unprefixed, malformed, and Cargo-version-mismatched tags before any artifact build can reach hosting.
 - `.github/workflows/publish-shell-installer.yml`: cargo-dist publish-stage installer upload and provenance attestation.
 - `.github/workflows/release-verify.yml`: cargo-dist post-announce checks of each released executable and the generated Homebrew formula.
 - `.github/workflows/ci.yml`: non-publishing pull-request and `main` verification for Rust and installer contracts.
@@ -52,7 +51,7 @@
 - Modify: `Cargo.toml`
 - Create: `dist-workspace.toml`
 - Create: `.github/workflows/release.yml`
-- Create: `.github/workflows/release-tag-gate.yml`
+- Create: `.github/release-build-setup.yml`
 - Modify: `tests/packaging.rs`
 
 **Interfaces:**
@@ -101,7 +100,7 @@
       assert!(workflow.contains("dist build"));
       assert!(workflow.contains("HOMEBREW_TAP_TOKEN"));
       assert!(workflow.contains("\"attestations\": \"write\""));
-      assert!(workflow.contains("release-tag-gate"));
+      assert!(workflow.contains("Enforce annotated vX.Y.Z release tag"));
   }
   ```
 
@@ -146,7 +145,7 @@
   github-attestations = true
   pr-run-mode = "skip"
   tap = "dcchuck/homebrew-tap"
-  host-jobs = ["./release-tag-gate"]
+  github-build-setup = "../release-build-setup.yml"
   publish-jobs = ["homebrew"]
   ```
 
@@ -160,9 +159,10 @@
 
   Keep the generated `.github/workflows/release.yml` tracked. Do not set `allow-dirty = ["ci"]`; later tasks add reusable-job configuration and regenerate this file from checked-in metadata instead of hand-editing it.
 
-  Create `.github/workflows/release-tag-gate.yml` as a reusable workflow with a required string `plan` workflow-call input. It must check out the triggering tag with `fetch-depth: 0`, extract `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"`, and execute this gate before cargo-dist enters its host stage:
+  Create `.github/release-build-setup.yml` as cargo-dist's injected build setup. It is inserted immediately after checkout in every build-local-artifacts job, so a failing gate makes all build jobs fail and prevents cargo-dist's host job from running. Its first step is named `Enforce annotated vX.Y.Z release tag` and executes this gate against `GITHUB_REF_NAME`:
 
   ```bash
+  TAG="$GITHUB_REF_NAME"
   case "$TAG" in
       v[0-9]*.[0-9]*.[0-9]*) ;;
       *) echo "release tag must be vX.Y.Z, got $TAG" >&2; exit 1 ;;
@@ -172,7 +172,7 @@
   test "$(git cat-file -t "refs/tags/$TAG")" = tag || { echo "release tag must be annotated" >&2; exit 1; }
   ```
 
-  Regenerate `.github/workflows/release.yml` with `dist init --yes` after adding the hook. This permits cargo-dist's normal tag planning while making an unprefixed, malformed, lightweight, or Cargo-version-mismatched tag fail before hosting or publishing.
+  Regenerate `.github/workflows/release.yml` with `dist init --yes` after adding the setup file. This permits cargo-dist's normal tag planning while making an unprefixed, malformed, lightweight, or Cargo-version-mismatched tag fail during every build before hosting or publishing.
 
 - [ ] **Step 4: Verify the release plan selects only the matching v0.2.0 announcement**
 
@@ -585,7 +585,7 @@
 
 **Files:**
 
-- Create: `.github/workflows/release-preflight.yml`
+- Modify: `.github/release-build-setup.yml`
 - Create: `.github/workflows/ci.yml`
 - Create: `.github/workflows/release-verify.yml`
 - Modify: `Cargo.toml`
@@ -594,8 +594,8 @@
 
 **Interfaces:**
 
-- Consumes: cargo-dist's generated plan and release stages plus the `host-jobs`, `publish-jobs`, and `post-announce-jobs` metadata configured in Task 1.
-- Produces: a required host-stage preflight, a publish-stage shell-installer hook, and post-announce smoke checks without hand-editing cargo-dist's generated workflow.
+- Consumes: cargo-dist's generated build and release stages plus the injected build setup and `publish-jobs` / `post-announce-jobs` metadata configured in earlier tasks.
+- Produces: build-stage verification that blocks hosting, a publish-stage shell-installer hook, and post-announce smoke checks without hand-editing cargo-dist's generated workflow.
 - Produces: a public `dcchuck/homebrew-tap` repository, with formula updates published only by cargo-dist using `HOMEBREW_TAP_TOKEN`.
 
 - [ ] **Step 1: Write failing workflow-contract assertions**
@@ -607,15 +607,15 @@
   fn ci_and_release_verification_cover_installable_artifacts() {
       let ci = repo_file(".github/workflows/ci.yml");
       let release = repo_file(".github/workflows/release.yml");
-      let preflight = repo_file(".github/workflows/release-preflight.yml");
+      let build_setup = repo_file(".github/release-build-setup.yml");
       let verify = repo_file(".github/workflows/release-verify.yml");
 
       assert!(ci.contains("cargo test --locked"));
       assert!(ci.contains("cargo clippy --all-targets --locked -- -D warnings"));
       assert!(ci.contains("make test-installer"));
-      assert!(preflight.contains("cargo fmt --all -- --check"));
+      assert!(build_setup.contains("cargo fmt --all -- --check"));
       assert!(release.contains("publish-shell-installer"));
-      assert!(release.contains("release-preflight"));
+      assert!(release.contains("Enforce annotated vX.Y.Z release tag"));
       assert!(verify.contains("health --skip-cargo"));
       assert!(verify.contains("brew audit --strict Formula/car-go-clean.rb"));
   }
@@ -627,7 +627,7 @@
 
   Expected: FAIL because neither CI workflow exists and the generated release workflow has no repository-specific verification jobs.
 
-- [ ] **Step 3: Add pull-request CI and release preflight**
+- [ ] **Step 3: Add pull-request CI and build-stage release verification**
 
   Create `.github/workflows/ci.yml` for `pull_request` and pushes to `main`. Its single Ubuntu job must check out the repository, install Rust 1.95.0 and dist 0.32.0, then run, in order:
 
@@ -639,14 +639,7 @@
   dist plan --tag v0.2.0 --output-format=json
   ```
 
-  Create `.github/workflows/release-preflight.yml` as a reusable workflow with a required string `plan` workflow-call input. Its `preflight` job checks out the tagged commit, installs Rust 1.95.0 and dist 0.32.0, then runs the first four commands above followed by this exact tag check:
-
-  ```bash
-  TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"
-  dist plan --tag "$TAG" --output-format=json
-  ```
-
-  Because Task 1 registers this file in `host-jobs`, cargo-dist will require it before entering its host stage. This keeps the generated release workflow clean while preventing publishing when formatting, strict Clippy, locked tests, installer contracts, or the tag/version plan fail.
+  Extend `.github/release-build-setup.yml`, after the Task 1 tag gate, with steps named `Check formatting`, `Check Clippy`, `Run locked tests`, and `Check shell installer`. They run the first four commands above. cargo-dist injects these steps into every build-local-artifacts job before `dist build`; therefore a failed check makes the generated build job fail and its host condition prevents GitHub Release creation. Regenerate `.github/workflows/release.yml` with `dist init --yes` after extending this setup file.
 
 - [ ] **Step 4: Add post-publication architecture smoke checks and formula verification**
 
@@ -674,10 +667,9 @@
 
   Add a formula job that clones `https://github.com/dcchuck/homebrew-tap`, runs `brew audit --strict Formula/car-go-clean.rb`, and checks the formula contains the current release tag and every SHA-256 listed for the macOS and Linux archive assets. The formula job must depend on all smoke jobs so the cargo-dist post-announce stage reports failure if any released binary or its generated formula fails verification.
 
-  Register both reusable workflows and regenerate the cargo-dist workflow:
+  Register the post-announce verification workflow and regenerate the cargo-dist workflow:
 
   ```toml
-  host-jobs = ["./release-tag-gate", "./release-preflight"]
   post-announce-jobs = ["./release-verify"]
   ```
 
@@ -710,8 +702,8 @@
 - [ ] **Step 7: Commit automated verification**
 
   ```bash
-  git add Cargo.toml .github/workflows/release.yml \
-    .github/workflows/release-preflight.yml .github/workflows/ci.yml \
+  git add Cargo.toml .github/release-build-setup.yml .github/workflows/release.yml \
+    .github/workflows/ci.yml \
     .github/workflows/release-verify.yml tests/packaging.rs
   git commit -m "ci: verify released installers and formula"
   ```
