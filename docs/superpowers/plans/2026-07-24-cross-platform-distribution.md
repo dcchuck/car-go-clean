@@ -22,7 +22,8 @@
 
 ## File Map
 
-- `Cargo.toml`: package release metadata, v0.2.0, and cargo-dist configuration.
+- `Cargo.toml`: package release metadata, v0.2.0, package-local cargo-dist eligibility, and cargo-dist's generated release profile.
+- `dist-workspace.toml`: cargo-dist 0.32's required workspace-level release targets, installers, GitHub attestation, tap, and publishing configuration.
 - `.github/workflows/release.yml`: cargo-dist-generated tag-only build, archive, checksum, attestation, GitHub Release, Homebrew publishing pipeline, and calls to tracked reusable jobs.
 - `.github/workflows/release-preflight.yml`: cargo-dist host-stage verification before publishing.
 - `.github/workflows/publish-shell-installer.yml`: cargo-dist publish-stage installer upload and provenance attestation.
@@ -48,6 +49,7 @@
 **Files:**
 
 - Modify: `Cargo.toml`
+- Create: `dist-workspace.toml`
 - Create: `.github/workflows/release.yml`
 - Modify: `tests/packaging.rs`
 
@@ -65,10 +67,15 @@
   #[test]
   fn cargo_dist_metadata_declares_the_public_release_contract() {
       let manifest = repo_file("Cargo.toml");
+      let dist = repo_file("dist-workspace.toml");
       for value in [
           "version = \"0.2.0\"",
           "repository = \"https://github.com/dcchuck/car-go-clean\"",
           "homepage = \"https://github.com/dcchuck/car-go-clean\"",
+      ] {
+          assert!(manifest.contains(value), "missing {value}");
+      }
+      for value in [
           "cargo-dist-version = \"0.32.0\"",
           "aarch64-apple-darwin",
           "x86_64-apple-darwin",
@@ -78,7 +85,7 @@
           "tap = \"dcchuck/homebrew-tap\"",
           "publish-jobs = [\"homebrew\"]",
       ] {
-          assert!(manifest.contains(value), "missing {value}");
+          assert!(dist.contains(value), "missing {value}");
       }
   }
 
@@ -112,8 +119,17 @@
 
   [package.metadata.dist]
   dist = true
+  ```
+
+  cargo-dist 0.32 reads release-wide configuration only from its workspace config, so create `dist-workspace.toml` with the generated workspace member declaration plus this exact release contract:
+
+  ```toml
+  [workspace]
+  members = ["cargo:."]
+
+  [dist]
   cargo-dist-version = "0.32.0"
-  ci = ["github"]
+  ci = "github"
   installers = ["homebrew"]
   targets = [
       "aarch64-apple-darwin",
@@ -158,7 +174,7 @@
 - [ ] **Step 6: Commit the release foundation**
 
   ```bash
-  git add Cargo.toml .github/workflows/release.yml tests/packaging.rs
+  git add Cargo.toml Cargo.lock dist-workspace.toml .github/workflows/release.yml tests/packaging.rs
   git commit -m "feat: add v0.2.0 release pipeline"
   ```
 
