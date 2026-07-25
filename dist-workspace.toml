@@ -19,5 +19,7 @@ github-attestations = true
 pr-run-mode = "skip"
 # A GitHub repo to push Homebrew formulas to
 tap = "dcchuck/homebrew-tap"
+# Steps injected into each local build job after checkout.
+github-build-setup = "../release-build-setup.yml"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]

@@ -80,4 +80,5 @@ fn release_workflow_is_tag_only_and_uses_dist() {
     assert!(workflow.contains("dist build"));
     assert!(workflow.contains("HOMEBREW_TAP_TOKEN"));
     assert!(workflow.contains("\"attestations\": \"write\""));
+    assert!(workflow.contains("Enforce annotated vX.Y.Z release tag"));
 }
