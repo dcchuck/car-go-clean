@@ -25,6 +25,7 @@
 - `Cargo.toml`: package release metadata, v0.2.0, package-local cargo-dist eligibility, and cargo-dist's generated release profile.
 - `dist-workspace.toml`: cargo-dist 0.32's required workspace-level release targets, installers, GitHub attestation, tap, and publishing configuration.
 - `.github/workflows/release.yml`: cargo-dist-generated tag-only build, archive, checksum, attestation, GitHub Release, Homebrew publishing pipeline, and calls to tracked reusable jobs.
+- `.github/workflows/release-tag-gate.yml`: reusable pre-publish check that rejects lightweight, unprefixed, malformed, and Cargo-version-mismatched tags.
 - `.github/workflows/release-preflight.yml`: cargo-dist host-stage verification before publishing.
 - `.github/workflows/publish-shell-installer.yml`: cargo-dist publish-stage installer upload and provenance attestation.
 - `.github/workflows/release-verify.yml`: cargo-dist post-announce checks of each released executable and the generated Homebrew formula.
@@ -51,6 +52,7 @@
 - Modify: `Cargo.toml`
 - Create: `dist-workspace.toml`
 - Create: `.github/workflows/release.yml`
+- Create: `.github/workflows/release-tag-gate.yml`
 - Modify: `tests/packaging.rs`
 
 **Interfaces:**
@@ -99,6 +101,7 @@
       assert!(workflow.contains("dist build"));
       assert!(workflow.contains("HOMEBREW_TAP_TOKEN"));
       assert!(workflow.contains("\"attestations\": \"write\""));
+      assert!(workflow.contains("release-tag-gate"));
   }
   ```
 
@@ -143,6 +146,7 @@
   github-attestations = true
   pr-run-mode = "skip"
   tap = "dcchuck/homebrew-tap"
+  host-jobs = ["./release-tag-gate"]
   publish-jobs = ["homebrew"]
   ```
 
@@ -155,6 +159,20 @@
   ```
 
   Keep the generated `.github/workflows/release.yml` tracked. Do not set `allow-dirty = ["ci"]`; later tasks add reusable-job configuration and regenerate this file from checked-in metadata instead of hand-editing it.
+
+  Create `.github/workflows/release-tag-gate.yml` as a reusable workflow with a required string `plan` workflow-call input. It must check out the triggering tag with `fetch-depth: 0`, extract `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"`, and execute this gate before cargo-dist enters its host stage:
+
+  ```bash
+  case "$TAG" in
+      v[0-9]*.[0-9]*.[0-9]*) ;;
+      *) echo "release tag must be vX.Y.Z, got $TAG" >&2; exit 1 ;;
+  esac
+  VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "car-go-clean").version')"
+  test "$TAG" = "v$VERSION" || { echo "tag $TAG does not match Cargo.toml version $VERSION" >&2; exit 1; }
+  test "$(git cat-file -t "refs/tags/$TAG")" = tag || { echo "release tag must be annotated" >&2; exit 1; }
+  ```
+
+  Regenerate `.github/workflows/release.yml` with `dist init --yes` after adding the hook. This permits cargo-dist's normal tag planning while making an unprefixed, malformed, lightweight, or Cargo-version-mismatched tag fail before hosting or publishing.
 
 - [ ] **Step 4: Verify the release plan selects only the matching v0.2.0 announcement**
 
@@ -659,7 +677,7 @@
   Register both reusable workflows and regenerate the cargo-dist workflow:
 
   ```toml
-  host-jobs = ["./release-preflight"]
+  host-jobs = ["./release-tag-gate", "./release-preflight"]
   post-announce-jobs = ["./release-verify"]
   ```
 
