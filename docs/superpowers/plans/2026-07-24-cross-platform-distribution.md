@@ -176,7 +176,7 @@
 **Interfaces:**
 
 - Produces: `car-go-clean-installer.sh [--version X.Y.Z] [--install-dir PATH]`.
-- Consumes: release assets named `car-go-clean-<target>.tar.xz` and their `SHA256SUMS` entry.
+- Consumes: cargo-dist release assets named `car-go-clean-<version>-<target>.tar.xz` and their `SHA256SUMS` entry.
 - Produces: a release asset named `car-go-clean-installer.sh`, uploaded after cargo-dist has published the tag's archives.
 - Produces: `make test-installer`, which runs without network access.
 
@@ -187,10 +187,10 @@
   ```sh
   run_installer --install-dir "$install_dir"
   test "$(cat "$install_dir/car-go-clean")" = "new binary"
-  test "$(cat "$curl_log")" = "latest car-go-clean-aarch64-apple-darwin.tar.xz SHA256SUMS"
+  test "$(cat "$curl_log")" = "latest-meta v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS"
 
   run_installer --version 0.2.0 --install-dir "$versioned_dir"
-  grep -qx 'v0.2.0 car-go-clean-aarch64-apple-darwin.tar.xz SHA256SUMS' "$curl_log"
+  grep -qx 'v0.2.0 car-go-clean-0.2.0-aarch64-apple-darwin.tar.xz SHA256SUMS' "$curl_log"
 
   printf '%s' 'old binary' > "$failed_dir/car-go-clean"
   if CHECKSUM_MODE=wrong run_installer --install-dir "$failed_dir"; then
@@ -231,13 +231,17 @@
   esac
 
   case "$version" in
-      latest) release_path=latest/download ;;
-      [0-9]*.[0-9]*.[0-9]*) release_path="download/v$version" ;;
+      latest)
+          tag=$(curl --proto '=https' --tlsv1.2 -fsSIL -o /dev/null -w '%{url_effective}' \
+              https://github.com/dcchuck/car-go-clean/releases/latest | sed -n 's#.*/tag/\(v[^/]*\)$#\1#p')
+          [ -n "$tag" ] || { echo "could not resolve the latest release tag" >&2; exit 1; }
+          ;;
+      [0-9]*.[0-9]*.[0-9]*) tag="v$version" ;;
       *) echo "--version must be X.Y.Z" >&2; exit 2 ;;
   esac
   ```
 
-  Set `base_url` to `https://github.com/dcchuck/car-go-clean/releases/$release_path`, download `SHA256SUMS` and `car-go-clean-$target.tar.xz` to a `mktemp -d` directory, and remove that directory with `trap 'rm -rf "$work_dir"' EXIT HUP INT TERM`. Extract the expected hash with `awk -v file="$archive_name" '$2 == file { print $1 }'`; require exactly one nonempty hash. Use `shasum -a 256` on macOS and `sha256sum` on Linux, compare exact digests, then extract with `tar -xJf`.
+  Set `release_version=${tag#v}`, `archive_name="car-go-clean-$release_version-$target.tar.xz"`, and `base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"`. Download `SHA256SUMS` and `"$archive_name"` to a `mktemp -d` directory, and remove that directory with `trap 'rm -rf "$work_dir"' EXIT HUP INT TERM`. Extract the expected hash with `awk -v file="$archive_name" '$2 == file { print $1 }'`; require exactly one nonempty hash. Use `shasum -a 256` on macOS and `sha256sum` on Linux, compare exact digests, then extract with `tar -xJf`.
 
   Require exactly one extracted `car-go-clean` regular executable. Run `mkdir -p "$install_dir"`, write it as `"$install_dir/.car-go-clean.$$"` with `install -m 755`, and use `mv -f` only after extraction and checksum validation complete. Print the final binary path and the reminder:
 
@@ -624,7 +628,7 @@
         runner: ubuntu-24.04
   ```
 
-  Each matrix job sets `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"`, downloads `car-go-clean-${{ matrix.target }}.tar.xz` and `SHA256SUMS` from that GitHub Release, verifies the archive with `shasum -a 256 -c SHA256SUMS` on macOS or `sha256sum -c SHA256SUMS` on Linux, extracts it, then runs:
+  Each matrix job sets `TAG="$(jq -r '.announcement_tag' <<< "${{ inputs.plan }}")"` and `VERSION="${TAG#v}"`, downloads `car-go-clean-${VERSION}-${{ matrix.target }}.tar.xz` and `SHA256SUMS` from that GitHub Release, verifies the archive with `shasum -a 256 -c SHA256SUMS` on macOS or `sha256sum -c SHA256SUMS` on Linux, extracts it, then runs:
 
   ```bash
   ./car-go-clean version
