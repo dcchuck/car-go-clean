@@ -10,8 +10,11 @@ use crate::safety::{
     ProjectReview, SafetyOptions, SkipReason,
 };
 use crate::scanner::{Scanner, ScannerOptions};
+use crate::service::{
+    resolve_service_binary, ServiceAction, ServiceManager, ServicePlatform, SystemCommandRunner,
+};
 use crate::store::{ErrorRecord, Store};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal};
@@ -153,6 +156,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Version,
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     Health {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -235,6 +242,14 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommands {
+    Install,
+    Status,
+    Restart,
+    Uninstall,
+}
+
 pub fn run() -> Result<()> {
     execute(Cli::parse())
 }
@@ -245,6 +260,7 @@ fn execute(cli: Cli) -> Result<()> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Commands::Service { command } => service(command),
         Commands::Health {
             config,
             state_dir,
@@ -299,6 +315,65 @@ fn execute(cli: Cli) -> Result<()> {
             state_dir,
         } => logs(state_dir, errors_only, tail),
     }
+}
+
+fn service(command: ServiceCommands) -> Result<()> {
+    let (platform, platform_label) = match std::env::consts::OS {
+        "macos" => (ServicePlatform::MacOs, "macOS (launchd)"),
+        "linux" => (ServicePlatform::Linux, "Linux (systemd --user)"),
+        _ => bail!("car-go-clean service is supported only on macOS and Linux"),
+    };
+    let home_dir = PathBuf::from(
+        std::env::var_os("HOME").ok_or_else(|| anyhow!("could not determine home directory"))?,
+    );
+    let home_dir = if home_dir.is_absolute() {
+        home_dir
+    } else {
+        std::env::current_dir()
+            .context("could not determine current directory for home directory")?
+            .join(home_dir)
+    };
+    let argv0 = std::env::args_os()
+        .next()
+        .ok_or_else(|| anyhow!("could not determine service executable name"))?;
+    let binary = resolve_service_binary(
+        &argv0,
+        std::env::var_os("PATH").as_deref(),
+        std::env::current_exe().context("could not determine current executable")?,
+    )?;
+    let definition = match platform {
+        ServicePlatform::MacOs => home_dir
+            .join("Library/LaunchAgents")
+            .join("com.dcchuck.car-go-clean.plist"),
+        ServicePlatform::Linux => home_dir.join(".config/systemd/user/car-go-clean.service"),
+    };
+    let action = match command {
+        ServiceCommands::Install => ServiceAction::Install,
+        ServiceCommands::Status => ServiceAction::Status,
+        ServiceCommands::Restart => ServiceAction::Restart,
+        ServiceCommands::Uninstall => ServiceAction::Uninstall,
+    };
+    let mut manager = ServiceManager::new(platform, home_dir, binary.clone(), SystemCommandRunner);
+    let status = match action {
+        ServiceAction::Install => manager.install()?,
+        ServiceAction::Status => manager.status()?,
+        ServiceAction::Restart => manager.restart()?,
+        ServiceAction::Uninstall => manager.uninstall()?,
+    };
+    let state = if !status.installed {
+        "not installed"
+    } else if status.active {
+        "running"
+    } else {
+        "stopped"
+    };
+
+    println!("Service");
+    print_row("Platform", platform_label);
+    print_row("Binary", binary.display().to_string());
+    print_row("Definition", definition.display().to_string());
+    print_row("State", state);
+    Ok(())
 }
 
 fn health(

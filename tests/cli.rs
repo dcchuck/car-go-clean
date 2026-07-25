@@ -6,6 +6,29 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 #[test]
+fn service_help_lists_only_explicit_lifecycle_actions() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["service", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("install"))
+        .stdout(contains("status"))
+        .stdout(contains("restart"))
+        .stdout(contains("uninstall"));
+}
+
+#[test]
+fn top_level_help_lists_service_management() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("service"));
+}
+
+#[test]
 fn version_prints_package_version() {
     let mut cmd = Command::cargo_bin("car-go-clean").unwrap();
     cmd.arg("version")
