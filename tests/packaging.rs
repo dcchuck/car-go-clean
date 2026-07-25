@@ -64,7 +64,8 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
         "x86_64-unknown-linux-musl",
         "github-attestations = true",
         "tap = \"dcchuck/homebrew-tap\"",
-        "publish-jobs = [\"homebrew\"]",
+        "publish-jobs = [\"homebrew\", \"./publish-shell-installer\"]",
+        "github-custom-job-permissions = { \"publish-shell-installer\" = { contents = \"write\", attestations = \"write\", id-token = \"write\" } }",
     ] {
         assert!(dist.contains(value), "missing {value}");
     }

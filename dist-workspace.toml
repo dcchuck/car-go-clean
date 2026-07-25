@@ -22,4 +22,5 @@ tap = "dcchuck/homebrew-tap"
 # Steps injected into each local build job after checkout.
 github-build-setup = "../release-build-setup.yml"
 # Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-shell-installer"]
+github-custom-job-permissions = { "publish-shell-installer" = { contents = "write", attestations = "write", id-token = "write" } }

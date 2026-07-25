@@ -1,0 +1,28 @@
+name: Publish shell installer
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-shell-installer:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Read release tag
+        run: echo "TAG=$(jq -r '.announcement_tag' <<< \"${{ inputs.plan }}\")" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Stage installer
+        run: cp packaging/release/car-go-clean-installer.sh car-go-clean-installer.sh
+      - name: Attest installer
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: car-go-clean-installer.sh
+      - name: Upload installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" car-go-clean-installer.sh --clobber

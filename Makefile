@@ -1,12 +1,15 @@
 CARGO ?= cargo
 
-.PHONY: build test fmt clippy clean
+.PHONY: build test test-installer fmt clippy clean
 
 build:
 	$(CARGO) build
 
-test:
+test: test-installer
 	$(CARGO) test
+
+test-installer:
+	sh tests/installer.sh
 
 fmt:
 	$(CARGO) fmt -- --check
