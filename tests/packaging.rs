@@ -53,7 +53,7 @@ fn readme_uses_compact_logo_asset() {
     assert!(readme.contains("assets/car-go-clean-logo-readme.png"));
     assert!(readme.contains("width=\"440\""));
     assert!(!readme.contains("width=\"640\""));
-    assert!(readme.contains("</p>\n# car-go-clean"));
+    assert!(readme.contains("</p>\n<h1>car-go-clean</h1>"));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 <p align="center">
   <img src="assets/car-go-clean-logo-readme.png" alt="car-go-clean crab logo" width="440">
 </p>
-# car-go-clean
+<h1>car-go-clean</h1>
 
 `car-go-clean` is a Rust CLI/daemon that finds Rust projects on disk, runs
 `cargo clean`, and tracks how much space was reclaimed.
