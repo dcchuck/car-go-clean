@@ -1,7 +1,6 @@
 <p align="center">
-  <img src="assets/car-go-clean-logo.png" alt="car-go-clean crab logo" width="640">
+  <img src="assets/car-go-clean-logo-readme.png" alt="car-go-clean crab logo" width="440">
 </p>
-
 # car-go-clean
 
 `car-go-clean` is a Rust CLI/daemon that finds Rust projects on disk, runs

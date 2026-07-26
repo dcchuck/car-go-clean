@@ -44,6 +44,19 @@ fn readme_documents_binary_installs_and_explicit_service_activation() {
 }
 
 #[test]
+fn readme_uses_compact_logo_asset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = repo_file("README.md");
+
+    assert!(root.join("assets/car-go-clean-logo.png").is_file());
+    assert!(root.join("assets/car-go-clean-logo-readme.png").is_file());
+    assert!(readme.contains("assets/car-go-clean-logo-readme.png"));
+    assert!(readme.contains("width=\"440\""));
+    assert!(!readme.contains("width=\"640\""));
+    assert!(readme.contains("</p>\n# car-go-clean"));
+}
+
+#[test]
 fn release_packaging_documents_tagged_binary_distribution() {
     let release = repo_file("packaging/release/README.md");
 
