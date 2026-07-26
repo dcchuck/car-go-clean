@@ -10,9 +10,13 @@ on:
 jobs:
   publish-shell-installer:
     runs-on: ubuntu-22.04
+    env:
+      PLAN: ${{ inputs.plan }}
     steps:
       - name: Read release tag
-        run: echo "TAG=$(jq -r '.announcement_tag' <<< \"${{ inputs.plan }}\")" >> "$GITHUB_ENV"
+        run: |
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
