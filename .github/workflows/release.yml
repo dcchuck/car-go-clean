@@ -359,7 +359,7 @@ jobs:
     with:
       plan: ${{ needs.plan.outputs.val }}
     permissions:
-      "contents": "read"
+      "contents": "write"
 
   announce:
     needs:
