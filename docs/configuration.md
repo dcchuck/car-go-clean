@@ -34,19 +34,23 @@ log_level = "info"
 ## Linked worktrees and discovery failures
 
 When a scan finds a primary Git checkout, car-go-clean asks Git for linked
-Rust worktrees within the configured scan roots, even when ignore rules hide
-them. Exclusions and the ordinary cleaning safeguards still apply. A successful
-enumeration reconciles stale cached candidates and replaces the exact primary's
-saved linked-worktree association.
+Rust worktrees within the configured scan roots or explicit project
+directories, even when ignore rules hide them. Exclusions and the ordinary
+cleaning safeguards still apply. A successful enumeration reconciles stale
+cached candidates and replaces the exact primary's saved linked-worktree
+association.
 
 A discovery failure is recorded as a normal scan error. Separately, the
 canonical primary and the linked worktrees saved for that primary remain
 blocked until a later successful enumeration replaces that association. The
 durable block normally does not spread to ancestors, siblings, or unrelated
-projects. Persisted primary and linked identities are retained conservatively:
-a changed alias cannot transfer or clear an old failure, and unresolved or
-noncanonical legacy associations remain blocked rather than being inferred
-from a reused path spelling.
+projects. Trusted canonical failures normally block only those identified
+paths. If the active discovery state cannot be trusted—for example, a legacy
+failure or linked-worktree association without a trusted canonical identity,
+or a saved blocked identity that no longer resolves canonically—car-go-clean
+fails closed by blocking all cached projects until a successful discovery can
+safely replace the association. Persisted identities are retained
+conservatively: a changed alias cannot transfer or clear an old failure.
 
 ## Cleaning policy and overrides
 
