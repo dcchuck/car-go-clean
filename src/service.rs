@@ -143,14 +143,19 @@ impl<R: CommandRunner> ServiceManager<R> {
         match self.platform {
             ServicePlatform::MacOs => {
                 let plist = self.launchd_plist_path();
-                self.run_allow_failure(
-                    Path::new("launchctl"),
-                    &[
-                        OsString::from("bootout"),
-                        OsString::from(self.launchd_domain()),
-                        plist.as_os_str().to_os_string(),
-                    ],
-                )?;
+                let bootout_args = [
+                    OsString::from("bootout"),
+                    OsString::from(self.launchd_domain()),
+                    plist.as_os_str().to_os_string(),
+                ];
+                let bootout_output = self.run(Path::new("launchctl"), &bootout_args)?;
+                if !bootout_output.success && !is_missing_launchd_service(&bootout_output) {
+                    return Err(anyhow!(
+                        "{} failed{}",
+                        command_description(Path::new("launchctl"), &bootout_args),
+                        format_command_error(&bootout_output)
+                    ));
+                }
                 if plist.exists() {
                     fs::remove_file(&plist)
                         .with_context(|| format!("could not remove {}", plist.display()))?;
@@ -380,18 +385,20 @@ pub fn resolve_service_binary(
     current_exe: PathBuf,
 ) -> Result<PathBuf> {
     let argv0_path = Path::new(argv0);
-    let direct_candidate = if argv0_path.is_absolute() {
-        argv0_path.to_path_buf()
-    } else {
-        env::current_dir()
+    if argv0_path.is_absolute() {
+        if is_executable_file(argv0_path) {
+            return Ok(argv0_path.to_path_buf());
+        }
+    } else if argv0_path.components().count() > 1 {
+        let direct_candidate = env::current_dir()
             .context("could not determine the current directory for service binary resolution")?
-            .join(argv0_path)
-    };
-    if direct_candidate.is_file() {
-        return Ok(direct_candidate);
+            .join(argv0_path);
+        if is_executable_file(&direct_candidate) {
+            return Ok(direct_candidate);
+        }
     }
 
-    if !argv0_path.is_absolute() {
+    if !argv0_path.is_absolute() && argv0_path.components().count() == 1 {
         if let Some(path) = path {
             for directory in env::split_paths(path) {
                 let directory = if directory.is_absolute() {
@@ -409,11 +416,11 @@ pub fn resolve_service_binary(
         }
     }
 
-    if current_exe.is_absolute() && current_exe.exists() {
+    if current_exe.is_absolute() && is_executable_file(&current_exe) {
         return Ok(current_exe);
     }
     Err(anyhow!(
-        "could not resolve an existing absolute service binary from {:?} or current executable {}",
+        "could not resolve an executable absolute service binary from {:?} or current executable {}",
         argv0,
         current_exe.display()
     ))
@@ -554,4 +561,16 @@ fn is_missing_systemd_unit(output: &CommandOutput) -> bool {
         && ["not found", "not loaded", "does not exist"]
             .iter()
             .any(|marker| message.contains(marker))
+}
+
+fn is_missing_launchd_service(output: &CommandOutput) -> bool {
+    let message = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    [
+        "no such process",
+        "could not find specified service",
+        "service not found",
+        "not loaded",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }

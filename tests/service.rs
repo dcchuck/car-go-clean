@@ -11,6 +11,7 @@ struct FakeRunner {
     calls: Vec<(PathBuf, Vec<OsString>)>,
     fail_systemd_environment: bool,
     disable_output: Option<CommandOutput>,
+    bootout_output: Option<CommandOutput>,
 }
 
 impl CommandRunner for FakeRunner {
@@ -20,6 +21,13 @@ impl CommandRunner for FakeRunner {
             && strings(args) == ["--user", "disable", "--now", "car-go-clean.service"]
         {
             if let Some(output) = &self.disable_output {
+                return Ok(output.clone());
+            }
+        }
+        if program == Path::new("launchctl")
+            && strings(args).first().map(String::as_str) == Some("bootout")
+        {
+            if let Some(output) = &self.bootout_output {
                 return Ok(output.clone());
             }
         }
@@ -208,6 +216,59 @@ fn linux_uninstall_allows_an_already_missing_systemd_unit() {
 }
 
 #[test]
+fn mac_uninstall_keeps_the_plist_when_bootout_fails_unexpectedly() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "plist").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner {
+            bootout_output: Some(CommandOutput::new(
+                false,
+                String::new(),
+                "Boot-out failed: 1: Operation not permitted".to_string(),
+            )),
+            ..FakeRunner::default()
+        },
+    );
+
+    let error = manager.uninstall().unwrap_err();
+    assert!(error.to_string().contains("Operation not permitted"));
+    assert!(plist.exists());
+}
+
+#[test]
+fn mac_uninstall_removes_the_plist_when_service_is_not_loaded() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "plist").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner {
+            bootout_output: Some(CommandOutput::new(
+                false,
+                String::new(),
+                "Boot-out failed: 3: No such process".to_string(),
+            )),
+            ..FakeRunner::default()
+        },
+    );
+
+    manager.uninstall().unwrap();
+    assert!(!plist.exists());
+}
+
+#[test]
 fn status_is_not_installed_without_running_a_platform_command() {
     let work = tempfile::tempdir().unwrap();
     let mut manager = test_manager(
@@ -264,4 +325,52 @@ fn path_resolved_absolute_binary_wins_over_current_exe() {
     )
     .unwrap();
     assert_eq!(resolved, path_binary);
+}
+
+#[cfg(unix)]
+#[test]
+fn bare_argv0_ignores_a_non_executable_current_directory_impostor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current_dir = std::env::current_dir().unwrap();
+    let impostor = tempfile::Builder::new()
+        .prefix("car-go-clean-impostor-")
+        .tempfile_in(&current_dir)
+        .unwrap();
+    fs::set_permissions(impostor.path(), fs::Permissions::from_mode(0o644)).unwrap();
+    let name = impostor.path().file_name().unwrap().to_os_string();
+
+    let work = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("bin");
+    let path_binary = bin_dir.join(&name);
+    let current_exe = work.path().join("current/car-go-clean");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
+    fs::write(&path_binary, "#!/bin/sh\n").unwrap();
+    fs::write(&current_exe, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&path_binary, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&current_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let resolved =
+        resolve_service_binary(name.as_os_str(), Some(bin_dir.as_os_str()), current_exe).unwrap();
+    assert_eq!(resolved, path_binary);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_executable_absolute_argv0_falls_back_to_current_exe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let argv0 = work.path().join("argv0/car-go-clean");
+    let current_exe = work.path().join("current/car-go-clean");
+    fs::create_dir_all(argv0.parent().unwrap()).unwrap();
+    fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
+    fs::write(&argv0, "#!/bin/sh\n").unwrap();
+    fs::write(&current_exe, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&argv0, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&current_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let resolved = resolve_service_binary(argv0.as_os_str(), None, current_exe.clone()).unwrap();
+    assert_eq!(resolved, current_exe);
 }

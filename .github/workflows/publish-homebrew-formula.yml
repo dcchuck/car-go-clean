@@ -1,0 +1,87 @@
+name: Publish Homebrew formula pull request
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-homebrew-formula:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+      TAP_REPOSITORY: dcchuck/homebrew-tap
+    steps:
+      - name: Read release metadata
+        run: |
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          VERSION="${TAG#v}"
+          BRANCH="formula/car-go-clean-$TAG"
+          printf 'TAG=%s\nVERSION=%s\nBRANCH=%s\n' "$TAG" "$VERSION" "$BRANCH" >> "$GITHUB_ENV"
+      - name: Require tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: test -n "$HOMEBREW_TAP_TOKEN"
+      - name: Download generated formula
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: dist-artifacts
+          merge-multiple: true
+      - name: Locate generated formula
+        run: |
+          FORMULA_PATHS="$(find dist-artifacts -type f -name car-go-clean.rb -print)"
+          test "$(printf '%s\n' "$FORMULA_PATHS" | awk 'NF { count++ } END { print count + 0 }')" -eq 1
+          printf 'FORMULA_PATH=%s\n' "$FORMULA_PATHS" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          repository: dcchuck/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Commit formula on the release branch
+        working-directory: homebrew-tap
+        run: |
+          DEFAULT_BRANCH="$(gh repo view "$TAP_REPOSITORY" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          test -n "$DEFAULT_BRANCH"
+          test "$BRANCH" != "$DEFAULT_BRANCH"
+          git fetch origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git switch --create "$BRANCH" --track "origin/$BRANCH"
+          else
+            git switch --create "$BRANCH" "origin/$DEFAULT_BRANCH"
+          fi
+          mkdir -p Formula
+          cp "../$FORMULA_PATH" Formula/car-go-clean.rb
+          git config user.name "car-go-clean release bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/car-go-clean.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "car-go-clean $VERSION"
+          fi
+          git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
+          printf 'DEFAULT_BRANCH=%s\n' "$DEFAULT_BRANCH" >> "$GITHUB_ENV"
+      - name: Open or update formula pull request
+        working-directory: homebrew-tap
+        run: |
+          TITLE="car-go-clean $VERSION"
+          BODY="Updates Formula/car-go-clean.rb for car-go-clean $TAG."
+          PR_NUMBER="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$TAP_REPOSITORY" --title "$TITLE" --body "$BODY"
+          elif git diff --quiet "origin/$DEFAULT_BRANCH...HEAD" -- Formula/car-go-clean.rb; then
+            echo "Formula is already current on $DEFAULT_BRANCH"
+          else
+            gh pr create --repo "$TAP_REPOSITORY" --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "$TITLE" --body "$BODY"
+          fi

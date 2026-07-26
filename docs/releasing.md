@@ -5,7 +5,14 @@ verified commit that will become `v0.2.0`; do not create a release from local
 uncommitted work. Before tagging, ensure the public
 [`dcchuck/homebrew-tap`](https://github.com/dcchuck/homebrew-tap) repository
 exists and that this repository has the `HOMEBREW_TAP_TOKEN` Actions secret
-with permission to update its formula.
+from a fine-grained token with repository contents and pull-request write
+permission limited to that tap. Store it without printing it:
+
+```bash
+printf %s "$HOMEBREW_TAP_TOKEN" | gh secret set HOMEBREW_TAP_TOKEN --repo dcchuck/car-go-clean
+```
+
+The release preflight fails before hosting if this secret is empty or absent.
 
 Run the complete local verification suite:
 
@@ -20,15 +27,23 @@ git push origin main v0.2.0
 ```
 
 The release workflow accepts only an annotated `vX.Y.Z` tag whose version
-matches `Cargo.toml`. It publishes four target archives
+matches `Cargo.toml`. The shell installer's `--version` option likewise accepts
+only exactly three decimal components such as `0.2.0`, with no prefix, suffix,
+fourth component, whitespace, or path characters.
+
+The workflow first creates a GitHub draft containing four target archives
 (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`), a matching
 `.sha256` file for each archive, provenance attestations, the
-`car-go-clean-installer.sh` asset, and the Homebrew formula. It does not
-publish to crates.io or enable any daemon.
+`car-go-clean-installer.sh` asset, and the generated Homebrew formula. The tap
+publisher pushes that formula only to the deterministic
+`formula/car-go-clean-vX.Y.Z` branch and opens or updates a formula-bump pull request;
+it never pushes the tap's default branch.
 
-After GitHub has published the release, the
 [release verification workflow](https://github.com/dcchuck/car-go-clean/blob/main/.github/workflows/release-verify.yml)
-downloads each archive, verifies its checksum, smoke-tests the binary, and
-audits the public tap formula. Investigate any failed post-publication check
-before announcing the release.
+downloads each archive from the authenticated draft, verifies its checksum,
+smoke-tests the binary, and audits the formula from that deterministic pull
+request branch. The announce job publishes the draft only after every archive
+and formula check succeeds. A failed check leaves the GitHub Release in
+draft state for investigation. The workflow does not publish to crates.io or
+enable any daemon.

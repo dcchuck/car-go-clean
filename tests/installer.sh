@@ -103,6 +103,26 @@ run_installer() {
     "$installer" "$@"
 }
 
+for malformed_version in \
+    1 \
+    1.2 \
+    1.2.3.4 \
+    1.2.3-rc1 \
+    1.2.3/../../escape \
+    '1.2.3 extra' \
+    latest \
+    .2.3 \
+    1..3 \
+    1.2.
+do
+    : > "$curl_log"
+    if run_installer --version "$malformed_version" --install-dir "$work_dir/malformed-install"; then
+        echo "accepted malformed version: $malformed_version" >&2
+        exit 1
+    fi
+    test ! -s "$curl_log"
+done
+
 install_dir="$work_dir/default-install"
 run_installer --install-dir "$install_dir"
 test "$(cat "$install_dir/car-go-clean")" = "new binary"

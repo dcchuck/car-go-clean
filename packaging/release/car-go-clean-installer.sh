@@ -2,14 +2,42 @@
 set -eu
 
 version=latest
+version_requested=false
 install_dir="$HOME/.local/bin"
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --version) version=${2:?missing version}; shift 2 ;;
+        --version) version=${2:?missing version}; version_requested=true; shift 2 ;;
         --install-dir) install_dir=${2:?missing install directory}; shift 2 ;;
         *) echo "usage: $0 [--version X.Y.Z] [--install-dir PATH]" >&2; exit 2 ;;
     esac
 done
+
+if [ "$version_requested" = true ]; then
+    case "$version" in
+        ''|*[!0123456789.]*)
+            echo "--version must be X.Y.Z" >&2
+            exit 2
+            ;;
+    esac
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    patch=${remainder#*.}
+    if [ "$remainder" = "$version" ] ||
+       [ "$patch" = "$remainder" ] ||
+       [ -z "$major" ] ||
+       [ -z "$minor" ] ||
+       [ -z "$patch" ]; then
+        echo "--version must be X.Y.Z" >&2
+        exit 2
+    fi
+    case "$patch" in
+        *.*)
+            echo "--version must be X.Y.Z" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64) target=aarch64-apple-darwin ;;
@@ -25,8 +53,7 @@ case "$version" in
             https://github.com/dcchuck/car-go-clean/releases/latest | sed -n 's#.*/tag/\(v[^/]*\)$#\1#p')
         [ -n "$tag" ] || { echo "could not resolve the latest release tag" >&2; exit 1; }
         ;;
-    [0-9]*.[0-9]*.[0-9]*) tag="v$version" ;;
-    *) echo "--version must be X.Y.Z" >&2; exit 2 ;;
+    *) tag="v$version" ;;
 esac
 
 archive_name="car-go-clean-$target.tar.xz"

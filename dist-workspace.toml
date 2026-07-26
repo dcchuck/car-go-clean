@@ -22,7 +22,7 @@ tap = "dcchuck/homebrew-tap"
 # Steps injected into each local build job after checkout.
 github-build-setup = "../release-build-setup.yml"
 # Publish jobs to run in CI
-publish-jobs = ["homebrew", "./publish-shell-installer"]
-github-custom-job-permissions = { "publish-shell-installer" = { contents = "write", attestations = "write", id-token = "write" } }
-# Post-announce jobs to run in CI
-post-announce-jobs = ["./release-verify"]
+publish-jobs = ["./publish-shell-installer", "./publish-homebrew-formula"]
+github-custom-job-permissions = { "publish-shell-installer" = { contents = "write", attestations = "write", id-token = "write" }, "publish-homebrew-formula" = { contents = "read" } }
+# release.yml contains required repository-owned draft verification gates.
+allow-dirty = ["ci"]

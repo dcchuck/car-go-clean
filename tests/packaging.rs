@@ -77,11 +77,14 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
         "x86_64-unknown-linux-musl",
         "github-attestations = true",
         "tap = \"dcchuck/homebrew-tap\"",
-        "publish-jobs = [\"homebrew\", \"./publish-shell-installer\"]",
-        "github-custom-job-permissions = { \"publish-shell-installer\" = { contents = \"write\", attestations = \"write\", id-token = \"write\" } }",
+        "publish-jobs = [\"./publish-shell-installer\", \"./publish-homebrew-formula\"]",
+        "\"publish-shell-installer\" = { contents = \"write\", attestations = \"write\", id-token = \"write\" }",
+        "\"publish-homebrew-formula\" = { contents = \"read\" }",
+        "allow-dirty = [\"ci\"]",
     ] {
         assert!(dist.contains(value), "missing {value}");
     }
+    assert!(!dist.contains("post-announce-jobs"));
 }
 
 #[test]
@@ -95,6 +98,36 @@ fn release_workflow_is_tag_only_and_uses_dist() {
     assert!(workflow.contains("HOMEBREW_TAP_TOKEN"));
     assert!(workflow.contains("\"attestations\": \"write\""));
     assert!(workflow.contains("Enforce annotated vX.Y.Z release tag"));
+    assert!(workflow.contains("\n  release-preflight:\n"));
+    assert!(workflow.contains("HOMEBREW_TAP_TOKEN is required"));
+    assert!(workflow.contains("gh release create"));
+    assert!(workflow.contains("--draft"));
+    assert!(!workflow.contains("\n  publish-homebrew-formula:\n"));
+    assert!(workflow.contains("\n  custom-publish-homebrew-formula:\n"));
+    assert!(workflow.contains("\n  custom-release-verify:\n"));
+    assert!(workflow.contains("needs.custom-release-verify.result == 'success'"));
+    assert!(workflow.contains("gh release edit"));
+    assert!(workflow.contains("--draft=false"));
+
+    let host = workflow
+        .split("\n  host:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  custom-publish-shell-installer:\n")
+        .next()
+        .unwrap();
+    assert!(host.contains("- release-preflight"));
+    assert!(host.contains("needs.release-preflight.result == 'success'"));
+
+    let verification = workflow
+        .split("\n  custom-release-verify:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  announce:\n")
+        .next()
+        .unwrap();
+    assert!(verification.contains("- custom-publish-shell-installer"));
+    assert!(verification.contains("- custom-publish-homebrew-formula"));
 }
 
 #[test]
@@ -109,7 +142,31 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(ci.contains("make test-installer"));
     assert!(build_setup.contains("cargo fmt --all -- --check"));
     assert!(release.contains("publish-shell-installer"));
+    assert!(release.contains("publish-homebrew-formula"));
     assert!(release.contains("Enforce annotated vX.Y.Z release tag"));
     assert!(verify.contains("health --skip-cargo"));
     assert!(verify.contains("brew audit --strict Formula/car-go-clean.rb"));
+    assert!(verify.contains("gh release download"));
+    assert!(verify.contains("formula/car-go-clean-$TAG"));
+    assert!(!verify.contains("git clone https://github.com/dcchuck/homebrew-tap"));
+
+    let formula = repo_file(".github/workflows/publish-homebrew-formula.yml");
+    assert!(formula.contains("HOMEBREW_TAP_TOKEN"));
+    assert!(formula.contains("formula/car-go-clean-$TAG"));
+    assert!(formula.contains("gh pr create"));
+    assert!(formula.contains("gh pr edit"));
+    assert!(formula.contains("contents: read"));
+    assert!(formula.contains("git push --set-upstream origin \"HEAD:refs/heads/$BRANCH\""));
+}
+
+#[test]
+fn release_runbook_documents_the_guarded_draft_publication_flow() {
+    let runbook = repo_file("docs/releasing.md");
+
+    assert!(runbook.contains("HOMEBREW_TAP_TOKEN"));
+    assert!(runbook.contains("gh secret set HOMEBREW_TAP_TOKEN"));
+    assert!(runbook.contains("draft"));
+    assert!(runbook.contains("formula-bump pull request"));
+    assert!(runbook.contains("publishes the draft only after"));
+    assert!(!runbook.contains("After GitHub has published the release"));
 }

@@ -29,15 +29,17 @@ jobs:
     steps:
       - name: Download and verify release archive
         env:
+          GH_TOKEN: ${{ github.token }}
           PLAN: ${{ inputs.plan }}
           TARGET: ${{ matrix.target }}
         run: |
-          TAG="$(jq -r '.announcement_tag' <<< "$PLAN")"
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
           ARCHIVE="car-go-clean-${TARGET}.tar.xz"
           CHECKSUM_FILE="${ARCHIVE}.sha256"
-          BASE_URL="https://github.com/dcchuck/car-go-clean/releases/download/$TAG"
-          curl --fail --location --remote-name "$BASE_URL/$CHECKSUM_FILE"
-          curl --fail --location --remote-name "$BASE_URL/$ARCHIVE"
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$CHECKSUM_FILE" \
+            --pattern "$ARCHIVE"
           EXPECTED_HASH="$(awk -v archive="$ARCHIVE" '
             NF {
               count++
@@ -71,20 +73,34 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Clone public tap
-        run: git clone https://github.com/dcchuck/homebrew-tap
-      - name: Audit formula and release hashes
         env:
           PLAN: ${{ inputs.plan }}
         run: |
-          TAG="$(jq -r '.announcement_tag' <<< "$PLAN")"
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          BRANCH="formula/car-go-clean-$TAG"
+          git clone --branch "$BRANCH" --single-branch https://github.com/dcchuck/homebrew-tap homebrew-tap
+      - name: Audit formula and release hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
           FORMULA="homebrew-tap/Formula/car-go-clean.rb"
           grep -Fq "$TAG" "$FORMULA"
+          mkdir release-assets
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            ARCHIVE="car-go-clean-${TARGET}.tar.xz"
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "${ARCHIVE}.sha256" \
+              --dir release-assets
+          done
           cd homebrew-tap
           FORMULA="Formula/car-go-clean.rb"
           brew audit --strict Formula/car-go-clean.rb
           for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
             ARCHIVE="car-go-clean-${TARGET}.tar.xz"
-            CHECKSUM="$(curl --fail --location --silent "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/${ARCHIVE}.sha256" | awk -v archive="$ARCHIVE" '
+            CHECKSUM="$(awk -v archive="$ARCHIVE" '
               NF {
                 count++
                 if (count != 1 || NF != 2 || $2 != archive) {
@@ -97,7 +113,7 @@ jobs:
                   exit 1
                 }
               }
-            ')"
+            ' "../release-assets/${ARCHIVE}.sha256")"
             test -n "$CHECKSUM"
             grep -Fq "$CHECKSUM" "$FORMULA"
           done
