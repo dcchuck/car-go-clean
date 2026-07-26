@@ -813,6 +813,62 @@
   git commit -m "docs: publish cross-platform installation guide"
   ```
 
+## Final-review remediation (2026-07-25)
+
+This section supersedes earlier Task 2, Task 3, and Task 5 details where they
+conflict. It records defects found in the comprehensive final review and must
+be completed as one reviewed fix wave before the first tag.
+
+**Root causes:** the POSIX shell glob used for `--version` is not an exact
+SemVer parser; service uninstallation treats macOS command failures too
+broadly and binary resolution treats a bare command name as a current-directory
+path; cargo-dist's built-in Homebrew publisher pushes directly to the tap; and
+cargo-dist's documented `post-announce-jobs` extension runs only after release
+publication. Its `github-build-setup` extension runs before `dist build`, so
+it cannot smoke-test produced archives.
+
+**Required corrections:**
+
+1. The installer must accept a pinned version only when it has exactly three
+   nonempty decimal components (`X.Y.Z`). Reject suffixes, additional
+   components, paths, whitespace, and other characters before any network
+   request. Extend the hermetic shell tests with malformed pinned-version
+   cases that assert no fake `curl` invocation.
+2. `resolve_service_binary` must resolve an absolute `argv0` only when it is
+   executable; resolve a relative `argv0` against the current directory only
+   when it contains a path separator; resolve a bare command name through the
+   supplied `PATH`; then fall back to an executable absolute `current_exe`.
+   Add regression tests for a non-executable current-directory impostor and a
+   non-executable absolute candidate.
+3. macOS `service uninstall` may ignore only a known launchd
+   absent/not-loaded response. On any other failed `launchctl bootout`, return
+   an error and preserve the plist. Add fake-runner tests for both an allowed
+   missing response and an unexpected permission/domain failure.
+4. Replace cargo-dist's built-in `homebrew` publish job with a tracked custom
+   `publish-homebrew-formula` reusable workflow. It uses the fine-grained
+   `HOMEBREW_TAP_TOKEN` only to create or update a deterministic formula-bump
+   branch and pull request in `dcchuck/homebrew-tap`; it never pushes the tap
+   default branch. Keep Homebrew in `installers` so cargo-dist still generates
+   the formula artifact. Do not create a tag, release, PR, or secret while
+   implementing this repository change.
+5. Require a nonempty `HOMEBREW_TAP_TOKEN` in the release workflow before the
+   host job can create a draft release. The current empty secret list is an
+   external first-release prerequisite; document the exact `gh secret set`
+   operation without printing a token.
+6. The generated release workflow must make the GitHub Release a **draft**,
+   upload the shell installer and formula-bump PR against that draft, then run
+   the four-target archive checksum/executable smoke checks and formula audit
+   against the deterministic PR branch. `announce` may publish the draft only
+   after all those jobs succeed. Delete the `post-announce-jobs` wiring. This
+   manual workflow wiring is required because cargo-dist 0.32 offers no custom
+   job stage that can make archive-level checks gate `host`; preserve and test
+   it after regenerating the cargo-dist portions.
+7. Update workflow-contract tests and release documentation to assert and
+   explain draft-before-verify-before-publication behavior, formula-bump PRs,
+   strict pinned versions, and the required tap token. Run formatter, strict
+   Clippy, the full test suite, installer tests, owned-workflow `actionlint`,
+   and a non-publishing `dist plan --tag v0.2.0`.
+
 ## Plan Self-Review
 
 ### Spec coverage
