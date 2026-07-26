@@ -34,11 +34,11 @@ fourth component, whitespace, or path characters.
 The workflow first creates a GitHub draft containing four target archives
 (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`), a matching
-`.sha256` file for each archive, provenance attestations, the
-`car-go-clean-installer.sh` asset, and the generated Homebrew formula. The tap
-publisher pushes that formula only to the deterministic
-`formula/car-go-clean-vX.Y.Z` branch and opens or updates a formula-bump pull request;
-it never pushes the tap's default branch.
+`.sha256` file for each archive, and provenance attestations. After that draft
+exists, one publisher uploads `car-go-clean-installer.sh` to it while the tap
+publisher pushes the generated formula only to the deterministic
+`formula/car-go-clean-vX.Y.Z` branch. It opens or updates a formula-bump pull request
+and never pushes the tap's default branch.
 
 [release verification workflow](https://github.com/dcchuck/car-go-clean/blob/main/.github/workflows/release-verify.yml)
 downloads each archive from the authenticated draft, verifies its checksum,
