@@ -99,38 +99,15 @@ clean_interval = "24h"
 scan_interval = "1d"
 ```
 
-The default scan interval is one day. When a scan finds a primary Git checkout,
-it also discovers linked Rust worktrees that Git reports within the configured
-scan roots. This includes Git-reported worktrees hidden by ignore rules;
-configured exclusions and the normal cleaning safeguards still apply. A
-successful enumeration also removes previously cached Git candidates that are
-now excluded or outside the configured scan roots. Explicitly configured
-`project_dirs` may authorize projects outside the scan roots, but never
-override configured exclusions.
+- `scan_dirs` controls discovery roots; the default is `$HOME`.
+- `project_dirs` can add explicit projects outside those roots; `excludes`
+  always wins.
+- Git-reported linked worktrees are discovered conservatively. A discovery
+  failure blocks the affected primary/worktree set until a later success.
+- Review before cleanup with `car-go-clean run --dry-run`.
 
-If Git worktree discovery fails for a primary checkout, the failure is recorded
-as an ordinary scan error, which retains the usual recent, hierarchical
-scan-error behavior. Independently, the canonical primary and exactly the
-linked worktrees saved for it remain blocked until a later successful discovery
-replaces the association. That persistent block normally does not extend to
-ancestors, siblings, or other projects. New failures retain the primary's
-canonical identity at failure time, so a primary alias changing targets cannot
-transfer or clear the old failure. Successful linked-worktree associations also
-retain the canonical primary identity, and their persisted primary identity is
-not rewritten from a later filesystem target. Saved linked-path spellings are
-likewise immutable outside a successful enumeration; ordinary cache
-canonicalization only moves project review rows. Migrated primary aliases in
-either failure or association state are trusted only when the persisted primary
-was already canonical; unresolvable or noncanonical legacy associations are
-never inferred from their current target or discarded merely because a new
-checkout reuses the same path spelling. While any discovery failure is active,
-such untrusted legacy association state blocks all cached projects. As another
-conservative fallback, if a saved linked identity is unresolvable or no longer
-canonical, all cached projects are temporarily blocked until successful
-discovery safely replaces the association. Discovery-error diagnostics remain
-in history, but a successful enumeration resolves their safety effect for that
-primary immediately; unrelated ordinary scan errors remain effective. An
-explicit forced run still bypasses either durable block.
+See the [Configuration reference](docs/configuration.md) for the complete
+safety, worktree, state, log, and scheduler behavior.
 
 ## Safe Cleaning Model
 
@@ -147,42 +124,6 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 - No running process has a cwd or command argument inside the project or
   `target/`.
 
-Cached project rows are canonicalized to their current physical locations
-before these gates run, even when immutable discovery provenance retains an
-older primary spelling. This keeps cache/container classification physical
-without transferring or clearing historical worktree associations.
-
-On Unix, Rust compiler path options are parsed as native OS bytes, so non-UTF-8
-path suffixes in `--manifest-path`, `--target-dir`, `--out-dir`, `--extern`,
-`--emit`, `-L`, and `--library-path` still protect the matching canonical
-project.
-
-The default `target_quiet_period` is `2h`.
-
-Use these commands to review or override the default policy:
-
-- `car-go-clean run --dry-run` refreshes the safety review, prints a compact
-  summary and target preview, and does not delete any `target/` directories.
-- `car-go-clean run --dry-run --all` prints every cleanable target path.
-- `car-go-clean run --include-managed-cache` includes known managed cache and
-  container storage paths in the review policy.
-- `car-go-clean run --include-active` includes projects with active process
-  matches in the review policy.
-- `car-go-clean run --force` bypasses policy gates except the direct,
-  readable `project/target` requirement.
-- `car-go-clean status` reports the last saved safety review without doing a
-  live filesystem/process review.
-- `car-go-clean status --refresh` recomputes and saves the safety review.
-- `car-go-clean projects` refreshes the review and prints a compact summary.
-- `car-go-clean projects --all` prints every cached project decision.
-- `car-go-clean projects --risky` previews decisions with managed cache and
-  container storage paths included.
-- `car-go-clean projects --active` previews decisions with active process paths
-  included.
-- `car-go-clean projects --json` emits structured project review data.
-- `car-go-clean logs --errors-only` shows scan, review, and clean diagnostics,
-  including unreadable directories.
-
 ## Commands
 
 | Command | Purpose |
@@ -197,15 +138,6 @@ Use these commands to review or override the default policy:
 | `car-go-clean logs` | Tail logs or show recent stored errors. |
 | `car-go-clean config` | Print effective config. |
 | `car-go-clean version` | Print version. |
-
-State lives under `$XDG_STATE_HOME/car-go-clean`, falling back to
-`$HOME/.local/state/car-go-clean`.
-
-Daemon logs are newline-delimited JSON written to the state directory at
-`car-go-clean.log`. Logs rotate automatically as `car-go-clean.log.1`,
-`car-go-clean.log.2`, and so on.
-Unreadable directories are skipped during scans and recorded as scan errors;
-view them with `car-go-clean logs --errors-only`.
 
 ## Fresh Install Validation
 

@@ -57,6 +57,33 @@ fn readme_uses_compact_logo_asset() {
 }
 
 #[test]
+fn configuration_reference_preserves_operational_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = repo_file("README.md");
+    let guide = repo_file("docs/configuration.md");
+
+    assert!(root.join("docs/configuration.md").is_file());
+    assert!(readme.contains("[Configuration reference](docs/configuration.md)"));
+    for value in [
+        "scan_dirs",
+        "project_dirs",
+        "excludes",
+        "clean_interval",
+        "scan_interval",
+        "target_quiet_period",
+        "log_level",
+        "XDG_STATE_HOME",
+        "linked worktrees",
+        "discovery failure",
+        "run --dry-run",
+        "run --force",
+        "car-go-clean.log",
+    ] {
+        assert!(guide.contains(value), "missing {value}");
+    }
+}
+
+#[test]
 fn release_packaging_documents_tagged_binary_distribution() {
     let release = repo_file("packaging/release/README.md");
 
