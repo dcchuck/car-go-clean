@@ -1,7 +1,7 @@
 # Releasing car-go-clean
 
 Releases are tag-driven GitHub Releases. Begin from a clean checkout of the
-verified commit that will become `v0.2.0`; do not create a release from local
+verified commit that will become `v0.3.0`; do not create a release from local
 uncommitted work. Before tagging, ensure the public
 [`dcchuck/homebrew-tap`](https://github.com/dcchuck/homebrew-tap) repository
 exists and that this repository has the `HOMEBREW_TAP_TOKEN` Actions secret
@@ -21,14 +21,14 @@ mise exec rust@1.95.0 -- cargo fmt --all -- --check
 mise exec rust@1.95.0 -- cargo clippy --all-targets --locked -- -D warnings
 mise exec rust@1.95.0 -- cargo test --locked
 make test-installer
-dist plan --tag v0.2.0 --output-format=json
-git tag -a v0.2.0 -m "car-go-clean v0.2.0"
-git push origin main v0.2.0
+dist plan --tag v0.3.0 --output-format=json
+git tag -a v0.3.0 -m "car-go-clean v0.3.0"
+git push origin main v0.3.0
 ```
 
 The release workflow accepts only an annotated `vX.Y.Z` tag whose version
 matches `Cargo.toml`. The shell installer's `--version` option likewise accepts
-only exactly three decimal components such as `0.2.0`, with no prefix, suffix,
+only exactly three decimal components such as `0.3.0`, with no prefix, suffix,
 fourth component, whitespace, or path characters.
 
 The workflow first creates a GitHub draft containing four target archives

@@ -103,7 +103,7 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
     let manifest = repo_file("Cargo.toml");
     let dist = repo_file("dist-workspace.toml");
     for value in [
-        "version = \"0.2.0\"",
+        "version = \"0.3.0\"",
         "repository = \"https://github.com/dcchuck/car-go-clean\"",
         "homepage = \"https://github.com/dcchuck/car-go-clean\"",
     ] {
