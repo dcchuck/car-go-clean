@@ -1,6 +1,6 @@
 # One-Shot Cleanup and Agent Quick Start
 
-**Status:** Behavior approved; written specification awaiting user review
+**Status:** Approved
 
 ## Problem
 
