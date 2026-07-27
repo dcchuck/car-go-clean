@@ -27,4 +27,6 @@ jobs:
       - name: Check shell installer
         run: make test-installer
       - name: Plan release artifacts
-        run: dist plan --tag v0.2.0 --output-format=json
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "car-go-clean").version')"
+          dist plan --tag "v$VERSION" --output-format=json

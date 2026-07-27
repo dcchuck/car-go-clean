@@ -180,6 +180,9 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(ci.contains("cargo test --locked"));
     assert!(ci.contains("cargo clippy --all-targets --locked -- -D warnings"));
     assert!(ci.contains("make test-installer"));
+    assert!(ci.contains("cargo metadata --no-deps --format-version 1"));
+    assert!(ci.contains("dist plan --tag \"v$VERSION\" --output-format=json"));
+    assert!(!ci.contains("dist plan --tag v0.3.0"));
     assert!(build_setup.contains("cargo fmt --all -- --check"));
     assert!(release.contains("publish-shell-installer"));
     assert!(release.contains("publish-homebrew-formula"));
