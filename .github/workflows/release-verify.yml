@@ -44,7 +44,7 @@ jobs:
           EXPECTED_HASH="$(awk -v archive="$ARCHIVE" '
             NF {
               count++
-              if (count != 1 || NF != 2 || $2 != archive) {
+              if (count != 1 || NF != 2 || ($2 != archive && $2 != "*" archive)) {
                 exit 1
               }
               print $1
@@ -65,8 +65,8 @@ jobs:
           tar -xJf "$ARCHIVE"
       - name: Smoke test executable
         run: |
-          ./car-go-clean version
-          ./car-go-clean health --skip-cargo
+          ./car-go-clean-${{ matrix.target }}/car-go-clean version
+          ./car-go-clean-${{ matrix.target }}/car-go-clean health --skip-cargo
 
   formula:
     name: Verify Homebrew formula
@@ -104,7 +104,7 @@ jobs:
             CHECKSUM="$(awk -v archive="$ARCHIVE" '
               NF {
                 count++
-                if (count != 1 || NF != 2 || $2 != archive) {
+                if (count != 1 || NF != 2 || ($2 != archive && $2 != "*" archive)) {
                   exit 1
                 }
                 print $1
