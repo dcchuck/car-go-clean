@@ -1,0 +1,37 @@
+class CarGoClean < Formula
+  desc "Periodically cleans Rust project build artifacts and tracks reclaimed disk space"
+  homepage "https://github.com/dcchuck/car-go-clean"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/dcchuck/car-go-clean/releases/download/__TAG__/car-go-clean-aarch64-apple-darwin.tar.xz"
+      sha256 "__AARCH64_APPLE_SHA256__"
+    end
+
+    on_intel do
+      url "https://github.com/dcchuck/car-go-clean/releases/download/__TAG__/car-go-clean-x86_64-apple-darwin.tar.xz"
+      sha256 "__X86_64_APPLE_SHA256__"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/dcchuck/car-go-clean/releases/download/__TAG__/car-go-clean-aarch64-unknown-linux-musl.tar.xz"
+      sha256 "__AARCH64_LINUX_SHA256__"
+    end
+
+    on_intel do
+      url "https://github.com/dcchuck/car-go-clean/releases/download/__TAG__/car-go-clean-x86_64-unknown-linux-musl.tar.xz"
+      sha256 "__X86_64_LINUX_SHA256__"
+    end
+  end
+
+  def install
+    bin.install "car-go-clean"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/car-go-clean version")
+  end
+end

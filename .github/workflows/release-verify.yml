@@ -96,9 +96,12 @@ jobs:
               --pattern "${ARCHIVE}.sha256" \
               --dir release-assets
           done
+          TAP="dcchuck/tap"
+          brew tap --custom-remote "$TAP" "$PWD/homebrew-tap"
+          trap 'brew untap "$TAP"' EXIT
+          brew audit --strict "$TAP/car-go-clean"
           cd homebrew-tap
           FORMULA="Formula/car-go-clean.rb"
-          brew audit --strict Formula/car-go-clean.rb
           for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
             ARCHIVE="car-go-clean-${TARGET}.tar.xz"
             CHECKSUM="$(awk -v archive="$ARCHIVE" '

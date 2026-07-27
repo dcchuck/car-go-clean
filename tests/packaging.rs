@@ -185,7 +185,8 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(release.contains("publish-homebrew-formula"));
     assert!(release.contains("Enforce annotated vX.Y.Z release tag"));
     assert!(verify.contains("health --skip-cargo"));
-    assert!(verify.contains("brew audit --strict Formula/car-go-clean.rb"));
+    assert!(verify.contains("brew tap --custom-remote \"$TAP\""));
+    assert!(verify.contains("brew audit --strict \"$TAP/car-go-clean\""));
     assert!(verify.contains("gh release download"));
     assert!(verify.contains("formula/car-go-clean-$TAG"));
     assert!(!verify.contains("git clone https://github.com/dcchuck/homebrew-tap"));
@@ -197,6 +198,12 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(formula.contains("gh pr edit"));
     assert!(formula.contains("contents: read"));
     assert!(formula.contains("git push --set-upstream origin \"HEAD:refs/heads/$BRANCH\""));
+    assert!(formula.contains("packaging/release/homebrew/car-go-clean.rb.in"));
+
+    let formula_template = repo_file("packaging/release/homebrew/car-go-clean.rb.in");
+    assert!(formula_template.contains("on_macos do"));
+    assert!(formula_template.contains("on_linux do"));
+    assert!(formula_template.contains("test do"));
 }
 
 #[test]
