@@ -362,6 +362,10 @@ impl Scanner {
         }
     }
 
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
+        self.should_skip(path)
+    }
+
     fn should_skip(&self, path: &Path) -> bool {
         if path_matches_exclude(path, "target") {
             return true;

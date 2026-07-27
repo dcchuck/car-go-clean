@@ -3275,6 +3275,91 @@ fn daemon_defaults_to_daily_scans() {
 }
 
 #[test]
+fn successful_scan_prunes_cached_excluded_candidates_and_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let excluded_root = root.path().join("OrbStack");
+    let excluded = excluded_root.join("docker/volumes/copied-crate");
+    let kept = root.path().join("src/kept");
+    fs::create_dir_all(excluded.join(".git")).unwrap();
+    write_file(&excluded.join("Cargo.toml"), b"[package]\nname='copied'\n");
+    write_file(&kept.join("Cargo.toml"), b"[package]\nname='kept'\n");
+    write_file(&kept.join("target/blob.bin"), &[0; 2048]);
+    let excluded = excluded.canonicalize().unwrap();
+    let kept = kept.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store.upsert_project(&excluded, now).unwrap();
+    store
+        .mark_worktree_discovery_failed(&excluded, now, "old dubious ownership")
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "worktree_discovery".to_string(),
+            path: Some(excluded.to_string_lossy().into_owned()),
+            message: "historical dubious ownership".to_string(),
+        })
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![excluded_root.to_string_lossy().into_owned()],
+            },
+            Arc::new(FakeWorktreeResolver::failure(
+                "excluded Git repository was inspected",
+            )),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    daemon.scan_cycle().unwrap();
+
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| PathBuf::from(project.path))
+            .collect::<Vec<_>>(),
+        vec![kept.clone()]
+    );
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(runner.calls.lock().unwrap()[0].dir, kept);
+}
+
+#[test]
 fn daemon_clamps_only_legacy_scan_deadlines_beyond_the_current_interval() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     let interval = Duration::from_secs(24 * 60 * 60);

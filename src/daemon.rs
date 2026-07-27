@@ -119,6 +119,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             })?;
         }
         self.store.normalize_resolvable_project_aliases()?;
+        self.store
+            .reconcile_excluded_discovery_state(|path| self.scanner.is_excluded(path))?;
         for discovery in report.worktree_discoveries {
             match discovery {
                 WorktreeDiscovery::Success {
