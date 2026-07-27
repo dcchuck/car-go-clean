@@ -28,20 +28,92 @@ Intel (`x86_64-apple-darwin`), plus Linux ARM64
 downloads the matching release archive and its `.sha256` file, verifies the
 SHA-256 checksum before replacing the binary, and does not require `sudo`.
 
-By default it installs to `$HOME/.local/bin`. After a release such as `v0.2.0`
+By default it installs to `$HOME/.local/bin`. After a release such as `v0.4.0`
 has been published, pin it or choose another location when needed:
 
 ```sh
+VERSION=0.4.0
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh \
-  | sh -s -- --version 0.2.0 --install-dir "$HOME/.local/bin"
+  | sh -s -- --version "$VERSION" --install-dir "$HOME/.local/bin"
 ```
 
-Both installation paths install or upgrade only the binary; neither path starts
-the daemon. The binary installer does not start the daemon. Activate daemon
-management explicitly after installation.
+Both installation paths install or upgrade only the binary, and the installer does not start the daemon.
+Activate daemon management explicitly after installation.
 
-## Explicit Service Activation
+## Quick Start
+
+Check the installation and preview every eligible cleanup target:
+
+```sh
+car-go-clean health
+car-go-clean run --dry-run --all
+```
+
+`run` scans automatically before it reviews or cleans. The preview does not
+invoke Cargo, and installation does not start the background service. The
+default quiet period, active-process checks, scan-error checks, managed-storage
+checks, and direct-target checks all remain in effect.
+
+After reviewing the preview:
+
+```sh
+car-go-clean run
+car-go-clean stats
+```
+
+A real run has no interactive confirmation. For advanced cached-only use,
+`car-go-clean run --no-scan` skips discovery but does not relax any safety
+gate.
+
+## Agent Quick Start
+
+Copy this prompt into your coding agent:
+
+> Install and configure the latest stable release of `car-go-clean` from its
+> canonical repository:
+>
+> https://github.com/dcchuck/car-go-clean
+>
+> Before acting, read the current README and latest release. Use only these
+> official installation sources:
+>
+> - Homebrew formula: `dcchuck/tap/car-go-clean`
+> - Checksum-verifying installer:
+>   `https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh`
+>
+> Do not use a similarly named package from another repository or registry.
+>
+> First inspect this machine's operating system, architecture, available
+> package manager, Cargo availability, existing `car-go-clean` installation,
+> configuration, and service status. Recommend Homebrew or the verified shell
+> installer and briefly explain why.
+>
+> Install or upgrade the binary, verify the installed version, and run:
+>
+> ```sh
+> car-go-clean health
+> car-go-clean run --dry-run --all
+> ```
+>
+> Explain what would be cleaned, what would be skipped, and why. Then
+> recommend either one-shot usage or the background service based on how this
+> machine is used.
+>
+> Inspection, installation or upgrade, health checks, and the dry run are
+> authorized by this prompt. Ask before:
+>
+> - Performing actual cleanup.
+> - Installing or enabling the background service.
+> - Changing configuration or exclusions.
+> - Using `--force`, `--include-active`, or `--include-managed-cache`.
+> - Cloning and building from source.
+>
+> Do not weaken safety checks, manually delete `target/` directories, or work
+> around scan errors or process locks. Report blockers and final results
+> clearly.
+
+## Background Service (Optional)
 
 `car-go-clean` uses a per-user launchd service on macOS and a per-user systemd
 service on Linux. Installation does not enable either service. Manage it only
@@ -56,26 +128,6 @@ car-go-clean service uninstall
 
 After upgrading a binary, run `car-go-clean service restart` if you have
 already installed the service and want the daemon to use the new binary.
-
-## Developer Installation
-
-```bash
-cargo install --path .
-```
-
-Or run from the repository:
-
-```bash
-cargo run -- scan
-cargo run -- run
-cargo run -- stats
-```
-
-This checkout also works with the local mise toolchain:
-
-```bash
-mise exec rust@1.95.0 -- cargo test
-```
 
 ## Configuration
 
@@ -133,7 +185,7 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 | --- | --- |
 | `car-go-clean daemon` | Long-running scheduler. |
 | `car-go-clean scan` | Refresh the project cache. |
-| `car-go-clean run` | Run one clean cycle now. |
+| `car-go-clean run` | Scan, then run one cleanup review/cycle now. |
 | `car-go-clean health` | Validate config, Cargo availability, and state DB access. |
 | `car-go-clean status` | Show cached project count, last saved safety review, scheduler timing, and last run summary. |
 | `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |
@@ -141,37 +193,6 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 | `car-go-clean logs` | Tail logs or show recent stored errors. |
 | `car-go-clean config` | Print effective config. |
 | `car-go-clean version` | Print version. |
-
-## Fresh Install Validation
-
-```bash
-mise exec rust@1.95.0 -- cargo install --path . --force
-car-go-clean health --skip-cargo
-car-go-clean scan
-car-go-clean status
-car-go-clean run --dry-run
-car-go-clean status
-car-go-clean projects
-car-go-clean projects --all
-car-go-clean projects --json > /tmp/car-go-clean-projects.json
-car-go-clean logs --errors-only
-```
-
-Validation points:
-
-- `status` should be fast; before the first review it reports `Last review:
-  <none>`, and after `run --dry-run` it reports the saved review summary.
-- `status` should show `Clean interval`, `Scan interval`, and the next
-  scheduled clean/scan time once the daemon has recorded scheduler state.
-- `projects` should show a compact summary by default.
-- `projects --all` should show why each cached project is cleanable or skipped.
-- Unreadable directories such as protected macOS library folders should appear
-  in `logs --errors-only`.
-- `run --dry-run` should list a cleanable target preview and should not delete
-  any `target/` directories.
-- `run --dry-run --all` should list every cleanable target.
-- A real `run` should clean only rows reported as `cleanable` by the same
-  review policy.
 
 ## Services And Packaging
 
@@ -189,10 +210,31 @@ plus `clean_interval` when there has never been a run.
 ## Development
 
 ```bash
+cargo install --path .
+```
+
+Or run from the repository:
+
+```bash
+cargo run -- scan
+cargo run -- run
+cargo run -- stats
+```
+
+This checkout also works with the local mise toolchain:
+
+```bash
+mise exec rust@1.95.0 -- cargo test
+```
+
+```bash
 mise exec rust@1.95.0 -- cargo fmt -- --check
 mise exec rust@1.95.0 -- cargo test
 mise exec rust@1.95.0 -- cargo clippy --all-targets -- -D warnings
 mise exec rust@1.95.0 -- cargo build
 ```
+
+See [Fresh install validation](docs/fresh-install-validation.md) for the
+source-checkout and released-binary smoke tests.
 
 See `docs/superpowers/specs/` for the design.
