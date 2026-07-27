@@ -23,6 +23,30 @@ log_level = "info"
 `warn`, or `error`. Tilde and environment variables expand in `scan_dirs` and
 `project_dirs`.
 
+### Default exclusions
+
+The scanner always prunes `target` because it is build output. The editable
+component defaults `.git` and `node_modules` apply wherever those directory
+names occur.
+
+The following editable defaults are anchored to `$HOME`:
+
+- All supported hosts: `.cargo`, `.rustup`, `.cache`,
+  `.bun/install/cache`, `go/pkg/mod`, `.colima`, `.lima`, and
+  `.local/share/containers`.
+- macOS: `Library`, `.Trash`, and `OrbStack`.
+- Linux: `.local/share/docker`, `.docker/desktop`,
+  `.local/share/rancher-desktop`, and `.local/share/Trash`.
+
+Docker Desktop and Rancher Desktop data on macOS are covered by `Library`.
+System-wide Docker Engine data on Linux normally lives outside `$HOME`.
+
+An explicit `excludes` array replaces these editable defaults. Excluded
+trees are pruned before filesystem or Git inspection. After a successful
+scan, cached discovery candidates and active worktree-discovery state that
+now match an exclusion are removed; project files and historical diagnostics
+are retained.
+
 ## Scan scope
 
 - `scan_dirs` lists roots to discover Rust projects. The default is `$HOME`.
@@ -30,6 +54,10 @@ log_level = "info"
   roots.
 - `excludes` omits matching paths. Exclusions always win, including over an
   explicit `project_dirs` entry.
+
+A discovery candidate is any directory containing `Cargo.toml`. It becomes a
+valid cleanup target only when its direct, non-symlink `target/` exists and
+all safety gates pass.
 
 ## Linked worktrees and discovery failures
 

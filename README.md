@@ -100,6 +100,9 @@ scan_interval = "1d"
 ```
 
 - `scan_dirs` controls discovery roots; the default is `$HOME`.
+- Platform-aware defaults prune operating-system, package-manager, container,
+  and VM storage before traversal; see the configuration reference for the
+  exact macOS and Linux lists.
 - `project_dirs` can add explicit projects outside those roots; `excludes`
   always wins.
 - Git-reported linked worktrees are discovered conservatively. A discovery
