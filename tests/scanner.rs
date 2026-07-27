@@ -684,3 +684,35 @@ fn scan_rejects_non_utf8_linked_path_as_discovery_failure() {
     ));
     assert_eq!(report.errors[0].path, canonical_primary);
 }
+
+#[test]
+fn absolute_home_exclusion_prunes_before_manifest_and_git_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let excluded = home.join("Library");
+    let legitimate = home.join("code/Library/project");
+    write_file(
+        &excluded.join("container-copy/Cargo.toml"),
+        "[package]\nname='container-copy'\nversion='0.1.0'\n",
+    );
+    fs::create_dir_all(excluded.join("container-copy/.git")).unwrap();
+    write_file(
+        &legitimate.join("Cargo.toml"),
+        "[package]\nname='project'\nversion='0.1.0'\n",
+    );
+    let resolver = FakeResolver::failure("excluded Git repository was inspected");
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![home],
+            project_dirs: vec![],
+            excludes: vec![excluded.to_string_lossy().into_owned()],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+
+    assert_eq!(report.projects, vec![legitimate.canonicalize().unwrap()]);
+    assert!(report.errors.is_empty());
+    assert!(resolver.calls().is_empty());
+}

@@ -174,16 +174,132 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPlatform {
+    MacOs,
+    Linux,
+    Other,
+}
+
+impl HostPlatform {
+    fn current() -> Self {
+        match env::consts::OS {
+            "macos" => Self::MacOs,
+            "linux" => Self::Linux,
+            _ => Self::Other,
+        }
+    }
+}
+
 fn default_excludes() -> Vec<String> {
-    [
-        ".git",
-        "node_modules",
-        ".cargo",
-        ".rustup",
-        "target",
-        "Library/Caches",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    default_excludes_for(&home_dir(), HostPlatform::current())
+}
+
+fn default_excludes_for(home: &Path, platform: HostPlatform) -> Vec<String> {
+    let mut excludes = vec![".git".to_string(), "node_modules".to_string()];
+
+    if home.is_absolute() {
+        for relative in [
+            ".cargo",
+            ".rustup",
+            ".cache",
+            ".bun/install/cache",
+            "go/pkg/mod",
+            ".colima",
+            ".lima",
+            ".local/share/containers",
+        ] {
+            excludes.push(home.join(relative).to_string_lossy().into_owned());
+        }
+
+        let platform_paths: &[&str] = match platform {
+            HostPlatform::MacOs => &["Library", ".Trash", "OrbStack"],
+            HostPlatform::Linux => &[
+                ".local/share/docker",
+                ".docker/desktop",
+                ".local/share/rancher-desktop",
+                ".local/share/Trash",
+            ],
+            HostPlatform::Other => &[],
+        };
+        excludes.extend(
+            platform_paths
+                .iter()
+                .map(|relative| home.join(relative).to_string_lossy().into_owned()),
+        );
+    }
+
+    excludes
+}
+
+#[cfg(test)]
+mod default_exclude_tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn macos_defaults_anchor_managed_and_platform_paths_to_home() {
+        let excludes = default_excludes_for(Path::new("/Users/tester"), HostPlatform::MacOs);
+
+        assert_eq!(
+            excludes,
+            strings(&[
+                ".git",
+                "node_modules",
+                "/Users/tester/.cargo",
+                "/Users/tester/.rustup",
+                "/Users/tester/.cache",
+                "/Users/tester/.bun/install/cache",
+                "/Users/tester/go/pkg/mod",
+                "/Users/tester/.colima",
+                "/Users/tester/.lima",
+                "/Users/tester/.local/share/containers",
+                "/Users/tester/Library",
+                "/Users/tester/.Trash",
+                "/Users/tester/OrbStack",
+            ])
+        );
+        assert!(!excludes.iter().any(|entry| entry == "target"));
+    }
+
+    #[test]
+    fn linux_defaults_cover_rootless_container_and_desktop_vm_storage() {
+        let excludes = default_excludes_for(Path::new("/home/tester"), HostPlatform::Linux);
+
+        assert_eq!(
+            excludes,
+            strings(&[
+                ".git",
+                "node_modules",
+                "/home/tester/.cargo",
+                "/home/tester/.rustup",
+                "/home/tester/.cache",
+                "/home/tester/.bun/install/cache",
+                "/home/tester/go/pkg/mod",
+                "/home/tester/.colima",
+                "/home/tester/.lima",
+                "/home/tester/.local/share/containers",
+                "/home/tester/.local/share/docker",
+                "/home/tester/.docker/desktop",
+                "/home/tester/.local/share/rancher-desktop",
+                "/home/tester/.local/share/Trash",
+            ])
+        );
+        assert!(!excludes.iter().any(|entry| entry == "target"));
+    }
+
+    #[test]
+    fn missing_or_relative_home_never_creates_unanchored_manager_patterns() {
+        assert_eq!(
+            default_excludes_for(Path::new(""), HostPlatform::MacOs),
+            strings(&[".git", "node_modules"])
+        );
+        assert_eq!(
+            default_excludes_for(Path::new("relative-home"), HostPlatform::Linux),
+            strings(&[".git", "node_modules"])
+        );
+    }
 }
