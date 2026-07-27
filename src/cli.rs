@@ -194,28 +194,39 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Refresh the project cache.
     Scan {
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Scan for projects, then run one cleanup review/cycle now.
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Show what would be cleaned without invoking Cargo.
         #[arg(long)]
         dry_run: bool,
+        /// Use cached discovery state instead of scanning first.
+        #[arg(long)]
+        no_scan: bool,
+        /// Include projects under managed cache or container storage.
         #[arg(long)]
         include_managed_cache: bool,
+        /// Include projects used by running processes.
         #[arg(long)]
         include_active: bool,
+        /// Bypass policy gates except the direct readable target requirement.
         #[arg(long)]
         force: bool,
+        /// Show every cleanable target in dry-run output.
         #[arg(long)]
         all: bool,
     },
+    /// Run the long-lived scan and clean scheduler.
     Daemon {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -289,6 +300,7 @@ fn execute(cli: Cli) -> Result<()> {
             config,
             state_dir,
             dry_run,
+            no_scan,
             include_managed_cache,
             include_active,
             force,
@@ -297,6 +309,7 @@ fn execute(cli: Cli) -> Result<()> {
             config,
             state_dir,
             dry_run,
+            no_scan,
             include_managed_cache,
             include_active,
             force,
@@ -510,8 +523,11 @@ fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> 
         .context("another car-go-clean process is running")?;
     let cfg = load_config(config_path)?;
     let store = open_store_at(&path_set)?;
-    let daemon = daemon_for_scan(&store, &cfg);
-    daemon.scan_cycle()?;
+    scan_and_report(&store, &cfg)
+}
+
+fn scan_and_report(store: &Store, cfg: &Config) -> Result<()> {
+    daemon_for_scan(store, cfg).scan_cycle()?;
     println!("Scan complete");
     Ok(())
 }
@@ -520,6 +536,7 @@ fn run_once(
     config_path: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     dry_run: bool,
+    no_scan: bool,
     include_managed_cache: bool,
     include_active: bool,
     force: bool,
@@ -536,6 +553,10 @@ fn run_once(
         force,
     };
     let store = open_store_at(&path_set)?;
+
+    if !no_scan {
+        scan_and_report(&store, &cfg)?;
+    }
 
     if dry_run {
         Cache::new(&store).sync_on_disk()?;
