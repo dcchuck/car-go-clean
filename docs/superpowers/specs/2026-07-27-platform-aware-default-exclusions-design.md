@@ -128,8 +128,10 @@ Home-anchored defaults are represented as absolute paths at runtime because
 the existing matcher treats a relative multi-component exclusion as a
 sequence that can match anywhere in a path.
 
-There is one current user. The existing configuration will be updated
-directly when the feature ships. No generalized migration system is needed.
+There is one current user, and the current installation has no configuration
+file. It uses compiled defaults, so the new profile will apply automatically
+after the binary is upgraded and the daemon is restarted. No local config
+edit or generalized migration system is needed.
 
 Custom manager roots selected through environment variables or application
 settings are outside this change; users can add those paths to `excludes`.
@@ -228,9 +230,9 @@ scanned by default and link to the configuration reference for the detailed
 lists.
 
 This change is suitable for a patch release because it narrows default
-discovery without broadening cleanup authority. The current user's config is
-updated alongside installation of that release, followed by a successful
-scan and verification that OrbStack contributes zero cached candidates.
+discovery without broadening cleanup authority. After installation, restart
+the current user's daemon, run one successful scan, and verify that OrbStack
+contributes zero cached candidates.
 
 ## Reference Locations
 
