@@ -28,7 +28,7 @@
 - Modify `tests/cli.rs`: specify fresh-state dry and real runs, cached-only behavior, help text, fatal scan failure, output ordering, and compatibility with existing cached-state tests.
 - Modify `README.md`: add the human Quick Start and exact Agent Quick Start, move optional service activation below them, and tighten the remaining user journey.
 - Create `docs/fresh-install-validation.md`: hold source-checkout and released-binary validation, including a fresh-state one-shot Rust-project test.
-- Modify `tests/packaging.rs`: enforce README order, canonical installation sources, consent boundaries, validation-document separation, and v0.4.0 metadata.
+- Modify `tests/packaging.rs`: update the existing package-version contract to v0.4.0 without adding prose-grep tests.
 - Modify `Cargo.toml`: bump the package from `0.3.0` to `0.4.0`.
 - Modify `Cargo.lock`: regenerate the root package entry for `0.4.0` without updating dependency versions.
 - Modify `docs/releasing.md`: make the guarded release commands and examples target `v0.4.0`.
@@ -453,88 +453,13 @@ git commit -m "feat: scan before manual cleanup runs"
 **Files:**
 - Modify: `README.md:9-198`
 - Create: `docs/fresh-install-validation.md`
-- Test: `tests/packaging.rs:35-84`
+- Verify: `tests/packaging.rs`
 
 **Interfaces:**
 - Consumes: Task 1's `run` auto-scan contract and `--no-scan` flag; the canonical repository and installation sources in the approved design.
-- Produces: top-level `## Quick Start`, `## Agent Quick Start`, and `## Background Service (Optional)` sections; `docs/fresh-install-validation.md`; and repository-content tests that later release work must satisfy.
+- Produces: top-level `## Quick Start`, `## Agent Quick Start`, and `## Background Service (Optional)` sections plus `docs/fresh-install-validation.md`.
 
-- [ ] **Step 1: Add failing documentation-contract tests**
-
-Add these tests to `tests/packaging.rs`:
-
-```rust
-#[test]
-fn readme_prioritizes_human_and_agent_quick_starts() {
-    let readme = repo_file("README.md");
-    let install = readme.find("## Install").unwrap();
-    let quick_start = readme.find("## Quick Start").unwrap();
-    let agent_quick_start = readme.find("## Agent Quick Start").unwrap();
-    let background_service = readme.find("## Background Service (Optional)").unwrap();
-
-    assert!(install < quick_start);
-    assert!(quick_start < agent_quick_start);
-    assert!(agent_quick_start < background_service);
-    for value in [
-        "car-go-clean health",
-        "car-go-clean run --dry-run --all",
-        "car-go-clean run",
-        "car-go-clean stats",
-        "scans automatically",
-        "no interactive confirmation",
-        "car-go-clean run --no-scan",
-        "https://github.com/dcchuck/car-go-clean",
-        "dcchuck/tap/car-go-clean",
-        "releases/latest/download/car-go-clean-installer.sh",
-        "Inspection, installation or upgrade, health checks, and the dry run are authorized",
-        "Performing actual cleanup",
-        "Installing or enabling the background service",
-        "Changing configuration or exclusions",
-        "Using `--force`, `--include-active`, or `--include-managed-cache`",
-        "Cloning and building from source",
-    ] {
-        assert!(readme.contains(value), "missing {value}");
-    }
-    assert!(!readme.contains("## Fresh Install Validation"));
-}
-
-#[test]
-fn maintainer_validation_is_separate_and_proves_fresh_one_shot_use() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = repo_file("README.md");
-    let validation = repo_file("docs/fresh-install-validation.md");
-
-    assert!(root.join("docs/fresh-install-validation.md").is_file());
-    assert!(readme.contains("[Fresh install validation](docs/fresh-install-validation.md)"));
-    for value in [
-        "Source checkout",
-        "Released binary",
-        "cargo new",
-        "car-go-clean health",
-        "car-go-clean run --dry-run --all",
-        "car-go-clean run",
-        "car-go-clean scan",
-        "must begin with an empty state directory",
-        "must not run an explicit scan first",
-    ] {
-        assert!(validation.contains(value), "missing {value}");
-    }
-}
-```
-
-- [ ] **Step 2: Run the documentation tests and verify they fail**
-
-Run:
-
-```bash
-mise exec rust@1.95.0 -- cargo test --test packaging readme_prioritizes_human_and_agent_quick_starts
-mise exec rust@1.95.0 -- cargo test --test packaging maintainer_validation_is_separate_and_proves_fresh_one_shot_use
-```
-
-Expected: both fail because the sections and validation document do not
-exist.
-
-- [ ] **Step 3: Add the human Quick Start immediately after installation**
+- [ ] **Step 1: Add the human Quick Start immediately after installation**
 
 Keep the install methods and supported-target explanation. Replace the pinned
 `v0.2.0` example with `VERSION=0.4.0` and `--version "$VERSION"` so the next
@@ -579,7 +504,7 @@ A real run has no interactive confirmation. For advanced cached-only use,
 gate.
 ````
 
-- [ ] **Step 4: Add the exact copyable Agent Quick Start**
+- [ ] **Step 2: Add the exact copyable Agent Quick Start**
 
 Place this section after the human Quick Start:
 
@@ -632,7 +557,7 @@ Copy this prompt into your coding agent:
 > clearly.
 ````
 
-- [ ] **Step 5: Reorder the remaining README around the user journey**
+- [ ] **Step 3: Reorder the remaining README around the user journey**
 
 Rename `## Explicit Service Activation` to
 `## Background Service (Optional)` and place it after Agent Quick Start.
@@ -656,7 +581,7 @@ See [Fresh install validation](docs/fresh-install-validation.md) for the
 source-checkout and released-binary smoke tests.
 ```
 
-- [ ] **Step 6: Create the maintainer validation document**
+- [ ] **Step 4: Create the maintainer validation document**
 
 Create `docs/fresh-install-validation.md` with this content:
 
@@ -764,19 +689,25 @@ must explain every decision. `logs --errors-only` may be empty on a clean
 fixture; any entry must name its category and path.
 ````
 
-- [ ] **Step 7: Run the documentation tests and commit**
+- [ ] **Step 5: Review the rendered structure, run existing tests, and commit**
 
 Run:
 
 ```bash
+rg -n '^## ' README.md docs/fresh-install-validation.md
+sed -n '1,260p' README.md
+sed -n '1,260p' docs/fresh-install-validation.md
 mise exec rust@1.95.0 -- cargo test --test packaging
 git diff --check
-git add README.md docs/fresh-install-validation.md tests/packaging.rs
+git add README.md docs/fresh-install-validation.md
 git commit -m "docs: add human and agent quick starts"
 ```
 
-Expected: all packaging tests pass and the top-level README no longer contains
-the maintainer validation procedure.
+Expected: headings follow the approved order, the exact Agent Quick Start and
+consent boundaries are present, the top-level README no longer contains the
+maintainer procedure, and all existing packaging tests pass. Human-facing
+prose is reviewed directly rather than protected by brittle exact-string
+tests.
 
 ---
 
@@ -786,22 +717,18 @@ the maintainer validation procedure.
 - Modify: `Cargo.toml:1-4`
 - Modify: `Cargo.lock:120-123`
 - Modify: `docs/releasing.md:3-32`
-- Modify: `tests/packaging.rs:101-127`
-- Modify: `tests/packaging.rs:214-226`
+- Modify: `tests/packaging.rs:101-110`
 
 **Interfaces:**
 - Consumes: Task 1's complete CLI behavior and Task 2's complete onboarding contract.
 - Produces: package version `0.4.0`, matching lockfile root entry, and a release runbook whose tag, cargo-dist plan, and version-format examples all use `v0.4.0`.
 
-- [ ] **Step 1: Change the metadata tests to require v0.4.0**
+- [ ] **Step 1: Update the existing manifest-version contract**
 
-In `cargo_dist_metadata_declares_the_public_release_contract`, replace the
-manifest version assertion and add a lockfile assertion:
+In `cargo_dist_metadata_declares_the_public_release_contract`, update only
+the existing manifest version assertion:
 
 ```rust
-    let manifest = repo_file("Cargo.toml");
-    let lock = repo_file("Cargo.lock");
-    let dist = repo_file("dist-workspace.toml");
     for value in [
         "version = \"0.4.0\"",
         "repository = \"https://github.com/dcchuck/car-go-clean\"",
@@ -809,31 +736,17 @@ manifest version assertion and add a lockfile assertion:
     ] {
         assert!(manifest.contains(value), "missing {value}");
     }
-    assert!(lock.contains("name = \"car-go-clean\"\nversion = \"0.4.0\""));
 ```
-
-Extend `release_runbook_documents_the_guarded_draft_publication_flow`:
-
-```rust
-    assert!(runbook.contains("dist plan --tag v0.4.0"));
-    assert!(runbook.contains("git tag -a v0.4.0 -m \"car-go-clean v0.4.0\""));
-    assert!(runbook.contains("Inspect any older open formula pull request"));
-    assert!(!runbook.contains("v0.3.0"));
-```
-
-- [ ] **Step 2: Run the metadata tests and verify they fail**
 
 Run:
 
-```bash
+```sh
 mise exec rust@1.95.0 -- cargo test --test packaging cargo_dist_metadata_declares_the_public_release_contract
-mise exec rust@1.95.0 -- cargo test --test packaging release_runbook_documents_the_guarded_draft_publication_flow
 ```
 
-Expected: both fail against the current `0.3.0` manifest, lockfile, and
-runbook.
+Expected: FAIL because the manifest still declares `0.3.0`.
 
-- [ ] **Step 3: Bump the package and regenerate only its lock entry**
+- [ ] **Step 2: Bump the package and regenerate only its lock entry**
 
 Change `Cargo.toml`:
 
@@ -853,7 +766,7 @@ Inspect `git diff -- Cargo.lock`. Expected: the `car-go-clean` root package
 entry changes from `0.3.0` to `0.4.0`; dependency packages and checksums do
 not change.
 
-- [ ] **Step 4: Update the release runbook to v0.4.0**
+- [ ] **Step 3: Update the release runbook to v0.4.0**
 
 In `docs/releasing.md`, change the verified release commit, dist plan, tag,
 push command, and version-format example:
@@ -884,18 +797,21 @@ that should remain installable; do not silently overwrite its branch or the
 tap's default branch.
 ```
 
-- [ ] **Step 5: Verify the version and commit release preparation**
+- [ ] **Step 4: Verify Cargo metadata, the built CLI, and release preparation**
 
 Run:
 
 ```bash
 mise exec rust@1.95.0 -- cargo test --test packaging
+mise exec rust@1.95.0 -- cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "car-go-clean") | .version == "0.4.0"'
 mise exec rust@1.95.0 -- cargo run --locked -- version
+sed -n '1,90p' docs/releasing.md
 git diff --check
 ```
 
-Expected: packaging tests pass and the version command prints exactly
-`0.4.0`.
+Expected: packaging tests pass, Cargo metadata evaluates to `true`, the
+version command prints exactly `0.4.0`, and direct review confirms the
+runbook uses `v0.4.0` and contains the older-formula-PR instruction.
 
 Commit:
 
