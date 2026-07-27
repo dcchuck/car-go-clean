@@ -94,6 +94,110 @@ fn removing_failed_primary_project_preserves_durable_association_until_success()
     );
 }
 
+#[test]
+fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
+    let root = tempfile::tempdir().unwrap();
+    let excluded_root = root.path().join("OrbStack");
+    let excluded_primary = excluded_root.join("docker/primary");
+    let excluded_linked = excluded_root.join("docker/linked");
+    let kept_primary = root.path().join("src/primary");
+    let kept_linked = root.path().join("src/linked");
+    for path in [
+        &excluded_primary,
+        &excluded_linked,
+        &kept_primary,
+        &kept_linked,
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+
+    let excluded_root = excluded_root.canonicalize().unwrap();
+    let excluded_primary = excluded_primary.canonicalize().unwrap();
+    let excluded_linked = excluded_linked.canonicalize().unwrap();
+    let kept_primary = kept_primary.canonicalize().unwrap();
+    let kept_linked = kept_linked.canonicalize().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+
+    for path in [
+        &excluded_primary,
+        &excluded_linked,
+        &kept_primary,
+        &kept_linked,
+    ] {
+        store.upsert_project(path, now).unwrap();
+    }
+    store
+        .replace_linked_worktrees(&excluded_primary, std::slice::from_ref(&excluded_linked))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&excluded_primary, now, "excluded failure")
+        .unwrap();
+    store
+        .replace_linked_worktrees(
+            &kept_primary,
+            &[kept_linked.clone(), excluded_linked.clone()],
+        )
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&kept_primary, now, "kept failure")
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "worktree_discovery".to_string(),
+            path: Some(excluded_primary.to_string_lossy().into_owned()),
+            message: "historical error".to_string(),
+        })
+        .unwrap();
+    let run_id = store.start_run(now).unwrap();
+    store
+        .record_clean_event(&CleanEvent {
+            id: 0,
+            run_id,
+            ts: now,
+            path: excluded_primary.to_string_lossy().into_owned(),
+            bytes_before: 1024,
+            bytes_after: 0,
+            duration_ms: 10,
+            exit_code: 0,
+            stderr_excerpt: String::new(),
+        })
+        .unwrap();
+
+    store
+        .reconcile_excluded_discovery_state(|path| path.starts_with(&excluded_root))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| PathBuf::from(project.path))
+            .collect::<Vec<_>>(),
+        vec![kept_linked.clone(), kept_primary.clone()]
+    );
+    assert!(!store
+        .is_active_worktree_discovery_identity(&excluded_primary)
+        .unwrap());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&excluded_linked)
+        .unwrap());
+    assert!(store
+        .is_active_worktree_discovery_identity(&kept_primary)
+        .unwrap());
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_provenance_is_rejected_before_replacing_existing_failure_state() {

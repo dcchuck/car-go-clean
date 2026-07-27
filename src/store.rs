@@ -360,6 +360,85 @@ impl Store {
         Ok(())
     }
 
+    pub fn reconcile_excluded_discovery_state<F>(&self, mut is_excluded: F) -> Result<()>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let projects = {
+            let mut stmt = tx.prepare("SELECT path FROM projects")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+        for path in projects {
+            if is_excluded(Path::new(&path)) {
+                tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
+            }
+        }
+
+        let linked = {
+            let mut stmt = tx.prepare(
+                "
+                SELECT primary_path, linked_path, canonical_primary_path
+                FROM linked_worktrees
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            collect_rows(rows)?
+        };
+        for (primary, linked, canonical_primary) in linked {
+            let remove = is_excluded(Path::new(&primary))
+                || is_excluded(Path::new(&linked))
+                || canonical_primary
+                    .as_deref()
+                    .is_some_and(|path| is_excluded(Path::new(path)));
+            if remove {
+                tx.execute(
+                    "
+                    DELETE FROM linked_worktrees
+                    WHERE primary_path=?1 AND linked_path=?2
+                    ",
+                    params![primary, linked],
+                )?;
+            }
+        }
+
+        let failures = {
+            let mut stmt = tx.prepare(
+                "
+                SELECT primary_path, canonical_primary_path
+                FROM worktree_discovery_failures
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+        for (primary, canonical_primary) in failures {
+            let remove = is_excluded(Path::new(&primary))
+                || canonical_primary
+                    .as_deref()
+                    .is_some_and(|path| is_excluded(Path::new(path)));
+            if remove {
+                tx.execute(
+                    "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+                    [&primary],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_project_path(&self, old_path: &Path, new_path: &Path) -> Result<()> {
         let old_path = path_to_string(old_path)?;
         let new_path = path_to_string(new_path)?;
