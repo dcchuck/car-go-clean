@@ -165,6 +165,31 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
             stderr_excerpt: String::new(),
         })
         .unwrap();
+    let review_summary = ReviewSummary {
+        total_projects: 4,
+        cleanable_projects: 2,
+        skipped_projects: 2,
+        cleanable_bytes: 1024,
+        active_recent_write: 0,
+        active_process: 1,
+        managed_cache: 1,
+        container_storage: 0,
+        scan_error: 0,
+        no_target: 0,
+        target_read_error: 0,
+    };
+    store
+        .record_review_status(now, "reconciliation-test", &review_summary)
+        .unwrap();
+    store
+        .record_scheduler_status(
+            now,
+            now + Duration::from_secs(60),
+            now + Duration::from_secs(120),
+        )
+        .unwrap();
+    let review_before = store.last_review_status().unwrap();
+    let scheduler_before = store.scheduler_status().unwrap();
 
     store
         .reconcile_excluded_discovery_state(|path| path.starts_with(&excluded_root))
@@ -188,6 +213,13 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
     assert!(store
         .is_active_worktree_discovery_identity(&kept_primary)
         .unwrap());
+    assert!(store
+        .is_active_worktree_discovery_identity(&kept_linked)
+        .unwrap());
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        vec![kept_linked, kept_primary]
+    );
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
     assert_eq!(
         store
@@ -196,6 +228,94 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
             .len(),
         1
     );
+    assert_eq!(store.last_review_status().unwrap(), review_before);
+    assert_eq!(store.scheduler_status().unwrap(), scheduler_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn reconcile_excluded_discovery_state_matches_canonical_primary_path_only() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let excluded_root = root.path().join("OrbStack");
+    let canonical_primary = excluded_root.join("primary");
+    let legacy_primary = root.path().join("legacy-primary");
+    let linked = root.path().join("src/linked");
+    fs::create_dir_all(&canonical_primary).unwrap();
+    fs::create_dir_all(&linked).unwrap();
+    symlink(&canonical_primary, &legacy_primary).unwrap();
+    let excluded_root = excluded_root.canonicalize().unwrap();
+    let canonical_primary = canonical_primary.canonicalize().unwrap();
+
+    assert!(!legacy_primary.starts_with(&excluded_root));
+    assert!(!linked.starts_with(&excluded_root));
+    assert!(canonical_primary.starts_with(&excluded_root));
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = test_store(&db_path);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store.upsert_project(&legacy_primary, now).unwrap();
+    let inspection = rusqlite::Connection::open(&db_path).unwrap();
+    inspection
+        .execute(
+            "
+            INSERT INTO linked_worktrees (
+                primary_path,
+                linked_path,
+                canonical_primary_path
+            )
+            VALUES (?1, ?2, ?3)
+            ",
+            rusqlite::params![
+                legacy_primary.to_str().unwrap(),
+                linked.to_str().unwrap(),
+                canonical_primary.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    inspection
+        .execute(
+            "
+            INSERT INTO worktree_discovery_failures (
+                primary_path,
+                failed_at,
+                message,
+                canonical_primary_path
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            ",
+            rusqlite::params![
+                legacy_primary.to_str().unwrap(),
+                100,
+                "legacy failure",
+                canonical_primary.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    drop(inspection);
+
+    store
+        .reconcile_excluded_discovery_state(|path| path.starts_with(&excluded_root))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| PathBuf::from(project.path))
+            .collect::<Vec<_>>(),
+        vec![legacy_primary.clone()]
+    );
+    assert!(!store
+        .is_active_worktree_discovery_identity(&legacy_primary)
+        .unwrap());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&linked)
+        .unwrap());
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
 }
 
 #[cfg(unix)]

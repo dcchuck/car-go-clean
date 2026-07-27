@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,20 @@ pub struct ScannerOptions {
 #[derive(Clone)]
 pub struct Scanner {
     opts: ScannerOptions,
+    exclusion_matchers: ExclusionMatchers,
     worktree_resolver: Arc<dyn GitWorktreeResolver>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExclusionMatchers {
+    absolute: Vec<AbsoluteExclusion>,
+    relative: Vec<Vec<OsString>>,
+}
+
+#[derive(Debug, Clone)]
+struct AbsoluteExclusion {
+    lexical: PathBuf,
+    canonical: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,8 +149,12 @@ impl Scanner {
         opts: ScannerOptions,
         resolver: Arc<dyn GitWorktreeResolver>,
     ) -> Self {
+        let exclusion_matchers = ExclusionMatchers::new(
+            std::iter::once("target").chain(opts.excludes.iter().map(String::as_str)),
+        );
         Self {
             opts,
+            exclusion_matchers,
             worktree_resolver: resolver,
         }
     }
@@ -367,13 +385,80 @@ impl Scanner {
     }
 
     fn should_skip(&self, path: &Path) -> bool {
-        if path_matches_exclude(path, "target") {
+        self.exclusion_matchers.matches(path)
+    }
+}
+
+impl ExclusionMatchers {
+    fn new<'a>(excludes: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut matchers = Self::default();
+        for exclude in excludes {
+            let exclude = Path::new(exclude);
+            if exclude.as_os_str().is_empty() {
+                continue;
+            }
+            if exclude.is_absolute() {
+                matchers.absolute.push(AbsoluteExclusion {
+                    lexical: exclude.to_path_buf(),
+                    canonical: canonicalize_with_missing_suffix(exclude),
+                });
+                continue;
+            }
+
+            let components = exclude
+                .components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .map(|component| component.as_os_str().to_os_string())
+                .collect::<Vec<_>>();
+            if !components.is_empty() {
+                matchers.relative.push(components);
+            }
+        }
+        matchers
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        if self.absolute.iter().any(|exclude| {
+            path.starts_with(&exclude.lexical)
+                || exclude
+                    .canonical
+                    .as_deref()
+                    .is_some_and(|canonical| path.starts_with(canonical))
+        }) {
             return true;
         }
-        self.opts
-            .excludes
-            .iter()
-            .any(|exclude| path_matches_exclude(path, exclude))
+
+        let path_components = path
+            .components()
+            .map(|component| component.as_os_str())
+            .collect::<Vec<_>>();
+        self.relative.iter().any(|exclude| {
+            path_components.windows(exclude.len()).any(|window| {
+                window
+                    .iter()
+                    .zip(exclude)
+                    .all(|(actual, expected)| *actual == expected.as_os_str())
+            })
+        })
+    }
+}
+
+fn canonicalize_with_missing_suffix(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut unresolved = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in unresolved.iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(_) => {
+                unresolved.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+        }
     }
 }
 
@@ -634,32 +719,6 @@ fn non_utf8_scan_error(path: &Path) -> ScanError {
         message: "project path is non-UTF-8 and cannot be persisted safely".to_string(),
         kind: ScanErrorKind::Scan,
     }
-}
-
-fn path_matches_exclude(path: &Path, exclude: &str) -> bool {
-    let exclude = Path::new(exclude);
-    if exclude.as_os_str().is_empty() {
-        return false;
-    }
-    if exclude.is_absolute() {
-        if path.starts_with(exclude) {
-            return true;
-        }
-        return fs::canonicalize(exclude)
-            .is_ok_and(|canonical_exclude| path.starts_with(canonical_exclude));
-    }
-
-    let exclude_parts: Vec<_> = exclude
-        .components()
-        .filter(|component| !matches!(component, std::path::Component::CurDir))
-        .collect();
-    if exclude_parts.is_empty() {
-        return false;
-    }
-    let path_parts: Vec<_> = path.components().collect();
-    path_parts
-        .windows(exclude_parts.len())
-        .any(|window| window == exclude_parts)
 }
 
 fn has_cargo_toml(dir: &Path) -> bool {

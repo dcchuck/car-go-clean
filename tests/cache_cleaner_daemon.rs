@@ -3359,6 +3359,65 @@ fn successful_scan_prunes_cached_excluded_candidates_and_failures() {
     assert_eq!(runner.calls.lock().unwrap()[0].dir, kept);
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_scan_reconciles_removed_exclusion_through_symlinked_home() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let physical_home = root.path().join("physical-home");
+    let symlinked_home = root.path().join("home");
+    let physical_excluded_root = physical_home.join("OrbStack");
+    let excluded_primary = physical_excluded_root.join("primary");
+    let excluded_linked = physical_excluded_root.join("linked");
+    fs::create_dir_all(&excluded_primary).unwrap();
+    fs::create_dir_all(&excluded_linked).unwrap();
+    symlink(&physical_home, &symlinked_home).unwrap();
+    let canonical_primary = excluded_primary.canonicalize().unwrap();
+    let canonical_linked = excluded_linked.canonicalize().unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store.upsert_project(&canonical_primary, now).unwrap();
+    store.upsert_project(&canonical_linked, now).unwrap();
+    store
+        .replace_linked_worktrees(&canonical_primary, std::slice::from_ref(&canonical_linked))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical_primary, now, "stale failure")
+        .unwrap();
+
+    fs::remove_dir_all(&physical_excluded_root).unwrap();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![physical_home],
+            project_dirs: vec![],
+            excludes: vec![symlinked_home
+                .join("OrbStack")
+                .to_string_lossy()
+                .into_owned()],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+    fs::remove_file(&symlinked_home).unwrap();
+
+    daemon.scan_cycle().unwrap();
+
+    assert!(store.all_projects().unwrap().is_empty());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&canonical_primary)
+        .unwrap());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&canonical_linked)
+        .unwrap());
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+}
+
 #[test]
 fn daemon_clamps_only_legacy_scan_deadlines_beyond_the_current_interval() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
