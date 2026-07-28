@@ -300,10 +300,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_until_shutdown(&self, shutdown: &ShutdownFlag) -> Result<()> {
-        if self.store.all_projects()?.is_empty() {
-            self.scan_cycle()?;
-        }
+        let initial_scan_error = if self.store.all_projects()?.is_empty() {
+            self.scan_cycle().err()
+        } else {
+            None
+        };
         let mut schedule = self.scheduler_status_or_initialize()?;
+        if let Some(err) = initial_scan_error {
+            self.defer_after_scan_failure(&mut schedule, &err)?;
+        }
         while !shutdown.is_requested() {
             let next_due = if schedule.next_clean_at <= schedule.next_scan_at {
                 schedule.next_clean_at
@@ -317,18 +322,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             let now = SystemTime::now();
             if now >= schedule.next_scan_at {
                 if let Err(err) = self.scan_cycle() {
-                    let retry_delay = self.opts.scan_interval.max(Duration::from_secs(1));
-                    let retry_at = SystemTime::now() + retry_delay;
-                    schedule.next_scan_at = retry_at;
-                    schedule.next_clean_at = schedule.next_clean_at.max(retry_at);
-                    self.store.record_scheduler_status(
-                        SystemTime::now(),
-                        schedule.next_clean_at,
-                        schedule.next_scan_at,
-                    )?;
-                    if let Some(logger) = &self.logger {
-                        logger.error(format!("scan cycle failed; retry scheduled: {err}"));
-                    }
+                    self.defer_after_scan_failure(&mut schedule, &err)?;
                     continue;
                 }
                 schedule.next_scan_at = SystemTime::now() + self.opts.scan_interval;
@@ -342,6 +336,26 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 schedule.next_clean_at,
                 schedule.next_scan_at,
             )?;
+        }
+        Ok(())
+    }
+
+    fn defer_after_scan_failure(
+        &self,
+        schedule: &mut SchedulerStatus,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        let retry_delay = self.opts.scan_interval.max(Duration::from_secs(1));
+        let retry_at = SystemTime::now() + retry_delay;
+        schedule.next_scan_at = retry_at;
+        schedule.next_clean_at = schedule.next_clean_at.max(retry_at);
+        self.store.record_scheduler_status(
+            SystemTime::now(),
+            schedule.next_clean_at,
+            schedule.next_scan_at,
+        )?;
+        if let Some(logger) = &self.logger {
+            logger.error(format!("scan cycle failed; retry scheduled: {err}"));
         }
         Ok(())
     }

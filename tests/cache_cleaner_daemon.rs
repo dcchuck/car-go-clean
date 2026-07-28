@@ -1791,6 +1791,93 @@ fn scheduler_reconciles_successful_exclusions_before_equal_due_clean() {
 
 #[cfg(unix)]
 #[test]
+fn scheduler_retries_initial_empty_store_scan_persistence_failure() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_project_upsert
+            BEFORE INSERT ON projects
+            BEGIN
+                SELECT RAISE(FAIL, 'injected project persistence failure');
+            END;
+            ",
+        )
+        .unwrap();
+
+    let log_path = db_dir.path().join("car-go-clean.log");
+    let logger = Logger::with_options(
+        &log_path,
+        LoggerOptions {
+            max_bytes: 1024,
+            max_files: 2,
+        },
+    )
+    .unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::ZERO,
+            scan_interval: Duration::ZERO,
+            target_quiet_period: Duration::ZERO,
+        },
+    )
+    .with_logger(logger);
+    let started = SystemTime::now();
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(store.last_run().is_err());
+    let schedule = store.scheduler_status().unwrap().unwrap();
+    assert!(
+        schedule
+            .next_scan_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            > started
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+    );
+    assert!(schedule.next_clean_at >= schedule.next_scan_at);
+    let event: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(log_path).unwrap().trim()).unwrap();
+    assert_eq!(event["level"], "ERROR");
+    assert!(event["message"]
+        .as_str()
+        .unwrap()
+        .contains("scan cycle failed; retry scheduled: injected project persistence failure"));
+}
+
+#[cfg(unix)]
+#[test]
 fn scheduler_defers_clean_and_retry_after_scan_persistence_failure() {
     let _guard = shutdown_test_lock();
     let root = tempfile::tempdir().unwrap();
