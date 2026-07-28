@@ -253,6 +253,18 @@ enum Commands {
     },
 }
 
+#[derive(Debug)]
+struct RunOptions {
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    dry_run: bool,
+    no_scan: bool,
+    include_managed_cache: bool,
+    include_active: bool,
+    force: bool,
+    all: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum ServiceCommands {
     Install,
@@ -305,8 +317,8 @@ fn execute(cli: Cli) -> Result<()> {
             include_active,
             force,
             all,
-        } => run_once(
-            config,
+        } => run_once(RunOptions {
+            config_path: config,
             state_dir,
             dry_run,
             no_scan,
@@ -314,7 +326,7 @@ fn execute(cli: Cli) -> Result<()> {
             include_active,
             force,
             all,
-        ),
+        }),
         Commands::Daemon { config, state_dir } => daemon(config, state_dir),
         Commands::Stats {
             since,
@@ -532,16 +544,17 @@ fn scan_and_report(store: &Store, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn run_once(
-    config_path: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    dry_run: bool,
-    no_scan: bool,
-    include_managed_cache: bool,
-    include_active: bool,
-    force: bool,
-    all: bool,
-) -> Result<()> {
+fn run_once(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        config_path,
+        state_dir,
+        dry_run,
+        no_scan,
+        include_managed_cache,
+        include_active,
+        force,
+        all,
+    } = options;
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
