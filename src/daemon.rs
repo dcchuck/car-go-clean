@@ -144,13 +144,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         }
         for path in report.projects {
             if let Err(err) = self.store.upsert_project(&path, now) {
-                self.store.record_error(&ErrorRecord {
+                let _ = self.store.record_error(&ErrorRecord {
                     id: 0,
                     ts: now,
                     category: "cache".to_string(),
                     path: path.to_str().map(str::to_owned),
                     message: err.to_string(),
-                })?;
+                });
+                return Err(err);
             }
         }
         Ok(())

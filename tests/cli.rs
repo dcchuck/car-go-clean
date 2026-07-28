@@ -252,6 +252,86 @@ fn run_aborts_before_cargo_when_scan_persistence_fails() {
     assert!(project.join("target/blob.bin").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn run_aborts_before_cargo_when_project_upsert_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("tree/proj");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 4096]).unwrap();
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("scan_dirs = [\"{}\"]\n", work.path().join("tree").display()),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let db_path = state.join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    store
+        .upsert_project(project.canonicalize().unwrap(), SystemTime::now())
+        .unwrap();
+    drop(store);
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_project_upsert
+            BEFORE INSERT ON projects
+            BEGIN
+                SELECT RAISE(FAIL, 'injected project persistence failure');
+            END;
+            ",
+        )
+        .unwrap();
+
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let marker = work.path().join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nif [ \"$1\" = clean ]; then rm -rf target; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("PATH", path)
+        .assert()
+        .failure()
+        .stderr(contains("injected project persistence failure"));
+
+    assert!(!marker.exists());
+    assert!(project.join("target/blob.bin").exists());
+    let store = Store::open(&db_path).unwrap();
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert!(errors.iter().any(|error| {
+        error.category == "cache"
+            && error.path.as_deref() == project.canonicalize().unwrap().to_str()
+            && error
+                .message
+                .contains("injected project persistence failure")
+    }));
+}
+
 #[test]
 fn version_prints_package_version() {
     let mut cmd = Command::cargo_bin("car-go-clean").unwrap();
