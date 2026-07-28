@@ -46,7 +46,7 @@
 
 **Interfaces:**
 - Consumes: existing `daemon_for_scan(&Store, &Config) -> Daemon<'_, RealRunner>`, `Daemon::scan_cycle() -> anyhow::Result<()>`, `run_cycle_with_safety`, process locking, configuration loading, and state migration.
-- Produces: `fn scan_and_report(store: &Store, cfg: &Config) -> Result<()>`; a `no_scan: bool` field on `Commands::Run`; and `fn run_once(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, dry_run: bool, no_scan: bool, include_managed_cache: bool, include_active: bool, force: bool, all: bool) -> Result<()>`.
+- Produces: `fn scan_and_report(store: &Store, cfg: &Config) -> Result<()>`; a `no_scan: bool` field on `Commands::Run`; an internal `RunOptions` value that groups the parsed run arguments; and `fn run_once(options: RunOptions) -> Result<()>`.
 
 - [ ] **Step 1: Add failing CLI contract tests**
 
@@ -326,6 +326,22 @@ In `src/cli.rs`, add clap doc comments and the new field:
     Daemon {
 ```
 
+Add the internal options value after `Commands`:
+
+```rust
+#[derive(Debug)]
+struct RunOptions {
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    dry_run: bool,
+    no_scan: bool,
+    include_managed_cache: bool,
+    include_active: bool,
+    force: bool,
+    all: bool,
+}
+```
+
 Update `Commands::Run` destructuring and the call:
 
 ```rust
@@ -338,8 +354,8 @@ Update `Commands::Run` destructuring and the call:
             include_active,
             force,
             all,
-        } => run_once(
-            config,
+        } => run_once(RunOptions {
+            config_path: config,
             state_dir,
             dry_run,
             no_scan,
@@ -347,10 +363,24 @@ Update `Commands::Run` destructuring and the call:
             include_active,
             force,
             all,
-        ),
+        }),
 ```
 
-Add `no_scan: bool` immediately after `dry_run: bool` in `run_once`.
+Define `run_once` with the grouped options and destructure them once:
+
+```rust
+fn run_once(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        config_path,
+        state_dir,
+        dry_run,
+        no_scan,
+        include_managed_cache,
+        include_active,
+        force,
+        all,
+    } = options;
+```
 
 - [ ] **Step 4: Share the scan cycle and invoke it before either run mode**
 
