@@ -98,6 +98,68 @@ fn run_dry_run_scans_fresh_state_by_default() {
 }
 
 #[test]
+fn custom_config_can_discover_protected_storage_but_requires_managed_storage_opt_in() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let project = home.join(".rustup/toolchains/stable/copied-crate");
+    fs::create_dir_all(project.join("target/debug")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='copied-crate'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(project.join("target/debug/blob.bin"), vec![0; 4096]).unwrap();
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\nexcludes = []\ntarget_quiet_period = \"1ms\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+
+    let skipped_state = work.path().join("skipped-state");
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--force", "--all", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&skipped_state)
+        .env("HOME", &home)
+        .assert()
+        .success()
+        .stdout(contains("Total projects: 1"))
+        .stdout(contains("Cleanable projects: 0"))
+        .stdout(contains("Skipped projects: 1"))
+        .stdout(contains("managed_cache=1"));
+    let store = Store::open(skipped_state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--dry-run",
+            "--force",
+            "--include-managed-cache",
+            "--all",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("included-state"))
+        .env("HOME", &home)
+        .assert()
+        .success()
+        .stdout(contains("Total projects: 1"))
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains(project.join("target").display().to_string()));
+}
+
+#[test]
 fn run_no_scan_uses_only_cached_state() {
     let work = tempfile::tempdir().unwrap();
     let project = work.path().join("tree/proj");
