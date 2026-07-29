@@ -335,7 +335,7 @@ impl Scanner {
 
         let canonical_path = match fs::canonicalize(configured_path) {
             Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.policy.is_none() => {
                 return Ok(OriginScan::completed_empty(kind, configured_path));
             }
             Err(error) => {
@@ -685,7 +685,16 @@ impl Scanner {
     }
 
     fn should_skip(&self, path: &Path) -> bool {
-        self.exclusion_matchers.matches(path)
+        if path
+            .components()
+            .any(|component| component.as_os_str() == "target")
+        {
+            return true;
+        }
+        match &self.policy {
+            Some(policy) => policy.is_excluded(path),
+            None => self.exclusion_matchers.matches(path),
+        }
     }
 }
 

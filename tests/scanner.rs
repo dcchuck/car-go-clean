@@ -966,3 +966,101 @@ fn retargeted_root_alias_is_incomplete_against_the_bound_policy() {
         .is_some_and(|error| error.contains("changed after policy construction")));
     assert!(report.origins[0].projects.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn bound_policy_keeps_the_original_canonical_exclusion_after_alias_retarget() {
+    use car_go_clean::cache::Cache;
+    use car_go_clean::cleaner::{Cleaner, RealRunner};
+    use car_go_clean::config::load;
+    use car_go_clean::daemon::{Daemon, DaemonOptions};
+    use car_go_clean::identity::SystemIdentityProvider;
+    use car_go_clean::policy::{ProcessEnvironment, ScopePolicy};
+    use car_go_clean::store::Store;
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let excluded = root.path().join("excluded");
+    let replacement = root.path().join("replacement");
+    write_file(&excluded.join("Cargo.toml"), "[package]\n");
+    fs::create_dir_all(&replacement).unwrap();
+    let exclusion_alias = root.path().join("excluded-alias");
+    symlink(&excluded, &exclusion_alias).unwrap();
+    let config_path = root.path().join("config.toml");
+    write_file(
+        &config_path,
+        &format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"{}\"]\n",
+            root.path().display(),
+            exclusion_alias.display()
+        ),
+    );
+    let config = load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&config, &config_path, &ProcessEnvironment).unwrap();
+    fs::remove_file(&exclusion_alias).unwrap();
+    symlink(&replacement, &exclusion_alias).unwrap();
+
+    let scanner = Scanner::new(ScannerOptions {
+        roots: config.scan_dirs.clone(),
+        project_dirs: config.project_dirs.clone(),
+        excludes: config.effective_excludes(),
+    })
+    .with_authority(policy, Arc::new(SystemIdentityProvider));
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        Cleaner::new("cargo", RealRunner, Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    let scan = daemon.scan_cycle().unwrap();
+
+    assert!(scan.origins[0].completed);
+    assert!(scan.origins[0].projects.is_empty());
+    assert!(store
+        .authorized_observations(scan.generation)
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_root_that_disappears_after_policy_construction_is_incomplete() {
+    use car_go_clean::config::load;
+    use car_go_clean::identity::SystemIdentityProvider;
+    use car_go_clean::policy::{ProcessEnvironment, ScopePolicy};
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let physical_root = root.path().join("physical-root");
+    fs::create_dir_all(&physical_root).unwrap();
+    let root_alias = root.path().join("root-alias");
+    symlink(&physical_root, &root_alias).unwrap();
+    let config_path = root.path().join("config.toml");
+    write_file(
+        &config_path,
+        &format!("scan_dirs = [\"{}\"]\n", root_alias.display()),
+    );
+    let config = load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&config, &config_path, &ProcessEnvironment).unwrap();
+    fs::remove_file(&root_alias).unwrap();
+
+    let report = Scanner::new(ScannerOptions {
+        roots: config.scan_dirs.clone(),
+        project_dirs: config.project_dirs.clone(),
+        excludes: config.effective_excludes(),
+    })
+    .with_authority(policy, Arc::new(SystemIdentityProvider))
+    .scan_with_errors()
+    .unwrap();
+
+    assert_eq!(report.origins.len(), 1);
+    assert!(!report.origins[0].completed);
+    assert!(report.origins[0].error.is_some());
+    assert!(report.origins[0].projects.is_empty());
+    assert_eq!(report.errors.len(), 1);
+}

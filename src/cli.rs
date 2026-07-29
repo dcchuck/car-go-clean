@@ -1171,3 +1171,34 @@ fn tail_file(path: &Path, n: usize) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn broken_bound_root_maps_to_the_public_incomplete_exit_code() {
+        let work = tempfile::tempdir().unwrap();
+        let physical_root = work.path().join("physical-root");
+        fs::create_dir_all(&physical_root).unwrap();
+        let root_alias = work.path().join("root-alias");
+        symlink(&physical_root, &root_alias).unwrap();
+        let config_path = work.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!("scan_dirs = [\"{}\"]\n", root_alias.display()),
+        )
+        .unwrap();
+        let (config, config_source) = load_config_with_source(Some(config_path.clone())).unwrap();
+        let policy = build_policy(&config, &config_source).unwrap();
+        fs::remove_file(&root_alias).unwrap();
+        let store = Store::open(work.path().join("state.db")).unwrap();
+        store.migrate().unwrap();
+
+        let outcome = scan_and_report(&store, &config, &policy, false).unwrap();
+
+        assert_eq!(outcome, CommandOutcome::Incomplete);
+        assert_eq!(outcome.code(), 2);
+    }
+}
