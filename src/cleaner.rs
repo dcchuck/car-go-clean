@@ -178,5 +178,31 @@ fn stderr_excerpt(stderr: &str) -> String {
     if stderr.len() <= MAX_STDERR_EXCERPT {
         return stderr.to_string();
     }
-    stderr[stderr.len() - MAX_STDERR_EXCERPT..].to_string()
+
+    let mut start = stderr.len() - MAX_STDERR_EXCERPT;
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    stderr[start..].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stderr_excerpt_starts_on_a_utf8_boundary() {
+        let stderr = format!("prefix:{}", "€".repeat(2_000));
+
+        let excerpt = stderr_excerpt(&stderr);
+
+        assert!(excerpt.len() <= MAX_STDERR_EXCERPT);
+        assert!(stderr.ends_with(&excerpt));
+        assert!(excerpt.chars().all(|character| character == '€'));
+    }
+
+    #[test]
+    fn stderr_excerpt_preserves_short_input() {
+        assert_eq!(stderr_excerpt("cargo failed: λ"), "cargo failed: λ");
+    }
 }
