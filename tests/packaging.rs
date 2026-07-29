@@ -30,6 +30,36 @@ fn step_running<'a>(steps: &'a [Yaml], command: &str) -> (usize, &'a Yaml) {
         .unwrap_or_else(|| panic!("workflow does not run `{command}`"))
 }
 
+fn named_step<'a>(steps: &'a [Yaml], name: &str) -> &'a Yaml {
+    steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("workflow does not contain step `{name}`"))
+}
+
+fn shell_block_containing(markdown: &str, required: &[&str]) -> String {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut in_shell = false;
+
+    for line in markdown.lines() {
+        if !in_shell && matches!(line, "```sh" | "```bash") {
+            in_shell = true;
+            current.clear();
+        } else if in_shell && line == "```" {
+            blocks.push(current.join("\n"));
+            in_shell = false;
+        } else if in_shell {
+            current.push(line);
+        }
+    }
+
+    blocks
+        .into_iter()
+        .find(|block| required.iter().all(|needle| block.contains(needle)))
+        .unwrap_or_else(|| panic!("no shell block contains {required:?}"))
+}
+
 #[test]
 fn systemd_service_keeps_the_embedded_binary_placeholder() {
     let service = repo_file("packaging/systemd/car-go-clean.service");
@@ -303,6 +333,206 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(formula_template.contains("on_macos do"));
     assert!(formula_template.contains("on_linux do"));
     assert!(formula_template.contains("test do"));
+}
+
+#[test]
+fn homebrew_formula_render_fails_before_output_when_checksums_are_missing() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let publish = workflow(".github/workflows/publish-homebrew-formula.yml");
+    let steps = workflow_steps(&publish, "publish-homebrew-formula");
+    let render = named_step(steps, "Render standards-compliant formula");
+    let run = run_command(render).unwrap();
+    let work = tempdir().unwrap();
+
+    fs::create_dir_all(work.path().join("dist-artifacts")).unwrap();
+    fs::create_dir_all(work.path().join("packaging/release/homebrew")).unwrap();
+    fs::copy(
+        root.join("packaging/release/homebrew/car-go-clean.rb.in"),
+        work.path()
+            .join("packaging/release/homebrew/car-go-clean.rb.in"),
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", run])
+        .current_dir(work.path())
+        .env("TAG", "v0.4.0")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "formula rendering accepted missing checksums"
+    );
+    assert!(
+        !work
+            .path()
+            .join("generated-formula/car-go-clean.rb")
+            .exists(),
+        "formula output was created after checksum validation failed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn homebrew_upgrade_docs_preserve_service_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn verify(markdown_path: &str, initial_state: Option<&str>) {
+        let markdown = repo_file(markdown_path);
+        let upgrade = shell_block_containing(
+            &markdown,
+            &[
+                "service_was_active=",
+                "brew upgrade dcchuck/tap/car-go-clean",
+                "car-go-clean run --dry-run --all",
+            ],
+        );
+        let work = tempdir().unwrap();
+        let bin = work.path().join("bin");
+        let calls = work.path().join("calls");
+        let installed = work.path().join("installed");
+        let state = work.path().join("service-state");
+        let template = work.path().join("car-go-clean.template");
+        fs::create_dir(&bin).unwrap();
+
+        write_executable(
+            &template,
+            r#"#!/bin/sh
+set -eu
+printf 'car-go-clean %s\n' "$*" >> "$CALL_LOG"
+case "$*" in
+  "service status")
+    if test -f "$SERVICE_STATE"; then
+      service_state=$(cat "$SERVICE_STATE")
+    else
+      service_state="not installed"
+    fi
+    printf 'Service\n  State: %s\n' "$service_state"
+    ;;
+  "service stop") printf 'stopped\n' > "$SERVICE_STATE" ;;
+  "service start") printf 'running\n' > "$SERVICE_STATE" ;;
+  "run --dry-run --all") ;;
+  "version") printf '0.4.0\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+        );
+        write_executable(
+            &bin.join("brew"),
+            r#"#!/bin/sh
+set -eu
+printf 'brew %s\n' "$*" >> "$CALL_LOG"
+case "$1" in
+  update) ;;
+  list) test -f "$INSTALLED_MARKER" ;;
+  install|upgrade)
+    cp "$CAR_GO_CLEAN_TEMPLATE" "$FAKE_BIN/car-go-clean"
+    chmod +x "$FAKE_BIN/car-go-clean"
+    : > "$INSTALLED_MARKER"
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+        );
+
+        if let Some(initial_state) = initial_state {
+            fs::copy(&template, bin.join("car-go-clean")).unwrap();
+            fs::set_permissions(bin.join("car-go-clean"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            fs::write(&state, format!("{initial_state}\n")).unwrap();
+            fs::write(&installed, "").unwrap();
+        }
+
+        let output = Command::new("sh")
+            .args(["-eu", "-c", &upgrade])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("CALL_LOG", &calls)
+            .env("INSTALLED_MARKER", &installed)
+            .env("SERVICE_STATE", &state)
+            .env("CAR_GO_CLEAN_TEMPLATE", &template)
+            .env("FAKE_BIN", &bin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} upgrade block failed: {}",
+            markdown_path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let calls = fs::read_to_string(&calls).unwrap();
+        match initial_state {
+            Some("running") => {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    vec![
+                        "car-go-clean service status",
+                        "car-go-clean service stop",
+                        "brew update",
+                        "brew list --versions car-go-clean",
+                        "brew upgrade dcchuck/tap/car-go-clean",
+                        "car-go-clean version",
+                        "car-go-clean run --dry-run --all",
+                        "car-go-clean service start",
+                        "car-go-clean service status",
+                    ]
+                );
+                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "running");
+            }
+            Some("stopped") => {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    vec![
+                        "car-go-clean service status",
+                        "brew update",
+                        "brew list --versions car-go-clean",
+                        "brew upgrade dcchuck/tap/car-go-clean",
+                        "car-go-clean version",
+                    ]
+                );
+                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "stopped");
+            }
+            Some("not installed") => {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    vec![
+                        "car-go-clean service status",
+                        "brew update",
+                        "brew list --versions car-go-clean",
+                        "brew upgrade dcchuck/tap/car-go-clean",
+                        "car-go-clean version",
+                    ]
+                );
+                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "not installed");
+            }
+            None => {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    vec![
+                        "brew update",
+                        "brew list --versions car-go-clean",
+                        "brew install dcchuck/tap/car-go-clean",
+                        "car-go-clean version",
+                    ]
+                );
+                assert!(!state.exists());
+            }
+            Some(other) => panic!("unsupported fixture state {other}"),
+        }
+    }
+
+    for markdown_path in ["docs/releasing.md", "docs/releases/v0.4.0.md"] {
+        verify(markdown_path, Some("running"));
+        verify(markdown_path, Some("stopped"));
+        verify(markdown_path, Some("not installed"));
+        verify(markdown_path, None);
+    }
 }
 
 #[test]

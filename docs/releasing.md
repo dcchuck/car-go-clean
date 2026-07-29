@@ -84,17 +84,42 @@ test -n "$formula_pr"
 gh pr checks "$formula_pr" --repo dcchuck/homebrew-tap
 gh pr view "$formula_pr" --repo dcchuck/homebrew-tap --web
 gh pr merge "$formula_pr" --repo dcchuck/homebrew-tap --merge --delete-branch
+```
 
-brew update
-if brew list --versions car-go-clean >/dev/null 2>&1
-then
-  brew upgrade dcchuck/tap/car-go-clean
-else
-  brew install dcchuck/tap/car-go-clean
-fi
-car-go-clean version
-car-go-clean service stop
-car-go-clean run --dry-run --all
-car-go-clean service start
-car-go-clean service status
+Before replacing the binary, the following block records whether an existing
+service is running. It stops, previews, and resumes only that active service;
+a stopped service stays stopped, and a fresh install does not gain a service
+definition.
+
+```sh
+(
+  set -eu
+  service_was_active=0
+  if command -v car-go-clean >/dev/null 2>&1
+  then
+    service_status=$(car-go-clean service status)
+    if printf '%s\n' "$service_status" |
+      awk -F ': ' '$1 ~ /^[[:space:]]*State$/ && $2 == "running" { active=1 } END { exit !active }'
+    then
+      service_was_active=1
+      car-go-clean service stop
+    fi
+  fi
+
+  brew update
+  if brew list --versions car-go-clean >/dev/null 2>&1
+  then
+    brew upgrade dcchuck/tap/car-go-clean
+  else
+    brew install dcchuck/tap/car-go-clean
+  fi
+  car-go-clean version
+
+  if test "$service_was_active" -eq 1
+  then
+    car-go-clean run --dry-run --all
+    car-go-clean service start
+    car-go-clean service status
+  fi
+)
 ```
