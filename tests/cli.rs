@@ -14,6 +14,8 @@ fn service_help_lists_only_explicit_lifecycle_actions() {
         .success()
         .stdout(contains("install"))
         .stdout(contains("status"))
+        .stdout(contains("start"))
+        .stdout(contains("stop"))
         .stdout(contains("restart"))
         .stdout(contains("uninstall"));
 }

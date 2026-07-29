@@ -270,6 +270,8 @@ struct RunOptions {
 enum ServiceCommands {
     Install,
     Status,
+    Start,
+    Stop,
     Restart,
     Uninstall,
 }
@@ -376,6 +378,8 @@ fn service(command: ServiceCommands) -> Result<()> {
     let action = match command {
         ServiceCommands::Install => ServiceAction::Install,
         ServiceCommands::Status => ServiceAction::Status,
+        ServiceCommands::Start => ServiceAction::Start,
+        ServiceCommands::Stop => ServiceAction::Stop,
         ServiceCommands::Restart => ServiceAction::Restart,
         ServiceCommands::Uninstall => ServiceAction::Uninstall,
     };
@@ -383,6 +387,8 @@ fn service(command: ServiceCommands) -> Result<()> {
     let status = match action {
         ServiceAction::Install => manager.install()?,
         ServiceAction::Status => manager.status()?,
+        ServiceAction::Start => manager.start()?,
+        ServiceAction::Stop => manager.stop()?,
         ServiceAction::Restart => manager.restart()?,
         ServiceAction::Uninstall => manager.uninstall()?,
     };

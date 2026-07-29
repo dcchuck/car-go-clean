@@ -23,6 +23,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub enum ServiceAction {
     Install,
     Status,
+    Start,
+    Stop,
     Restart,
     Uninstall,
 }
@@ -107,6 +109,80 @@ impl<R: CommandRunner> ServiceManager<R> {
             ServicePlatform::MacOs => self.status_macos(),
             ServicePlatform::Linux => self.status_linux(),
         }
+    }
+
+    pub fn stop(&mut self) -> Result<ServiceStatus> {
+        let status = self.status()?;
+        if !status.installed || !status.active {
+            return Ok(status);
+        }
+        match self.platform {
+            ServicePlatform::MacOs => self.run_checked(
+                Path::new("launchctl"),
+                &[
+                    OsString::from("bootout"),
+                    OsString::from(self.launchd_domain()),
+                    self.launchd_plist_path().into_os_string(),
+                ],
+            )?,
+            ServicePlatform::Linux => {
+                self.require_systemd_user()?;
+                self.run_checked(
+                    Path::new("systemctl"),
+                    &[
+                        OsString::from("--user"),
+                        OsString::from("stop"),
+                        OsString::from(UNIT),
+                    ],
+                )?;
+            }
+        }
+        Ok(ServiceStatus {
+            installed: true,
+            active: false,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<ServiceStatus> {
+        let status = self.status()?;
+        if !status.installed {
+            bail!("car-go-clean service is not installed");
+        }
+        if status.active {
+            return Ok(status);
+        }
+        match self.platform {
+            ServicePlatform::MacOs => {
+                self.run_checked(
+                    Path::new("launchctl"),
+                    &[
+                        OsString::from("bootstrap"),
+                        OsString::from(self.launchd_domain()),
+                        self.launchd_plist_path().into_os_string(),
+                    ],
+                )?;
+                self.run_checked(
+                    Path::new("launchctl"),
+                    &[
+                        OsString::from("kickstart"),
+                        OsString::from("-k"),
+                        OsString::from(self.launchd_service_target()),
+                    ],
+                )?;
+            }
+            ServicePlatform::Linux => self.run_checked(
+                Path::new("systemctl"),
+                &[
+                    OsString::from("--user"),
+                    OsString::from("start"),
+                    OsString::from(UNIT),
+                ],
+            )?,
+        }
+        Ok(ServiceStatus {
+            installed: true,
+            active: true,
+        })
     }
 
     pub fn restart(&mut self) -> Result<ServiceStatus> {
@@ -277,13 +353,18 @@ impl<R: CommandRunner> ServiceManager<R> {
                 active: false,
             });
         }
-        let output = self.run(
-            Path::new("launchctl"),
-            &[
-                OsString::from("print"),
-                OsString::from(self.launchd_service_target()),
-            ],
-        )?;
+        let args = [
+            OsString::from("print"),
+            OsString::from(self.launchd_service_target()),
+        ];
+        let output = self.run(Path::new("launchctl"), &args)?;
+        if !output.success && !is_missing_launchd_service(&output) {
+            return Err(anyhow!(
+                "{} failed{}",
+                command_description(Path::new("launchctl"), &args),
+                format_command_error(&output)
+            ));
+        }
         Ok(ServiceStatus {
             installed: true,
             active: output.success,
@@ -298,15 +379,23 @@ impl<R: CommandRunner> ServiceManager<R> {
                 active: false,
             });
         }
-        let output = self.run(
-            Path::new("systemctl"),
-            &[
-                OsString::from("--user"),
-                OsString::from("status"),
-                OsString::from("--no-pager"),
-                OsString::from(UNIT),
-            ],
-        )?;
+        let args = [
+            OsString::from("--user"),
+            OsString::from("is-active"),
+            OsString::from(UNIT),
+        ];
+        let output = self.run(Path::new("systemctl"), &args)?;
+        let inactive = matches!(
+            output.stdout.trim(),
+            "inactive" | "failed" | "deactivating" | "unknown"
+        );
+        if !output.success && !inactive {
+            return Err(anyhow!(
+                "{} failed{}",
+                command_description(Path::new("systemctl"), &args),
+                format_command_error(&output)
+            ));
+        }
         Ok(ServiceStatus {
             installed: true,
             active: output.success,
