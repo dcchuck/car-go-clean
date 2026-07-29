@@ -17,6 +17,7 @@ use car_go_clean::safety::{
 #[derive(Default)]
 struct FakeIdentityProvider {
     boot_session: Option<BootSessionId>,
+    boot_error: bool,
     identities: BTreeMap<PathBuf, FilesystemIdentity>,
 }
 
@@ -24,8 +25,14 @@ impl FakeIdentityProvider {
     fn with_boot(boot_session: Option<&str>) -> Self {
         Self {
             boot_session: boot_session.map(|value| BootSessionId(value.to_string())),
+            boot_error: false,
             identities: BTreeMap::new(),
         }
+    }
+
+    fn with_boot_error(mut self) -> Self {
+        self.boot_error = true;
+        self
     }
 
     fn with_identity(mut self, path: &Path, device: u64, inode: u64) -> Self {
@@ -37,6 +44,9 @@ impl FakeIdentityProvider {
 
 impl IdentityProvider for FakeIdentityProvider {
     fn boot_session(&self) -> Result<Option<BootSessionId>> {
+        if self.boot_error {
+            return Err(anyhow!("fake boot session unavailable"));
+        }
         Ok(self.boot_session.clone())
     }
 
@@ -177,6 +187,7 @@ fn target_symlink_is_rejected_before_identity_comparison() {
     symlink(&real_target, project.join("target")).unwrap();
 
     let provider = FakeIdentityProvider::with_boot(Some("boot-a"))
+        .with_boot_error()
         .with_identity(&project, 1, 10)
         .with_identity(&project.join("target"), 1, 11);
     let review = review_project_with_identity_provider(
@@ -194,6 +205,7 @@ fn target_symlink_is_rejected_before_identity_comparison() {
         review.decision,
         CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable)
     );
+    assert_eq!(review.reviewed_identity, None);
 }
 
 #[test]
@@ -201,6 +213,7 @@ fn project_and_target_on_different_devices_are_rejected() {
     let project = tempfile::tempdir().unwrap();
     write_project(project.path());
     let provider = FakeIdentityProvider::with_boot(Some("boot-a"))
+        .with_boot_error()
         .with_identity(project.path(), 1, 10)
         .with_identity(&project.path().join("target"), 2, 11);
 
@@ -219,6 +232,53 @@ fn project_and_target_on_different_devices_are_rejected() {
         review.decision,
         CleanDecision::Skipped(SkipReason::CrossDeviceTarget)
     );
+    assert_eq!(review.reviewed_identity, None);
+}
+
+#[test]
+fn cleanable_review_captures_exact_identity_and_boot_session() {
+    let project = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let provider = FakeIdentityProvider::with_boot(Some("review-boot"))
+        .with_identity(project.path(), 7, 70)
+        .with_identity(&project.path().join("target"), 7, 71);
+
+    let review = review_project_with_identity_provider(
+        project.path(),
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &options(),
+        &provider,
+    )
+    .unwrap();
+
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+    assert_eq!(
+        review.reviewed_identity,
+        Some(ReviewedIdentity {
+            project: identity(7, 70),
+            target: identity(7, 71),
+            boot_session: Some(BootSessionId("review-boot".to_string())),
+        })
+    );
+
+    let unavailable = FakeIdentityProvider::with_boot(Some("unused"))
+        .with_boot_error()
+        .with_identity(project.path(), 7, 70)
+        .with_identity(&project.path().join("target"), 7, 71);
+    let error = review_project_with_identity_provider(
+        project.path(),
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &options(),
+        &unavailable,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("fake boot session unavailable"));
 }
 
 #[test]

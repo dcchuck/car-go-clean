@@ -87,13 +87,28 @@ fn direct_identity(path: &Path) -> Result<FilesystemIdentity> {
 
 #[cfg(target_os = "linux")]
 fn platform_boot_session() -> Result<Option<BootSessionId>> {
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .context("read Linux boot session identity")?;
-    let boot_id = boot_id.trim();
-    if boot_id.is_empty() {
-        bail!("Linux boot session identity is empty");
+    Ok(linux_boot_session_from_read(fs::read_to_string(
+        "/proc/sys/kernel/random/boot_id",
+    )))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_boot_session_from_read(read: std::io::Result<String>) -> Option<BootSessionId> {
+    let value = read.ok()?;
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() != 36
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
     }
-    Ok(Some(BootSessionId(boot_id.to_string())))
+    Some(BootSessionId(value.to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -109,23 +124,107 @@ fn platform_boot_session() -> Result<Option<BootSessionId>> {
             0,
         )
     };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("read macOS boot session identity");
+    if result != 0 || length != std::mem::size_of::<libc::timeval>() {
+        return Ok(macos_boot_session_from_sysctl_result(result, length, None));
     }
-    if length != std::mem::size_of::<libc::timeval>() {
-        bail!(
-            "macOS boot session identity had unexpected size {length}, expected {}",
-            std::mem::size_of::<libc::timeval>()
-        );
+    Ok(macos_boot_session_from_sysctl_result(
+        result,
+        length,
+        Some(unsafe { boot_time.assume_init() }),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_boot_session_from_sysctl_result(
+    result: i32,
+    length: usize,
+    boot_time: Option<libc::timeval>,
+) -> Option<BootSessionId> {
+    if result != 0 || length != std::mem::size_of::<libc::timeval>() {
+        return None;
     }
-    let boot_time = unsafe { boot_time.assume_init() };
-    Ok(Some(BootSessionId(format!(
+    macos_boot_session_from_timeval(boot_time?)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_boot_session_from_timeval(boot_time: libc::timeval) -> Option<BootSessionId> {
+    if boot_time.tv_sec < 0 || boot_time.tv_usec < 0 || boot_time.tv_usec >= 1_000_000 {
+        return None;
+    }
+    Some(BootSessionId(format!(
         "{}:{}",
         boot_time.tv_sec, boot_time.tv_usec
-    ))))
+    )))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn platform_boot_session() -> Result<Option<BootSessionId>> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn linux_boot_session_accepts_only_valid_uuid_text() {
+        assert_eq!(
+            linux_boot_session_from_read(Err(io::Error::from(io::ErrorKind::NotFound))),
+            None
+        );
+        assert_eq!(linux_boot_session_from_read(Ok("  \n".to_string())), None);
+        assert_eq!(
+            linux_boot_session_from_read(Ok("not-a-boot-uuid\n".to_string())),
+            None
+        );
+        assert_eq!(
+            linux_boot_session_from_read(Ok("ABCDEF01-2345-6789-abcd-ef0123456789\n".to_string())),
+            Some(BootSessionId(
+                "ABCDEF01-2345-6789-abcd-ef0123456789".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn macos_sysctl_result_requires_valid_shape_and_timeval() {
+        let valid = libc::timeval {
+            tv_sec: 1_725_000_000,
+            tv_usec: 42,
+        };
+        assert_eq!(
+            macos_boot_session_from_sysctl_result(
+                -1,
+                std::mem::size_of::<libc::timeval>(),
+                Some(valid),
+            ),
+            None
+        );
+        assert_eq!(
+            macos_boot_session_from_sysctl_result(0, 1, Some(valid)),
+            None
+        );
+        assert_eq!(
+            macos_boot_session_from_sysctl_result(
+                0,
+                std::mem::size_of::<libc::timeval>(),
+                Some(valid),
+            ),
+            Some(BootSessionId("1725000000:42".to_string()))
+        );
+        assert_eq!(
+            macos_boot_session_from_timeval(libc::timeval {
+                tv_sec: -1,
+                tv_usec: 42,
+            }),
+            None
+        );
+        assert_eq!(
+            macos_boot_session_from_timeval(libc::timeval {
+                tv_sec: 1_725_000_000,
+                tv_usec: 1_000_000,
+            }),
+            None
+        );
+    }
 }

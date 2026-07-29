@@ -1,5 +1,5 @@
 use crate::activity::{path_is_within, ActivitySignal};
-use crate::identity::{IdentityProvider, SystemIdentityProvider};
+use crate::identity::{IdentityProvider, ReviewedIdentity, SystemIdentityProvider};
 use crate::storage::{classify_protected_path_for, current_home_dir, HostPlatform, ProtectedKind};
 
 use anyhow::Result;
@@ -54,6 +54,7 @@ pub struct ProjectReview {
     pub class: ProjectClass,
     pub target_path: PathBuf,
     pub target_bytes: u64,
+    pub reviewed_identity: Option<ReviewedIdentity>,
     pub decision: CleanDecision,
 }
 
@@ -189,6 +190,7 @@ pub fn review_project_with_identity_provider(
             class,
             target_path,
             0,
+            None,
             CleanDecision::Skipped(SkipReason::InvalidManifest),
         ));
     }
@@ -199,6 +201,7 @@ pub fn review_project_with_identity_provider(
             class,
             target_path,
             0,
+            None,
             CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable),
         ));
     }
@@ -210,6 +213,7 @@ pub fn review_project_with_identity_provider(
                 class,
                 target_path,
                 0,
+                None,
                 CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable),
             ));
         }
@@ -222,6 +226,7 @@ pub fn review_project_with_identity_provider(
                 class,
                 target_path,
                 0,
+                None,
                 CleanDecision::Skipped(SkipReason::NoTarget),
             ));
         }
@@ -232,6 +237,7 @@ pub fn review_project_with_identity_provider(
                 class,
                 target_path,
                 0,
+                None,
                 CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable),
             ));
         }
@@ -244,6 +250,7 @@ pub fn review_project_with_identity_provider(
                 class,
                 target_path,
                 0,
+                None,
                 CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable),
             ));
         }
@@ -254,9 +261,16 @@ pub fn review_project_with_identity_provider(
             class,
             target_path,
             0,
+            None,
             CleanDecision::Skipped(SkipReason::CrossDeviceTarget),
         ));
     }
+
+    let reviewed_identity = Some(ReviewedIdentity {
+        project: project_identity,
+        target: target_identity,
+        boot_session: identity_provider.boot_session()?,
+    });
 
     let target_bytes = match directory_size(&target_path) {
         Ok(bytes) => bytes,
@@ -266,6 +280,7 @@ pub fn review_project_with_identity_provider(
                 class,
                 target_path,
                 0,
+                reviewed_identity.clone(),
                 CleanDecision::Skipped(SkipReason::TargetReadError),
             ));
         }
@@ -279,6 +294,7 @@ pub fn review_project_with_identity_provider(
                     class,
                     target_path,
                     target_bytes,
+                    reviewed_identity.clone(),
                     CleanDecision::Skipped(SkipReason::ManagedCache),
                 ));
             }
@@ -288,6 +304,7 @@ pub fn review_project_with_identity_provider(
                     class,
                     target_path,
                     target_bytes,
+                    reviewed_identity.clone(),
                     CleanDecision::Skipped(SkipReason::ContainerStorage),
                 ));
             }
@@ -304,6 +321,7 @@ pub fn review_project_with_identity_provider(
             class,
             target_path,
             target_bytes,
+            reviewed_identity.clone(),
             CleanDecision::Skipped(SkipReason::ScanError),
         ));
     }
@@ -314,6 +332,7 @@ pub fn review_project_with_identity_provider(
             class,
             target_path,
             target_bytes,
+            reviewed_identity.clone(),
             CleanDecision::Skipped(SkipReason::ActiveProcess),
         ));
     }
@@ -327,6 +346,7 @@ pub fn review_project_with_identity_provider(
                     class,
                     target_path,
                     target_bytes,
+                    reviewed_identity.clone(),
                     CleanDecision::Skipped(SkipReason::TargetReadError),
                 ));
             }
@@ -340,6 +360,7 @@ pub fn review_project_with_identity_provider(
                     class,
                     target_path,
                     target_bytes,
+                    reviewed_identity.clone(),
                     CleanDecision::Skipped(SkipReason::ActiveRecentWrite {
                         newest_age_secs: newest_age.as_secs(),
                     }),
@@ -353,6 +374,7 @@ pub fn review_project_with_identity_provider(
         class,
         target_path,
         target_bytes,
+        reviewed_identity,
         CleanDecision::Cleanable,
     ))
 }
@@ -392,6 +414,7 @@ fn review(
     class: ProjectClass,
     target_path: PathBuf,
     target_bytes: u64,
+    reviewed_identity: Option<ReviewedIdentity>,
     decision: CleanDecision,
 ) -> ProjectReview {
     ProjectReview {
@@ -399,6 +422,7 @@ fn review(
         class,
         target_path,
         target_bytes,
+        reviewed_identity,
         decision,
     }
 }
