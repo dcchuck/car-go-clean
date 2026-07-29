@@ -54,6 +54,67 @@ fn run_help_explains_default_scan_and_safety_flags() {
         .stdout(contains("requires --include-managed-cache"));
 }
 
+#[cfg(unix)]
+#[test]
+fn run_no_scan_prunes_physically_excluded_cached_alias_before_review() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let work = tempfile::tempdir().unwrap();
+    let library = work.path().join("Library");
+    let physical = library.join("copied-crate");
+    let alias = work.path().join("legacy-crate");
+    fs::create_dir_all(physical.join("target")).unwrap();
+    fs::write(physical.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(physical.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    symlink(&physical, &alias).unwrap();
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = []\nexcludes = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            library.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&alias, SystemTime::now()).unwrap();
+    drop(store);
+
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let marker = work.path().join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--no-scan", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("PATH", path)
+        .assert()
+        .success()
+        .stdout(contains("Run complete: cleaned=0"));
+
+    assert!(!marker.exists());
+    assert!(physical.join("target/blob.bin").exists());
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    assert!(store.all_projects().unwrap().is_empty());
+}
+
 #[test]
 fn run_dry_run_scans_fresh_state_by_default() {
     let work = tempfile::tempdir().unwrap();

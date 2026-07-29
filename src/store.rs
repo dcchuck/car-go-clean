@@ -364,25 +364,15 @@ impl Store {
     where
         F: FnMut(&Path) -> bool,
     {
-        let tx = self.conn.unchecked_transaction()?;
-
         let projects = {
-            let mut stmt = tx.prepare("SELECT path FROM projects")?;
+            let mut stmt = self.conn.prepare("SELECT path FROM projects")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             collect_rows(rows)?
         };
-        for path in projects {
-            if is_excluded(Path::new(&path)) {
-                tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
-            }
-        }
-
         let linked = {
-            let mut stmt = tx.prepare(
-                "
-                SELECT primary_path, linked_path, canonical_primary_path
-                FROM linked_worktrees
-                ",
+            let mut stmt = self.conn.prepare(
+                "SELECT primary_path, linked_path, canonical_primary_path
+                 FROM linked_worktrees",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -393,48 +383,70 @@ impl Store {
             })?;
             collect_rows(rows)?
         };
-        for (primary, linked, canonical_primary) in linked {
-            let remove = is_excluded(Path::new(&primary))
-                || is_excluded(Path::new(&linked))
-                || canonical_primary
-                    .as_deref()
-                    .is_some_and(|path| is_excluded(Path::new(path)));
-            if remove {
-                tx.execute(
-                    "
-                    DELETE FROM linked_worktrees
-                    WHERE primary_path=?1 AND linked_path=?2
-                    ",
-                    params![primary, linked],
-                )?;
-            }
-        }
-
         let failures = {
-            let mut stmt = tx.prepare(
-                "
-                SELECT primary_path, canonical_primary_path
-                FROM worktree_discovery_failures
-                ",
+            let mut stmt = self.conn.prepare(
+                "SELECT primary_path, canonical_primary_path
+                 FROM worktree_discovery_failures",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
             collect_rows(rows)?
         };
-        for (primary, canonical_primary) in failures {
-            let remove = is_excluded(Path::new(&primary))
-                || canonical_primary
-                    .as_deref()
-                    .is_some_and(|path| is_excluded(Path::new(path)));
-            if remove {
-                tx.execute(
-                    "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
-                    [&primary],
-                )?;
+
+        let mut remove_projects = Vec::new();
+        for path in projects {
+            if should_remove_cached_path(Path::new(&path), &mut is_excluded)? {
+                remove_projects.push(path);
             }
         }
 
+        let mut remove_linked = Vec::new();
+        for (primary, linked, canonical_primary) in linked {
+            let remove = should_remove_durable_identity(Path::new(&primary), &mut is_excluded)?
+                || should_remove_durable_identity(Path::new(&linked), &mut is_excluded)?
+                || match canonical_primary.as_deref() {
+                    Some(path) => {
+                        should_remove_durable_identity(Path::new(path), &mut is_excluded)?
+                    }
+                    None => false,
+                };
+            if remove {
+                remove_linked.push((primary, linked));
+            }
+        }
+
+        let mut remove_failures = Vec::new();
+        for (primary, canonical_primary) in failures {
+            let remove = should_remove_durable_identity(Path::new(&primary), &mut is_excluded)?
+                || match canonical_primary.as_deref() {
+                    Some(path) => {
+                        should_remove_durable_identity(Path::new(path), &mut is_excluded)?
+                    }
+                    None => false,
+                };
+            if remove {
+                remove_failures.push(primary);
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for path in remove_projects {
+            tx.execute("DELETE FROM projects WHERE path=?1", [&path])?;
+        }
+        for (primary, linked) in remove_linked {
+            tx.execute(
+                "DELETE FROM linked_worktrees
+                 WHERE primary_path=?1 AND linked_path=?2",
+                params![primary, linked],
+            )?;
+        }
+        for primary in remove_failures {
+            tx.execute(
+                "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+                [&primary],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1386,6 +1398,38 @@ fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+fn should_remove_cached_path<F>(path: &Path, is_excluded: &mut F) -> Result<bool>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if is_excluded(path) {
+        return Ok(true);
+    }
+    match std::fs::canonicalize(path) {
+        Ok(physical) => Ok(is_excluded(&physical)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => {
+            Err(err).with_context(|| format!("canonicalize cached project {}", path.display()))
+        }
+    }
+}
+
+fn should_remove_durable_identity<F>(path: &Path, is_excluded: &mut F) -> Result<bool>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if is_excluded(path) {
+        return Ok(true);
+    }
+    match std::fs::canonicalize(path) {
+        Ok(physical) => Ok(is_excluded(&physical)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("canonicalize cached project {}", path.display()))
+        }
+    }
 }
 
 fn path_to_string(path: &Path) -> Result<String> {

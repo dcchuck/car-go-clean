@@ -102,6 +102,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self
     }
 
+    pub fn reconcile_cached_state(&self) -> Result<Vec<PathBuf>> {
+        self.cache
+            .reconcile_for_review(|path| self.scanner.is_excluded(path))
+    }
+
     pub fn scan_cycle(&self) -> Result<()> {
         let now = SystemTime::now();
         let report = self.scanner.scan_with_errors()?;
@@ -118,9 +123,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 message: error.message,
             })?;
         }
-        self.store.normalize_resolvable_project_aliases()?;
-        self.store
-            .reconcile_excluded_discovery_state(|path| self.scanner.is_excluded(path))?;
+        self.reconcile_cached_state()?;
         for discovery in report.worktree_discoveries {
             match discovery {
                 WorktreeDiscovery::Success {
@@ -173,7 +176,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         safety: SafetyOptions,
         inspector: &impl ProcessInspector,
     ) -> Result<RunCycleResult> {
-        self.cache.sync_on_disk()?;
+        self.reconcile_cached_state()?;
         let started = SystemTime::now();
         let run_id = self.store.start_run(started)?;
         let projects = self.store.all_projects()?;

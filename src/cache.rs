@@ -35,4 +35,12 @@ impl<'a> Cache<'a> {
         }
         Ok(removed)
     }
+
+    pub fn reconcile_for_review<F>(&self, is_excluded: F) -> Result<Vec<PathBuf>>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        self.store.reconcile_excluded_discovery_state(is_excluded)?;
+        self.sync_on_disk()
+    }
 }

@@ -436,7 +436,7 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: boo
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
     if refresh {
-        Cache::new(&store).sync_on_disk()?;
+        reconcile_review_state(&store, &cfg)?;
         let safety = SafetyOptions {
             target_quiet_period: cfg.target_quiet_period,
             include_managed_cache: false,
@@ -498,7 +498,7 @@ fn projects(
 ) -> Result<()> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
-    Cache::new(&store).sync_on_disk()?;
+    reconcile_review_state(&store, &cfg)?;
     let safety = SafetyOptions {
         target_quiet_period: cfg.target_quiet_period,
         include_managed_cache: risky,
@@ -573,7 +573,7 @@ fn run_once(options: RunOptions) -> Result<()> {
     }
 
     if dry_run {
-        Cache::new(&store).sync_on_disk()?;
+        reconcile_review_state(&store, &cfg)?;
         let reviews = project_reviews(&store, &safety, cfg.scan_interval, "dry-run")?;
         print_review_summary("Dry run", &reviews);
         print_skip_breakdown(&review_summary(&reviews));
@@ -901,6 +901,11 @@ fn daemon_for_scan<'a>(store: &'a Store, cfg: &Config) -> Daemon<'a, RealRunner>
             target_quiet_period: cfg.target_quiet_period,
         },
     )
+}
+
+fn reconcile_review_state(store: &Store, cfg: &Config) -> Result<()> {
+    daemon_for_scan(store, cfg).reconcile_cached_state()?;
+    Ok(())
 }
 
 fn daemon_for_clean<'a>(

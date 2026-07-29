@@ -2193,7 +2193,7 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
 
 #[cfg(unix)]
 #[test]
-fn symlink_spelled_scan_error_blocks_cached_canonical_descendant() {
+fn reconciliation_uncertainty_aborts_before_cargo_without_mutation() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     let physical_root = tempfile::tempdir().unwrap();
@@ -2233,24 +2233,21 @@ fn symlink_spelled_scan_error_blocks_cached_canonical_descendant() {
         },
     );
 
-    daemon.scan_cycle().unwrap();
+    let error = daemon.scan_cycle().unwrap_err();
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    let result = daemon
-        .run_cycle_with_safety(
-            SafetyOptions {
-                target_quiet_period: Duration::ZERO,
-                include_managed_cache: false,
-                include_active: false,
-                force: false,
-            },
-            &NoopProcessInspector,
-        )
-        .unwrap();
 
-    assert_eq!(result.cleaned, 0);
-    assert_eq!(result.skipped, 1);
+    assert!(error.to_string().contains("canonicalize cached project"));
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(project.join("target/blob.bin").exists());
+    assert_eq!(
+        store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| PathBuf::from(project.path))
+            .collect::<Vec<_>>(),
+        vec![canonical_project]
+    );
 }
 
 #[test]
@@ -3520,4 +3517,135 @@ fn daemon_clamps_only_legacy_scan_deadlines_beyond_the_current_interval() {
         clamp_next_scan_at(earlier_deadline, now, interval),
         earlier_deadline
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_boundary_prunes_alias_of_excluded_library_before_cargo() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("Library");
+    let physical = library.join("copied-crate");
+    let alias = root.path().join("legacy-crate");
+    write_file(&physical.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&physical.join("target/blob.bin"), &[0; 2048]);
+    symlink(&physical, &alias).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&alias, SystemTime::now()).unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![],
+            excludes: vec![library.to_string_lossy().into_owned()],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(physical.join("target/blob.bin").exists());
+    assert!(store.all_projects().unwrap().is_empty());
+}
+
+#[test]
+fn upgraded_nonempty_cache_prunes_exclusions_when_clean_is_due_before_scan() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let library_project = root.path().join("Library/Caches/copied-crate");
+    let orbstack_project = root.path().join("OrbStack/docker/copied-crate");
+    let ordinary_project = root.path().join("src/ordinary");
+    for project in [&library_project, &orbstack_project, &ordinary_project] {
+        write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+        write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    }
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    for project in [&library_project, &orbstack_project, &ordinary_project] {
+        store.upsert_project(project, SystemTime::now()).unwrap();
+    }
+    let now = SystemTime::now();
+    store
+        .record_scheduler_status(
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap(),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![
+                root.path().join("Library").to_string_lossy().into_owned(),
+                root.path().join("OrbStack").to_string_lossy().into_owned(),
+            ],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    );
+    let shutdown = ShutdownFlag::new();
+    let shutdown_for_thread = shutdown;
+    let shutdown_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        shutdown_for_thread.request();
+    });
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+    shutdown_thread.join().unwrap();
+
+    assert_eq!(
+        runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.dir.clone())
+            .collect::<Vec<_>>(),
+        vec![ordinary_project.canonicalize().unwrap()]
+    );
+    assert!(library_project.join("target/blob.bin").exists());
+    assert!(orbstack_project.join("target/blob.bin").exists());
+    assert!(!ordinary_project.join("target").exists());
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 1);
 }

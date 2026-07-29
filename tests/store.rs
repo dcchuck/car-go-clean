@@ -234,7 +234,7 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
 
 #[cfg(unix)]
 #[test]
-fn reconcile_excluded_discovery_state_matches_canonical_primary_path_only() {
+fn reconcile_excluded_discovery_state_removes_physically_excluded_project() {
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().unwrap();
@@ -300,22 +300,30 @@ fn reconcile_excluded_discovery_state_matches_canonical_primary_path_only() {
         .reconcile_excluded_discovery_state(|path| path.starts_with(&excluded_root))
         .unwrap();
 
-    assert_eq!(
-        store
-            .all_projects()
-            .unwrap()
-            .into_iter()
-            .map(|project| PathBuf::from(project.path))
-            .collect::<Vec<_>>(),
-        vec![legacy_primary.clone()]
-    );
-    assert!(!store
-        .is_active_worktree_discovery_identity(&legacy_primary)
-        .unwrap());
-    assert!(!store
-        .is_active_worktree_discovery_identity(&linked)
-        .unwrap());
+    assert!(store.all_projects().unwrap().is_empty());
     assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn reconcile_excluded_discovery_state_aborts_without_mutation_on_canonicalize_error() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let loop_a = root.path().join("loop-a");
+    let loop_b = root.path().join("loop-b");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = test_store(&db_dir.path().join("state.db"));
+    store.upsert_project(&loop_a, SystemTime::now()).unwrap();
+
+    let error = store
+        .reconcile_excluded_discovery_state(|_| false)
+        .unwrap_err();
+    assert!(error.to_string().contains("canonicalize cached project"));
+    assert_eq!(store.all_projects().unwrap().len(), 1);
 }
 
 #[cfg(unix)]
