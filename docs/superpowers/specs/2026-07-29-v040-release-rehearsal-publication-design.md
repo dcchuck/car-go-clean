@@ -73,6 +73,19 @@ Before a release tag, a guarded job uses `HOMEBREW_TAP_TOKEN` to:
 Cleanup runs even when an intermediate step fails. The workflow never prints
 the token. Existing user branches and PRs are untouched.
 
+This rehearsal writes to a public repository, so its side effects are public:
+
+- the branch name is explicitly marked as a rehearsal artifact and carries the
+  rehearsal run ID, so anyone reading the tap can tell what it was;
+- a closed pull request remains permanently visible in the tap's history. That
+  is accepted as the cost of proving token capability before tagging;
+- before enabling this, confirm which of the tap's own workflows fire on
+  `pull_request` from a branch in the same repository. A formula-only no-op
+  can trigger a `brew test-bot` run that consumes minutes and reports a
+  confusing failure on an inert change. Prefer the inert evidence file over a
+  formula edit for exactly this reason, and if tap CI still fires, scope it to
+  ignore the rehearsal branch prefix.
+
 ## Retry-safe Draft Workflow
 
 An annotated stable tag starts hosting but does not imply immediate latest
@@ -104,7 +117,10 @@ Hosted smoke uses unauthenticated versioned URLs and verifies:
 - shell installer on fresh macOS and Linux runners;
 - exact binary version;
 - checksums and attestations;
-- Homebrew formula install/test against the public archives;
+- Homebrew formula install/test against the public archives. The tap PR is
+  still unmerged at this point, so the smoke renders the formula locally from
+  the release artifacts and installs from that file. It does not install from
+  the tap, which would test the previous version;
 - no implicit service installation;
 - formula URL/version/hash equality with release artifacts.
 
@@ -129,8 +145,13 @@ tests:
 - review-ID execution and recovered-byte accounting;
 - `--no-scan`;
 - narrowed scope retaining an out-of-scope sentinel;
-- Cargo failure reporting and nonzero exit;
+- Cargo failure reporting and exit `1`;
+- an incomplete scan reporting exit `2` while still printing usable results,
+  and a fully clean run reporting `0`;
 - strict config typo/undefined-variable handling;
+- a legacy `excludes` config loading with a deprecation warning, and
+  `config migrate` rewriting it to `override_excludes`;
+- `config` output redirected to a config file and reloaded unchanged;
 - service absent/install/running/stop/reboot/start/uninstall behavior;
 - config/state retention;
 - v0.2 and v0.3 upgrades in active, stopped, and absent states;
@@ -138,6 +159,15 @@ tests:
 
 Intel macOS and x86_64 Linux remain covered by GitHub-hosted architecture
 runners because Apple Silicon Tart cannot execute those native targets.
+
+This is a dependency on a runner label GitHub is retiring. Before relying on
+it, the rehearsal workflow resolves the Intel macOS label it will use and
+fails loudly if that label no longer exists, rather than silently falling back
+to an Apple Silicon runner and reporting `x86_64-apple-darwin` as validated.
+If no Intel macOS runner is available, the honest position is that
+`x86_64-apple-darwin` has archive- and checksum-level verification but no
+install-path validation, and the release notes say so. Do not treat an
+arm64 runner's success as coverage for that target.
 
 Sanitized transcripts, commit SHA, image digests, artifact hashes, workflow
 run URLs, and pass/fail results are stored as release evidence without
@@ -150,7 +180,11 @@ acceptance.
 
 Cleanup procedure:
 
-1. Capture `tart list`, Tart storage usage, and host free space.
+1. Capture `tart list`, Tart storage usage, and host free space. Record each
+   VM's **source image reference and digest**, not only its local name — a
+   bare name is not enough to pull anything back. Any VM whose source cannot
+   be determined is reported by name before deletion, because that is the one
+   case where deletion is genuinely unrecoverable.
 2. Verify no acceptance process still depends on a VM.
 3. Stop every running Tart VM.
 4. Delete every listed VM, including pre-existing VMs.
@@ -159,7 +193,13 @@ Cleanup procedure:
 7. Report host free space before/after and estimated bytes reclaimed.
 
 Deletion happens only after evidence is copied out and validation is complete.
-VM deletion is not recoverable unless the source image is pulled again.
+VM deletion is not recoverable unless the source image is pulled again, and
+local changes inside a VM are never recoverable.
+
+Step 4 deletes pre-existing VMs that have nothing to do with this release. The
+user authorized that explicitly. The inventory from step 1 is printed and
+confirmed immediately before deletion rather than only archived, so the
+authorization is exercised against a concrete list instead of a category.
 
 ## Error Handling and Rollback
 

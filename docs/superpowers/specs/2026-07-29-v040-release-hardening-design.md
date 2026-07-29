@@ -1,5 +1,24 @@
 # v0.4.0 Release Hardening Design
 
+> **Status: partially superseded. Do not implement from this document alone.**
+>
+> Independent review found that several mechanisms here are insufficient. The
+> following sections are superseded and must be read in their replacements:
+>
+> - *Cached-State Reconciliation*, *Shared Platform Storage Profile*, and
+>   *Daemon Upgrade Behavior* →
+>   `2026-07-29-v040-runtime-safety-foundation-design.md`. Cached path rows are
+>   replaced by discovery generations and observations; a cached row is never
+>   authorization by itself.
+> - *Service Lifecycle UX* and the documented active-service preview →
+>   `2026-07-29-v040-operator-control-design.md`. `bootout` alone does not
+>   persist a stop across login.
+> - *Release Notes and Homebrew Completion* and *Fresh-install Validation* →
+>   `2026-07-29-v040-release-rehearsal-publication-design.md`.
+>
+> The *Scanner Filesystem Boundary* section and the exclusion-ordering work it
+> describes remain current and are already implemented.
+
 ## Context
 
 The v0.4.0 release candidate adds platform-aware scan exclusions, automatic
