@@ -3,6 +3,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -136,6 +138,37 @@ pub struct PathSet {
     pub lock_path: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct ConfigMigration {
+    path: PathBuf,
+    before: String,
+    after: String,
+}
+
+impl ConfigMigration {
+    pub fn unified_diff(&self) -> String {
+        similar::TextDiff::from_lines(&self.before, &self.after)
+            .unified_diff()
+            .header(
+                &format!("{} (legacy)", self.path.display()),
+                &format!("{} (migrated)", self.path.display()),
+            )
+            .to_string()
+    }
+
+    pub fn apply(self) -> Result<()> {
+        let current = fs::read_to_string(&self.path)
+            .with_context(|| format!("re-read {}", self.path.display()))?;
+        if current != self.before {
+            return Err(anyhow!(
+                "{} changed after migration preview; refusing to overwrite it",
+                self.path.display()
+            ));
+        }
+        write_atomic(&self.path, self.after.as_bytes())
+    }
+}
+
 pub fn default_path() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(xdg).join("car-go-clean/config.toml");
@@ -168,6 +201,78 @@ pub fn load(path: impl AsRef<Path>) -> Result<Config> {
     let raw: RawConfig =
         toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     apply_overlay(raw).with_context(|| format!("validate {}", path.display()))
+}
+
+pub fn prepare_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigration>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let before = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let raw: RawConfig =
+        toml::from_str(&before).with_context(|| format!("parse {}", path.display()))?;
+    if raw.excludes.is_some() && raw.override_excludes.is_some() {
+        return Err(anyhow!("excludes and override_excludes cannot both be set"));
+    }
+    if raw.excludes.is_none() {
+        return Ok(None);
+    }
+    apply_overlay(raw)?;
+
+    let mut document = before
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("edit {}", path.display()))?;
+    let (old_key, item) = document
+        .as_table_mut()
+        .remove_entry("excludes")
+        .ok_or_else(|| anyhow!("legacy excludes key disappeared during migration"))?;
+    let new_key = toml_edit::Key::new("override_excludes")
+        .with_leaf_decor(old_key.leaf_decor().clone())
+        .with_dotted_decor(old_key.dotted_decor().clone());
+    document.as_table_mut().insert_formatted(&new_key, item);
+    let after = document.to_string();
+    let migrated: RawConfig = toml::from_str(&after).context("validate migrated configuration")?;
+    if migrated.override_excludes.is_none() || migrated.excludes.is_some() {
+        return Err(anyhow!(
+            "migrated configuration did not preserve exclusions"
+        ));
+    }
+    apply_overlay(migrated)?;
+
+    Ok(Some(ConfigMigration {
+        path: path.to_path_buf(),
+        before,
+        after,
+    }))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let temp_path = path.with_extension(format!("car-go-clean-migrate-{}.tmp", std::process::id()));
+    let permissions = fs::metadata(path)
+        .with_context(|| format!("read permissions for {}", path.display()))?
+        .permissions();
+    let mut created = false;
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("create {}", temp_path.display()))?;
+        created = true;
+        temp.set_permissions(permissions)
+            .with_context(|| format!("set permissions on {}", temp_path.display()))?;
+        temp.write_all(contents)
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+        drop(temp);
+        fs::rename(&temp_path, path).with_context(|| format!("replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn apply_overlay(raw: RawConfig) -> Result<Config> {

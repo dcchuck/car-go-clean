@@ -1,7 +1,7 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
-use crate::config::{default_path, load, paths, Config, ConfigWarning, PathSet};
+use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
@@ -169,7 +169,9 @@ enum Commands {
         skip_cargo: bool,
     },
     Config {
-        #[arg(long)]
+        #[command(subcommand)]
+        command: Option<ConfigCommands>,
+        #[arg(long, global = true)]
         config: Option<PathBuf>,
     },
     Status {
@@ -276,6 +278,12 @@ enum ServiceCommands {
     Uninstall,
 }
 
+#[derive(Debug, Subcommand)]
+enum ConfigCommands {
+    /// Rename deprecated configuration keys in place.
+    Migrate,
+}
+
 pub fn run() -> Result<()> {
     execute(Cli::parse())
 }
@@ -292,11 +300,25 @@ fn execute(cli: Cli) -> Result<()> {
             state_dir,
             skip_cargo,
         } => health(config, state_dir, skip_cargo),
-        Commands::Config { config } => {
-            let cfg = load_config(config)?;
-            print!("{}", cfg.to_toml()?);
-            Ok(())
-        }
+        Commands::Config { command, config } => match command {
+            None => {
+                let cfg = load_config(config)?;
+                print!("{}", cfg.to_toml()?);
+                Ok(())
+            }
+            Some(ConfigCommands::Migrate) => {
+                let path = config.unwrap_or_else(default_path);
+                match prepare_migration(&path)? {
+                    Some(migration) => {
+                        print!("{}", migration.unified_diff());
+                        migration.apply()?;
+                        println!("Migrated {}", path.display());
+                    }
+                    None => println!("No migration needed for {}", path.display()),
+                }
+                Ok(())
+            }
+        },
         Commands::Status {
             config,
             state_dir,

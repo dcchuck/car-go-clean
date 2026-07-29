@@ -148,6 +148,42 @@ fn config_command_keeps_warning_off_round_trippable_stdout() {
     assert!(load(&round_trip).unwrap().warnings().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn config_migrate_renames_legacy_excludes_idempotently() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\nexcludes = [\"vendor\"]\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "migrate", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("--- "))
+        .stdout(contains("+++ "))
+        .stdout(contains("-excludes = ["))
+        .stdout(contains("+override_excludes = ["));
+
+    assert!(load(&config).unwrap().warnings().is_empty());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "migrate", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("No migration needed"));
+}
+
 #[test]
 fn run_dry_run_scans_fresh_state_by_default() {
     let work = tempfile::tempdir().unwrap();

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use car_go_clean::config::{default_path, load, paths, Config, ConfigWarning};
+use car_go_clean::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning};
 
 #[test]
 fn default_config_scans_home_and_has_intervals() {
@@ -271,6 +271,69 @@ fn legacy_excludes_loads_as_a_warned_override_but_conflicts_with_new_override() 
     .unwrap();
     let error = format!("{:#}", load(&conflict).unwrap_err());
     assert!(error.contains("excludes and override_excludes cannot both be set"));
+}
+
+#[test]
+fn migration_renames_only_the_legacy_key_and_preserves_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"# operator scope
+scan_dirs = ["/tmp/work"]
+
+# intentionally broad legacy override
+excludes = [
+  "vendor", # generated source
+]
+"#,
+    )
+    .unwrap();
+
+    let migration = prepare_migration(&path).unwrap().unwrap();
+    let diff = migration.unified_diff();
+
+    assert!(diff.contains("--- "));
+    assert!(diff.contains("+++ "));
+    assert!(diff.contains("-excludes = ["));
+    assert!(diff.contains("+override_excludes = ["));
+    assert!(fs::read_to_string(&path).unwrap().contains("excludes = ["));
+
+    migration.apply().unwrap();
+    let migrated = fs::read_to_string(&path).unwrap();
+    assert!(migrated.contains("# operator scope"));
+    assert!(migrated.contains("# intentionally broad legacy override"));
+    assert!(migrated.contains("# generated source"));
+    assert!(migrated.contains("override_excludes = ["));
+    assert!(!migrated.lines().any(|line| line.starts_with("excludes =")));
+    assert!(load(&path).unwrap().warnings().is_empty());
+}
+
+#[test]
+fn migration_is_a_noop_without_a_legacy_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "scan_dirs = [\"/tmp\"]\nextra_excludes = [\"vendor\"]\n",
+    )
+    .unwrap();
+
+    assert!(prepare_migration(&path).unwrap().is_none());
+}
+
+#[test]
+fn migration_refuses_conflicting_or_unknown_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    for body in [
+        "scan_dirs = [\"/tmp\"]\nexcludes = []\noverride_excludes = []\n",
+        "scan_dirs = [\"/tmp\"]\nexclude = []\n",
+    ] {
+        let path = dir.path().join(format!("{}.toml", body.len()));
+        fs::write(&path, body).unwrap();
+        assert!(prepare_migration(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+    }
 }
 
 #[test]
