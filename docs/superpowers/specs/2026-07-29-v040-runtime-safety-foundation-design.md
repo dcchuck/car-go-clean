@@ -78,7 +78,7 @@ processes agree byte for byte:
 2. canonical scan roots, sorted;
 3. canonical explicit project paths, sorted;
 4. lexical exclusion patterns, sorted;
-5. canonical exclusion identities that resolved, sorted;
+5. canonical identities for absolute exclusions that resolved, sorted;
 6. resolved protected roots with their kinds, sorted;
 7. `target_quiet_period`;
 8. `scan_interval` (it defines the scan-error window that gates cleanup);
@@ -220,11 +220,18 @@ sampled once for an entire cycle.
 
 ## Exclusion and Protected-storage Snapshots
 
-Build the exclusion matcher from current lexical and canonical identities for
-each scan and each review/cleanup cycle. A long-lived daemon never reuses a
-canonical target captured only at startup.
+Build the exclusion matcher from current lexical patterns and the canonical
+identities of absolute exclusions for each scan and each review/cleanup cycle.
+A long-lived daemon never reuses a canonical target captured only at startup.
 
-### Absent Exclusions Are Normal, Unreadable Exclusions Are Not
+Relative exclusions such as `.git` and `node_modules` are component/path
+patterns, not filesystem identities. They remain lexical-only: policy
+construction never passes them to the canonicalizer, anchors them to the
+process working directory, or records a canonical identity for them. This
+keeps policy hashes deterministic between an interactive command and a
+service with a different working directory.
+
+### Absent Absolute Exclusions Are Normal, Unreadable Absolute Exclusions Are Not
 
 "Canonicalization uncertainty blocks cleanup" must not be implemented as
 "any canonicalization failure blocks cleanup". The default exclusion set is
@@ -234,14 +241,14 @@ home-anchored and deliberately speculative: `~/.bun/install/cache`,
 uncertainty would block every cycle on a stock install, and the tool would
 never clean anything again.
 
-The rule is therefore by error kind:
+The following error rule applies to absolute exclusion entries only:
 
-- `NotFound` — the exclusion cannot alias anything that exists. Keep the
-  lexical pattern active, record nothing, do not block. This is the common
+- `NotFound` — the absolute exclusion cannot alias anything that exists. Keep
+  the lexical pattern active, record nothing, do not block. This is the common
   case for defaults.
 - Permission denied, symlink loop, I/O error, or any other failure — the
-  exclusion may be aliasing a real path that this cycle cannot see. Block
-  cleanup for the cycle and report which entry failed and why.
+  absolute exclusion may be aliasing a real path that this cycle cannot see.
+  Block cleanup for the cycle and report which entry failed and why.
 
 This restores the distinction the superseded design made for cached paths
 ("missing paths are marked for eviction; any other canonicalization failure
@@ -308,8 +315,10 @@ Rules:
 - both `${NAME}` and bare `$NAME` remain supported, matching v0.2/v0.3
   behavior; unterminated `${NAME` is an error;
 - expanded `scan_dirs` and `project_dirs` must be absolute;
-- relative exclusion entries remain component/path patterns, while absolute
-  exclusions must remain absolute after expansion;
+- relative exclusion entries remain lexical-only component/path patterns and
+  are never canonicalized or working-directory anchored, while absolute
+  exclusions must remain absolute after expansion and receive fresh canonical
+  identity snapshots;
 - empty effective scope (`scan_dirs` and `project_dirs` both empty) is invalid;
 - `extra_excludes` appends to protected defaults;
 - `override_excludes` deliberately replaces editable discovery exclusions;

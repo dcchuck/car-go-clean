@@ -8,7 +8,6 @@ use std::time::Duration;
 use car_go_clean::config::{load, Config};
 use car_go_clean::policy::{
     Canonicalizer, Environment, ProtectedRootKind, RootProvenance, ScopePolicy,
-    POLICY_HASH_FORMAT_VERSION,
 };
 
 #[derive(Default)]
@@ -131,11 +130,11 @@ fn policy_hash_is_stable_across_input_order() {
 }
 
 #[test]
-fn relative_exclusions_do_not_depend_on_process_working_directory() {
+fn relative_exclusions_are_lexical_only_and_do_not_depend_on_process_working_directory() {
     let config = test_config(&["/scope"], &[], &[".git", "node_modules"]);
     let first_canonicalizer = TestCanonicalizer::default()
-        .maps(".git", "/checkout/a/.git")
-        .maps("node_modules", "/checkout/a/node_modules");
+        .fails(".git", io::ErrorKind::PermissionDenied)
+        .fails("node_modules", io::ErrorKind::Other);
     let second_canonicalizer = TestCanonicalizer::default()
         .maps(".git", "/checkout/b/.git")
         .maps("node_modules", "/checkout/b/node_modules");
@@ -247,15 +246,6 @@ fn policy_hash_changes_for_each_enumerated_authority_input() {
         &baseline_canonicalizer,
     );
 
-    let format_version = ScopePolicy::build_with_canonicalizer_and_format_version(
-        &baseline_config,
-        Path::new("/config/a.toml"),
-        &baseline_environment,
-        &baseline_canonicalizer,
-        POLICY_HASH_FORMAT_VERSION + 1,
-    )
-    .unwrap();
-
     for (input, policy) in [
         ("canonical scan roots", scan),
         ("canonical project paths", project),
@@ -265,7 +255,6 @@ fn policy_hash_changes_for_each_enumerated_authority_input() {
         ("target quiet period", quiet),
         ("scan interval", scan_interval),
         ("config source", config_source),
-        ("policy hash format version", format_version),
     ] {
         assert_ne!(baseline.hash(), policy.hash(), "{input}");
     }

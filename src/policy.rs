@@ -120,23 +120,6 @@ impl ScopePolicy {
         environment: &dyn Environment,
         canonicalizer: &dyn Canonicalizer,
     ) -> Result<Self> {
-        Self::build_with_canonicalizer_and_format_version(
-            config,
-            config_source,
-            environment,
-            canonicalizer,
-            POLICY_HASH_FORMAT_VERSION,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn build_with_canonicalizer_and_format_version(
-        config: &Config,
-        config_source: &Path,
-        environment: &dyn Environment,
-        canonicalizer: &dyn Canonicalizer,
-        format_version: u32,
-    ) -> Result<Self> {
         let mut canonical_scan_roots =
             canonicalize_required(&config.scan_dirs, "scan root", canonicalizer)?;
         let mut canonical_project_paths =
@@ -172,7 +155,7 @@ impl ScopePolicy {
         sort_and_deduplicate(&mut protected_roots);
 
         let hash_input = PolicyHashInput {
-            format_version,
+            format_version: POLICY_HASH_FORMAT_VERSION,
             scan_roots: &canonical_scan_roots,
             project_paths: &canonical_project_paths,
             lexical_exclusions: &lexical_exclusions,
@@ -182,13 +165,7 @@ impl ScopePolicy {
             scan_interval_ms: config.scan_interval.as_millis(),
             config_source,
         };
-        let serialized =
-            serde_json::to_vec(&hash_input).context("serialize cleanup policy hash input")?;
-        let digest = Sha256::digest(serialized);
-        let mut hash = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
-        }
+        let hash = hash_policy_input(&hash_input)?;
 
         Ok(Self {
             canonical_scan_roots,
@@ -200,7 +177,7 @@ impl ScopePolicy {
             scan_interval: config.scan_interval,
             config_source: config_source.to_path_buf(),
             hash,
-            policy_hash_format_version: format_version,
+            policy_hash_format_version: POLICY_HASH_FORMAT_VERSION,
         })
     }
 
@@ -242,6 +219,16 @@ impl ScopePolicy {
             config_source: &self.config_source,
         }
     }
+}
+
+fn hash_policy_input(input: &PolicyHashInput<'_>) -> Result<String> {
+    let serialized = serde_json::to_vec(input).context("serialize cleanup policy hash input")?;
+    let digest = Sha256::digest(serialized);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(hash)
 }
 
 fn canonicalize_required(
@@ -287,4 +274,32 @@ fn lexical_exclusion_matches(path: &Path, exclusion: &Path) -> bool {
     path_components
         .windows(exclusion_components.len())
         .any(|window| window == exclusion_components)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_hash_format_version_changes_internal_hash() {
+        let paths = Vec::<PathBuf>::new();
+        let exclusions = Vec::<String>::new();
+        let protected_roots = Vec::<ProtectedRoot>::new();
+        let input = |format_version| PolicyHashInput {
+            format_version,
+            scan_roots: &paths,
+            project_paths: &paths,
+            lexical_exclusions: &exclusions,
+            canonical_exclusions: &paths,
+            protected_roots: &protected_roots,
+            target_quiet_period_ms: 1,
+            scan_interval_ms: 2,
+            config_source: Path::new("/config.toml"),
+        };
+
+        let current = hash_policy_input(&input(POLICY_HASH_FORMAT_VERSION)).unwrap();
+        let next = hash_policy_input(&input(POLICY_HASH_FORMAT_VERSION + 1)).unwrap();
+
+        assert_ne!(current, next);
+    }
 }

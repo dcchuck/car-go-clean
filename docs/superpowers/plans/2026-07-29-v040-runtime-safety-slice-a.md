@@ -14,7 +14,7 @@
 - Do not alter the real Homebrew installation, launchd service, configuration, or state on the development Mac.
 - `--no-scan` skips discovery only; it never bypasses scope, generation, exclusion, identity, activity, quiet-period, or managed-storage checks.
 - The policy hash is SHA-256 over the exact versioned tuple specified below; `clean_interval` and `log_level` are excluded.
-- An absent speculative exclusion is normal; every non-`NotFound` canonicalization failure blocks the cycle.
+- Relative component exclusions are lexical-only and never canonicalized or working-directory anchored. An absent speculative absolute exclusion is normal; every non-`NotFound` absolute-exclusion canonicalization failure blocks the cycle.
 - Persisted device numbers are comparable only inside the same boot session.
 - A migrated path-only database grants no current cleanup authority.
 - Forced discovery for missing/mismatched policy generations is rate-limited to once per five minutes.
@@ -48,10 +48,15 @@ Create `tests/policy.rs` with table-driven tests for:
 fn policy_hash_is_stable_across_input_order() { /* same roots in different order */ }
 
 #[test]
+fn relative_exclusions_are_lexical_only_and_do_not_depend_on_process_working_directory() {
+    /* injected canonicalizer errors for relative patterns are never consulted */
+}
+
+#[test]
 fn policy_hash_changes_for_each_enumerated_authority_input() {
     // Independently vary scan roots, explicit projects, lexical exclusions,
     // canonical exclusions, protected roots/kinds, quiet period, scan
-    // interval, config path, and POLICY_HASH_FORMAT_VERSION.
+    // interval, and config path.
 }
 
 #[test]
@@ -71,6 +76,9 @@ fn relocated_manager_roots_have_environment_provenance() { /* CARGO_HOME etc. */
 ```
 
 Use an injected `Environment` and `Canonicalizer` in tests; do not mutate the process-wide environment.
+Exercise `POLICY_HASH_FORMAT_VERSION` variation through a private hash helper
+and an in-module unit test. Do not expose a production constructor that accepts
+an arbitrary format version.
 
 - [ ] **Step 2: Run the new tests and confirm the missing API fails**
 
@@ -144,6 +152,8 @@ struct PolicyHashInput<'a> {
 ```
 
 Sort and deduplicate each list before hashing. Add `sha2 = "0.10"` and format the 32-byte digest as lowercase hex without adding another dependency.
+`ScopePolicy::build` and the canonicalizer-injected test seam always use
+`POLICY_HASH_FORMAT_VERSION`; no public API accepts a caller-selected version.
 
 - [ ] **Step 4: Make protected storage provenance explicit**
 
@@ -167,17 +177,24 @@ Cover `CARGO_HOME`, `RUSTUP_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `GOMODCACH
 
 - [ ] **Step 5: Build a fresh exclusion snapshot per policy**
 
-Implement `Canonicalizer` so production uses `std::fs::canonicalize`. For exclusions:
+Implement `Canonicalizer` so production uses `std::fs::canonicalize`. Relative
+component/path exclusions are lexical-only: never pass them to the
+canonicalizer, anchor them to the working directory, or add them to
+`canonical_exclusions`. For absolute exclusions only:
 
 ```rust
-match canonicalizer.canonicalize(path) {
-    Ok(path) => canonical_exclusions.push(path),
-    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-    Err(error) => bail!("canonicalize exclusion {}: {error}", path.display()),
+if path.is_absolute() {
+    match canonicalizer.canonicalize(path) {
+        Ok(path) => canonical_exclusions.push(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => bail!("canonicalize exclusion {}: {error}", path.display()),
+    }
 }
 ```
 
-Keep lexical patterns active even when the path does not exist. Require every configured scan root and explicit project to canonicalize successfully.
+Keep every lexical pattern active even when an absolute path does not exist.
+Require every configured scan root and explicit project to canonicalize
+successfully.
 
 - [ ] **Step 6: Run focused and regression tests**
 
