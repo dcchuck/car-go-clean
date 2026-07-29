@@ -1,3 +1,4 @@
+use crate::policy::{Environment, ProcessEnvironment};
 use crate::storage::{current_home_dir, protected_roots_for, HostPlatform};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -437,13 +438,21 @@ fn default_log_level() -> String {
 }
 
 fn default_excludes() -> Vec<String> {
-    default_excludes_for(&current_home_dir(), HostPlatform::current())
+    default_excludes_for(
+        &current_home_dir(),
+        HostPlatform::current(),
+        &ProcessEnvironment,
+    )
 }
 
-fn default_excludes_for(home: &Path, platform: HostPlatform) -> Vec<String> {
+fn default_excludes_for(
+    home: &Path,
+    platform: HostPlatform,
+    environment: &dyn Environment,
+) -> Vec<String> {
     let mut excludes = vec![".git".to_string(), "node_modules".to_string()];
     excludes.extend(
-        protected_roots_for(home, platform)
+        protected_roots_for(platform, home, environment)
             .into_iter()
             .map(|root| root.path.to_string_lossy().into_owned()),
     );
@@ -454,6 +463,15 @@ fn default_excludes_for(home: &Path, platform: HostPlatform) -> Vec<String> {
 #[cfg(test)]
 mod default_exclude_tests {
     use super::*;
+    use std::ffi::OsString;
+
+    struct EmptyEnvironment;
+
+    impl Environment for EmptyEnvironment {
+        fn var_os(&self, _name: &str) -> Option<OsString> {
+            None
+        }
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -461,7 +479,11 @@ mod default_exclude_tests {
 
     #[test]
     fn macos_defaults_anchor_managed_and_platform_paths_to_home() {
-        let excludes = default_excludes_for(Path::new("/Users/tester"), HostPlatform::MacOs);
+        let excludes = default_excludes_for(
+            Path::new("/Users/tester"),
+            HostPlatform::MacOs,
+            &EmptyEnvironment,
+        );
 
         assert_eq!(
             excludes,
@@ -486,7 +508,11 @@ mod default_exclude_tests {
 
     #[test]
     fn linux_defaults_cover_rootless_container_and_desktop_vm_storage() {
-        let excludes = default_excludes_for(Path::new("/home/tester"), HostPlatform::Linux);
+        let excludes = default_excludes_for(
+            Path::new("/home/tester"),
+            HostPlatform::Linux,
+            &EmptyEnvironment,
+        );
 
         assert_eq!(
             excludes,
@@ -513,11 +539,15 @@ mod default_exclude_tests {
     #[test]
     fn missing_or_relative_home_never_creates_unanchored_manager_patterns() {
         assert_eq!(
-            default_excludes_for(Path::new(""), HostPlatform::MacOs),
+            default_excludes_for(Path::new(""), HostPlatform::MacOs, &EmptyEnvironment),
             strings(&[".git", "node_modules"])
         );
         assert_eq!(
-            default_excludes_for(Path::new("relative-home"), HostPlatform::Linux),
+            default_excludes_for(
+                Path::new("relative-home"),
+                HostPlatform::Linux,
+                &EmptyEnvironment,
+            ),
             strings(&[".git", "node_modules"])
         );
     }
