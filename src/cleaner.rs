@@ -20,6 +20,7 @@ pub struct CleanResult {
     pub duration: Duration,
     pub exit_code: i32,
     pub stderr_excerpt: String,
+    pub measurement_error: Option<String>,
     pub skipped: bool,
 }
 
@@ -66,6 +67,7 @@ impl<R: CommandRunner> Cleaner<R> {
             duration: Duration::ZERO,
             exit_code: 0,
             stderr_excerpt: String::new(),
+            measurement_error: None,
             skipped: false,
         };
 
@@ -86,11 +88,14 @@ impl<R: CommandRunner> Cleaner<R> {
         result.duration = start.elapsed();
         result.exit_code = outcome.exit_code;
         result.stderr_excerpt = stderr_excerpt(&outcome.stderr);
-        result.bytes_after = if target_dir.exists() {
-            dir_size(&target_dir)?
-        } else {
-            0
-        };
+        match dir_size(&target_dir) {
+            Ok(bytes_after) => result.bytes_after = bytes_after,
+            Err(error) => {
+                result.bytes_after = result.bytes_before;
+                result.measurement_error =
+                    Some(format!("measure target after cargo clean: {error:#}"));
+            }
+        }
         Ok(result)
     }
 }
@@ -178,5 +183,31 @@ fn stderr_excerpt(stderr: &str) -> String {
     if stderr.len() <= MAX_STDERR_EXCERPT {
         return stderr.to_string();
     }
-    stderr[stderr.len() - MAX_STDERR_EXCERPT..].to_string()
+
+    let mut start = stderr.len() - MAX_STDERR_EXCERPT;
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    stderr[start..].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stderr_excerpt_starts_on_a_utf8_boundary() {
+        let stderr = format!("prefix:{}", "€".repeat(2_000));
+
+        let excerpt = stderr_excerpt(&stderr);
+
+        assert!(excerpt.len() <= MAX_STDERR_EXCERPT);
+        assert!(stderr.ends_with(&excerpt));
+        assert!(excerpt.chars().all(|character| character == '€'));
+    }
+
+    #[test]
+    fn stderr_excerpt_preserves_short_input() {
+        assert_eq!(stderr_excerpt("cargo failed: λ"), "cargo failed: λ");
+    }
 }

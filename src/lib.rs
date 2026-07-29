@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod lockfile;
 pub mod logging;
+pub mod outcome;
 pub mod safety;
 pub mod scanner;
 pub mod service;

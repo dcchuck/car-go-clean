@@ -78,6 +78,10 @@ A real run has no interactive confirmation. For advanced cached-only use,
 `car-go-clean run --no-scan` skips discovery but does not relax any safety
 gate.
 
+One-shot commands exit `0` for complete coverage, `2` for valid results with
+incomplete discovery coverage, and `1` for failures. A macOS home scan can
+legitimately return `2` when privacy-protected directories cannot be read.
+
 ## Agent Quick Start
 
 Copy this prompt into your coding agent:
@@ -163,12 +167,18 @@ clean_interval = "24h"
 scan_interval = "1d"
 ```
 
-- `scan_dirs` controls discovery roots; the default is `$HOME`.
+- `scan_dirs` and `project_dirs` define cleanup discovery scope and must expand
+  to absolute paths.
 - Platform-aware defaults prune operating-system, package-manager, container,
   and VM storage before traversal; see the configuration reference for the
   exact macOS and Linux lists.
-- `project_dirs` can add explicit projects outside those roots; `excludes`
-  always wins.
+- `extra_excludes` is the normal way to add discovery exclusions.
+- `override_excludes` is an advanced option that replaces editable discovery
+  defaults; protected-storage cleanup gates remain independent.
+- The v0.4 binary still accepts legacy `excludes` with a warning. Run
+  `car-go-clean config migrate` before v0.5.
+- Unknown keys, unset path variables, unterminated `${NAME` expressions, and
+  an empty effective scope are configuration errors.
 - Git-reported linked worktrees are discovered conservatively. A discovery
   failure blocks the affected primary/worktree set until a later success.
 - Review before cleanup with `car-go-clean run --dry-run`.

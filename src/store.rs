@@ -323,6 +323,72 @@ impl Store {
             tx.execute("INSERT INTO schema_version (version) VALUES (7)", [])?;
             tx.commit()?;
         }
+        if current < 8 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                UPDATE runs
+                SET projects_cleaned = (
+                        SELECT COUNT(*)
+                        FROM clean_events
+                        WHERE run_id = runs.id
+                          AND exit_code = 0
+                    ),
+                    bytes_recovered = COALESCE((
+                        SELECT SUM(MAX(bytes_before - bytes_after, 0))
+                        FROM clean_events
+                        WHERE run_id = runs.id
+                          AND exit_code = 0
+                    ), 0),
+                    errors_count = MAX(
+                        errors_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM clean_events
+                            WHERE run_id = runs.id
+                              AND exit_code <> 0
+                        )
+                    );
+
+                UPDATE projects
+                SET last_cleaned_at = (
+                    SELECT MAX(ts)
+                    FROM clean_events
+                    WHERE path = projects.path
+                      AND exit_code = 0
+                );
+
+                INSERT INTO errors (ts, category, path, message)
+                SELECT
+                    clean_events.ts,
+                    'clean',
+                    clean_events.path,
+                    'cargo clean exited ' || clean_events.exit_code
+                        || CASE
+                            WHEN clean_events.stderr_excerpt = '' THEN ''
+                            ELSE ': ' || clean_events.stderr_excerpt
+                        END
+                FROM clean_events
+                WHERE clean_events.exit_code <> 0
+                  AND NOT EXISTS(
+                      SELECT 1
+                      FROM errors
+                      WHERE errors.ts = clean_events.ts
+                        AND errors.category = 'clean'
+                        AND errors.path = clean_events.path
+                        AND errors.message =
+                            'cargo clean exited ' || clean_events.exit_code
+                            || CASE
+                                WHEN clean_events.stderr_excerpt = '' THEN ''
+                                ELSE ': ' || clean_events.stderr_excerpt
+                            END
+                  );
+
+                INSERT INTO schema_version (version) VALUES (8);
+                ",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -997,11 +1063,41 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn scan_coverage_incomplete_since(&self, since: SystemTime) -> Result<bool> {
+        let incomplete = self.conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM errors
+                WHERE ts >= ?1
+                  AND (
+                      category = 'scan'
+                      OR (
+                          category = 'worktree_discovery'
+                          AND (
+                              path IS NULL
+                              OR EXISTS(
+                                  SELECT 1
+                                  FROM worktree_discovery_failures
+                                  WHERE primary_path = errors.path
+                                     OR canonical_primary_path = errors.path
+                              )
+                          )
+                      )
+                  )
+            )
+            ",
+            [to_epoch(since)?],
+            |row| row.get(0),
+        )?;
+        Ok(incomplete)
+    }
+
     pub fn total_bytes_recovered(&self, since: SystemTime) -> Result<i64> {
         let total = self.conn.query_row(
             "
             SELECT COALESCE(SUM(bytes_before - bytes_after), 0)
-            FROM clean_events WHERE ts >= ?1
+            FROM clean_events WHERE ts >= ?1 AND exit_code = 0
             ",
             [to_epoch(since)?],
             |row| row.get(0),
@@ -1014,7 +1110,7 @@ impl Store {
             "
             SELECT path, SUM(bytes_before - bytes_after) AS recovered
             FROM clean_events
-            WHERE ts >= ?1
+            WHERE ts >= ?1 AND exit_code = 0
             GROUP BY path
             ORDER BY recovered DESC
             LIMIT ?2
@@ -1027,6 +1123,16 @@ impl Store {
             })
         })?;
         collect_rows(rows)
+    }
+
+    pub fn failed_clean_attempts(&self, since: SystemTime) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM clean_events WHERE ts >= ?1 AND exit_code <> 0",
+                [to_epoch(since)?],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn record_review_status(

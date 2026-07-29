@@ -116,13 +116,22 @@ fn configuration_reference_preserves_operational_contract() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = repo_file("README.md");
     let guide = repo_file("docs/configuration.md");
+    let release = repo_file("docs/releases/v0.4.0.md");
 
     assert!(root.join("docs/configuration.md").is_file());
     assert!(readme.contains("[Configuration reference](docs/configuration.md)"));
     for value in [
         "scan_dirs",
         "project_dirs",
-        "excludes",
+        "extra_excludes",
+        "override_excludes",
+        "legacy `excludes`",
+        "config migrate",
+        "unknown keys",
+        "absolute",
+        "exit `0`",
+        "exit `1`",
+        "exit `2`",
         "clean_interval",
         "scan_interval",
         "target_quiet_period",
@@ -135,6 +144,15 @@ fn configuration_reference_preserves_operational_contract() {
         "car-go-clean.log",
     ] {
         assert!(guide.contains(value), "missing {value}");
+    }
+    for value in [
+        "removed in v0.5",
+        "config migrate",
+        "exit `0`",
+        "exit `1`",
+        "exit `2`",
+    ] {
+        assert!(release.contains(value), "missing {value}");
     }
 }
 

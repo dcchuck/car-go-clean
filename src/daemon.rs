@@ -68,6 +68,12 @@ pub struct RunCycleResult {
     pub skipped: i64,
     pub bytes_recovered: i64,
     pub errors: i64,
+    pub coverage_incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCycleResult {
+    pub errors: usize,
 }
 
 pub struct Daemon<'a, R: CommandRunner> {
@@ -107,9 +113,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .reconcile_for_review(|path| self.scanner.is_excluded(path))
     }
 
-    pub fn scan_cycle(&self) -> Result<()> {
+    pub fn scan_cycle(&self) -> Result<ScanCycleResult> {
         let now = SystemTime::now();
         let report = self.scanner.scan_with_errors()?;
+        let error_count = report.errors.len();
         for error in report.errors {
             self.store.record_error(&ErrorRecord {
                 id: 0,
@@ -157,7 +164,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 return Err(err);
             }
         }
-        Ok(())
+        Ok(ScanCycleResult {
+            errors: error_count,
+        })
     }
 
     pub fn run_cycle(&self) -> Result<()> {
@@ -188,7 +197,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .checked_sub(self.opts.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let scan_coverage_incomplete = self
+            .store
+            .scan_coverage_incomplete_since(scan_error_since)?;
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
+        let coverage_incomplete = scan_coverage_incomplete || !discovery_blocks.is_empty();
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -229,8 +242,6 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     cleaner_skipped += 1;
                 }
                 Ok(result) => {
-                    projects_cleaned += 1;
-                    bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
                     let now = SystemTime::now();
                     self.store.record_clean_event(&CleanEvent {
                         id: 0,
@@ -241,9 +252,44 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         bytes_after: result.bytes_after,
                         duration_ms: result.duration.as_millis() as i64,
                         exit_code: result.exit_code,
-                        stderr_excerpt: result.stderr_excerpt,
+                        stderr_excerpt: result.stderr_excerpt.clone(),
                     })?;
-                    self.store.mark_project_cleaned(&project.path, now)?;
+                    let measurement_failed =
+                        if let Some(measurement_error) = &result.measurement_error {
+                            errors_count += 1;
+                            self.store.record_error(&ErrorRecord {
+                                id: 0,
+                                ts: now,
+                                category: "clean".to_string(),
+                                path: Some(project.path.clone()),
+                                message: measurement_error.clone(),
+                            })?;
+                            true
+                        } else {
+                            false
+                        };
+                    if result.exit_code == 0 && !measurement_failed {
+                        projects_cleaned += 1;
+                        bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
+                        self.store.mark_project_cleaned(&project.path, now)?;
+                    } else if result.exit_code != 0 {
+                        errors_count += 1;
+                        let detail = if result.stderr_excerpt.is_empty() {
+                            format!("cargo clean exited {}", result.exit_code)
+                        } else {
+                            format!(
+                                "cargo clean exited {}: {}",
+                                result.exit_code, result.stderr_excerpt
+                            )
+                        };
+                        self.store.record_error(&ErrorRecord {
+                            id: 0,
+                            ts: now,
+                            category: "clean".to_string(),
+                            path: Some(project.path.clone()),
+                            message: detail,
+                        })?;
+                    }
                 }
                 Err(err) => {
                     errors_count += 1;
@@ -274,6 +320,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             skipped,
             bytes_recovered,
             errors: errors_count,
+            coverage_incomplete,
         };
         self.log_run_cycle(&result);
         Ok(result)
@@ -293,6 +340,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             Value::from(result.bytes_recovered),
         );
         fields.insert("errors".to_string(), Value::from(result.errors));
+        fields.insert(
+            "coverage_incomplete".to_string(),
+            Value::from(result.coverage_incomplete),
+        );
         logger.info_fields("clean cycle complete", fields);
     }
 

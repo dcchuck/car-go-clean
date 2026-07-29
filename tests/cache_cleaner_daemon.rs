@@ -384,7 +384,7 @@ fn first_v4_scan_reconciles_v3_cached_out_of_scope_worktree_without_provenance()
         .args(["--state-dir"])
         .arg(state_dir.path())
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 0"))
         .stdout(contains(canonical_outside.display().to_string()).not());
 }
@@ -933,6 +933,8 @@ fn daemon_cache_review_cannot_retarget_trusted_linked_provenance() {
 struct FakeRunner {
     calls: Arc<Mutex<Vec<FakeCall>>>,
     delete_target: bool,
+    delete_relative_path: Option<PathBuf>,
+    replace_target_with_file_for: Option<PathBuf>,
     exit_code: i32,
     stderr: String,
 }
@@ -979,6 +981,12 @@ impl CommandRunner for FakeRunner {
         });
         if self.delete_target {
             let _ = fs::remove_dir_all(dir.join("target"));
+        }
+        if let Some(relative) = &self.delete_relative_path {
+            fs::remove_file(dir.join("target").join(relative)).unwrap();
+        }
+        if self.replace_target_with_file_for.as_deref() == Some(dir) {
+            fs::write(dir.join("target"), b"not a directory").unwrap();
         }
         Ok(CleanOutcome {
             exit_code: self.exit_code,
@@ -1515,6 +1523,183 @@ fn daemon_scan_and_run_cycle_record_state() {
 }
 
 #[test]
+fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/removed.bin"), &[0; 2048]);
+    write_file(&project.join("target/retained.bin"), &[0; 1024]);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(store_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&project, SystemTime::now()).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new(
+            "cargo",
+            FakeRunner {
+                delete_relative_path: Some(PathBuf::from("removed.bin")),
+                exit_code: 7,
+                stderr: "cargo metadata failed".to_string(),
+                ..FakeRunner::default()
+            },
+            Duration::from_secs(60),
+        ),
+        DaemonOptions {
+            target_quiet_period: Duration::from_millis(1),
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_millis(1),
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.bytes_recovered, 0);
+    assert_eq!(result.errors, 1);
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert_eq!(run.bytes_recovered, 0);
+    assert_eq!(run.errors_count, 1);
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, 7);
+    assert!(events[0].bytes_before > events[0].bytes_after);
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert!(errors.iter().any(|error| {
+        error.category == "clean"
+            && error.message.contains("cargo clean exited 7")
+            && error.message.contains("cargo metadata failed")
+    }));
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
+}
+
+#[test]
+fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let unmeasurable = root.path().join("a-unmeasurable");
+    let successful = root.path().join("b-successful");
+    for project in [&unmeasurable, &successful] {
+        write_file(&project.join("Cargo.toml"), b"[package]\n");
+        write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    }
+    let unmeasurable = unmeasurable.canonicalize().unwrap();
+    let successful = successful.canonicalize().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(store_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let discovered_at = SystemTime::now();
+    store.upsert_project(&unmeasurable, discovered_at).unwrap();
+    store.upsert_project(&successful, discovered_at).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let runner = FakeRunner {
+        delete_target: true,
+        replace_target_with_file_for: Some(unmeasurable.clone()),
+        exit_code: 0,
+        stderr: "cargo completed with a warning".to_string(),
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::from_millis(1),
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_millis(1),
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(result.bytes_recovered, 2048);
+    assert_eq!(result.errors, 1);
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 1);
+    assert_eq!(run.bytes_recovered, 2048);
+    assert_eq!(run.errors_count, 1);
+
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 2);
+    let unmeasurable_event = events
+        .iter()
+        .find(|event| event.path == unmeasurable.to_string_lossy())
+        .unwrap();
+    assert_eq!(unmeasurable_event.exit_code, 0);
+    assert_eq!(
+        unmeasurable_event.stderr_excerpt,
+        "cargo completed with a warning"
+    );
+    assert_eq!(
+        unmeasurable_event.bytes_after,
+        unmeasurable_event.bytes_before
+    );
+
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "clean");
+    assert_eq!(
+        errors[0].path.as_deref(),
+        Some(unmeasurable.to_string_lossy().as_ref())
+    );
+    assert!(errors[0]
+        .message
+        .contains("measure target after cargo clean"));
+
+    let projects = store.all_projects().unwrap();
+    assert!(projects
+        .iter()
+        .find(|project| project.path == unmeasurable.to_string_lossy())
+        .unwrap()
+        .last_cleaned_at
+        .is_none());
+    assert!(projects
+        .iter()
+        .find(|project| project.path == successful.to_string_lossy())
+        .unwrap()
+        .last_cleaned_at
+        .is_some());
+}
+
+#[test]
 fn daemon_logs_run_cycle_summary() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
@@ -2041,6 +2226,63 @@ fn daemon_run_cycle_skips_symlinked_target_even_with_force_compatibility() {
 }
 
 #[test]
+fn daemon_run_cycle_reports_pathless_scan_error_as_incomplete_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&project, SystemTime::now()).unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: SystemTime::now(),
+            category: "scan".to_string(),
+            path: None,
+            message: "scan failed before resolving an identity".to_string(),
+        })
+        .unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert!(result.coverage_incomplete);
+}
+
+#[test]
 fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
@@ -2189,6 +2431,34 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
         Some(blocked.canonicalize().unwrap().to_str().unwrap())
     );
     assert!(errors[0].message.contains("Permission denied"));
+}
+
+#[test]
+fn daemon_scan_cycle_returns_errors_for_a_missing_absolute_root() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let missing_root = db_dir.path().join("missing-root");
+    assert!(missing_root.is_absolute());
+
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![missing_root.clone()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    let result = daemon.scan_cycle().unwrap();
+    assert_eq!(result.errors, 1);
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "scan");
+    assert_eq!(errors[0].path.as_deref(), missing_root.to_str());
 }
 
 #[cfg(unix)]
