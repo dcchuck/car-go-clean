@@ -1,8 +1,33 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use tempfile::tempdir;
+use yaml_rust2::{Yaml, YamlLoader};
 
 fn repo_file(path: &str) -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+}
+
+fn workflow(path: &str) -> Yaml {
+    let documents = YamlLoader::load_from_str(&repo_file(path)).unwrap();
+    assert_eq!(documents.len(), 1);
+    documents.into_iter().next().unwrap()
+}
+
+fn workflow_steps<'a>(document: &'a Yaml, job: &str) -> &'a [Yaml] {
+    document["jobs"][job]["steps"].as_vec().unwrap()
+}
+
+fn run_command(step: &Yaml) -> Option<&str> {
+    step["run"].as_str()
+}
+
+fn step_running<'a>(steps: &'a [Yaml], command: &str) -> (usize, &'a Yaml) {
+    steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| run_command(step).is_some_and(|run| run.trim() == command))
+        .unwrap_or_else(|| panic!("workflow does not run `{command}`"))
 }
 
 #[test]
@@ -168,6 +193,77 @@ fn release_workflow_is_tag_only_and_uses_dist() {
         .unwrap();
     assert!(verification.contains("- custom-publish-shell-installer"));
     assert!(verification.contains("- custom-publish-homebrew-formula"));
+}
+
+#[test]
+fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(root.join("docs/releases/v0.4.0.md").is_file());
+    assert!(root.join("scripts/compose-release-notes.sh").is_file());
+
+    let release = workflow(".github/workflows/release.yml");
+    let steps = workflow_steps(&release, "host");
+    let compose = steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| {
+            run_command(step).is_some_and(|run| {
+                run.lines()
+                    .map(str::trim)
+                    .any(|line| line.starts_with("scripts/compose-release-notes.sh "))
+            })
+        })
+        .expect("host job does not compose reviewed release notes");
+    let create = steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| {
+            run_command(step).is_some_and(|run| {
+                run.lines()
+                    .map(str::trim)
+                    .any(|line| line.starts_with("gh release create "))
+            })
+        })
+        .expect("host job does not create a release");
+
+    assert!(compose.0 < create.0);
+    assert!(compose.1["env"]["ANNOUNCEMENT_BODY"].as_str().is_some());
+    assert!(create.1["env"]["ANNOUNCEMENT_BODY"].is_badvalue());
+    assert!(run_command(create.1)
+        .unwrap()
+        .split_whitespace()
+        .any(|word| word == "\"$RUNNER_TEMP/notes.txt\""));
+
+    let runner_temp = tempdir().unwrap();
+    let runnable = run_command(compose.1)
+        .unwrap()
+        .replace("${{ needs.plan.outputs.tag }}", "v0.4.0");
+    let output = Command::new("sh")
+        .args(["-eu", "-c", &runnable])
+        .current_dir(root)
+        .env("ANNOUNCEMENT_BODY", "generated workflow body")
+        .env("RUNNER_TEMP", runner_temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "composition step failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let notes = fs::read_to_string(runner_temp.path().join("notes.txt")).unwrap();
+    assert_eq!(notes.lines().next(), Some("# car-go-clean v0.4.0"));
+    assert!(notes.lines().any(|line| line == "generated workflow body"));
+}
+
+#[test]
+fn ci_runs_release_note_validation_after_installer_validation() {
+    let ci = workflow(".github/workflows/ci.yml");
+    let steps = workflow_steps(&ci, "verify");
+    let installer = step_running(steps, "make test-installer");
+    let release_notes = step_running(steps, "make test-release-notes");
+
+    assert!(installer.0 < release_notes.0);
 }
 
 #[test]

@@ -52,3 +52,49 @@ request branch. The announce job publishes the draft only after every archive
 and formula check succeeds. A failed check leaves the GitHub Release in
 draft state for investigation. The workflow does not publish to crates.io or
 enable any daemon.
+
+## Complete the Homebrew release
+
+After GitHub publishes the verified release, list all open formula pull
+requests:
+
+```sh
+gh pr list \
+  --repo dcchuck/homebrew-tap \
+  --state open \
+  --search 'car-go-clean in:title' \
+  --json number,title,url
+```
+
+Inspect each older formula pull request and either deliberately close it as
+superseded or retain it with a written reason. Merge the v0.4.0 formula pull
+request only after its checks pass. The `--web` step below is the required
+human review of the formula diff.
+
+```sh
+formula_pr=$(
+  gh pr list \
+    --repo dcchuck/homebrew-tap \
+    --state open \
+    --search 'car-go-clean v0.4.0 in:title' \
+    --json number \
+    --jq '.[0].number'
+)
+test -n "$formula_pr"
+gh pr checks "$formula_pr" --repo dcchuck/homebrew-tap
+gh pr view "$formula_pr" --repo dcchuck/homebrew-tap --web
+gh pr merge "$formula_pr" --repo dcchuck/homebrew-tap --merge --delete-branch
+
+brew update
+if brew list --versions car-go-clean >/dev/null 2>&1
+then
+  brew upgrade dcchuck/tap/car-go-clean
+else
+  brew install dcchuck/tap/car-go-clean
+fi
+car-go-clean version
+car-go-clean service stop
+car-go-clean run --dry-run --all
+car-go-clean service start
+car-go-clean service status
+```

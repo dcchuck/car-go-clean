@@ -48,8 +48,9 @@ cargo new "$validation_root/sample"
 cargo build --manifest-path "$validation_root/sample/Cargo.toml"
 validation_config="$validation_root/config.toml"
 validation_state="$validation_root/state"
-printf 'scan_dirs = ["%s"]\ntarget_quiet_period = "0s"\n' \
+printf 'scan_dirs = ["%s"]\ntarget_quiet_period = "1s"\n' \
   "$validation_root" > "$validation_config"
+sleep 2
 ```
 
 Do not run `car-go-clean scan`. Start with the absent

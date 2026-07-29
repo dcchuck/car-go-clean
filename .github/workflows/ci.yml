@@ -26,6 +26,8 @@ jobs:
         run: cargo test --locked
       - name: Check shell installer
         run: make test-installer
+      - name: Check release notes
+        run: make test-release-notes
       - name: Plan release artifacts
         run: |
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "car-go-clean").version')"

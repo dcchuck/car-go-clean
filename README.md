@@ -55,6 +55,18 @@ invoke Cargo, and installation does not start the background service. The
 default quiet period, active-process checks, scan-error checks, managed-storage
 checks, and direct-target checks all remain in effect.
 
+If the service is already active, stop it for the preview and resume it
+afterward:
+
+```sh
+car-go-clean service stop
+car-go-clean run --dry-run --all
+car-go-clean service start
+```
+
+`service stop` preserves the installed service definition; `service start`
+resumes it after you approve the preview.
+
 After reviewing the preview:
 
 ```sh
