@@ -2,8 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use car_go_clean::identity::{BootSessionId, FilesystemIdentity, ReviewedIdentity};
 use car_go_clean::safety::ReviewSummary;
-use car_go_clean::store::{CleanEvent, ErrorRecord, Store};
+use car_go_clean::store::{
+    CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
+    ObservationReconciliation, OriginReconciliation, Store,
+};
 
 fn test_store(path: &Path) -> Store {
     let store = Store::open(path).unwrap();
@@ -27,6 +31,9 @@ fn open_creates_file_and_migrations_create_tables() {
     assert!(store.table_exists("scheduler_state").unwrap());
     assert!(store.table_exists("linked_worktrees").unwrap());
     assert!(store.table_exists("worktree_discovery_failures").unwrap());
+    assert!(store.table_exists("discovery_generations").unwrap());
+    assert!(store.table_exists("discovery_origins").unwrap());
+    assert!(store.table_exists("project_observations").unwrap());
 }
 
 #[test]
@@ -160,7 +167,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 8);
+    assert_eq!(schema_version, 9);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1556,4 +1563,439 @@ fn records_scheduler_status_snapshot() {
     assert_eq!(status.updated_at, now);
     assert_eq!(status.next_clean_at, next_clean);
     assert_eq!(status.next_scan_at, next_scan);
+}
+
+fn create_legacy_database(path: &Path, version: i64) {
+    assert!(matches!(version, 1 | 4 | 7 | 8));
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            CREATE TABLE projects (
+                path TEXT PRIMARY KEY,
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_cleaned_at INTEGER
+            );
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                projects_cleaned INTEGER NOT NULL DEFAULT 0,
+                bytes_recovered INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE clean_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                ts INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                bytes_before INTEGER NOT NULL,
+                bytes_after INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER NOT NULL DEFAULT 0,
+                stderr_excerpt TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                path TEXT,
+                message TEXT NOT NULL
+            );
+            INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
+            VALUES
+                ('/history/success', 10, 30, 20),
+                ('/history/failure', 11, 31, 21);
+            INSERT INTO runs (
+                id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
+            ) VALUES (1, 10, 40, 1, 900, 1);
+            INSERT INTO clean_events (
+                id, run_id, ts, path, bytes_before, bytes_after,
+                duration_ms, exit_code, stderr_excerpt
+            ) VALUES
+                (1, 1, 20, '/history/success', 1000, 100, 5, 0, ''),
+                (2, 1, 21, '/history/failure', 1000, 200, 5, 9, 'failed');
+            ",
+        )
+        .unwrap();
+
+    if version >= 2 {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE review_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    reviewed_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    total_projects INTEGER NOT NULL,
+                    cleanable_projects INTEGER NOT NULL,
+                    skipped_projects INTEGER NOT NULL,
+                    cleanable_bytes INTEGER NOT NULL,
+                    active_recent_write INTEGER NOT NULL,
+                    active_process INTEGER NOT NULL,
+                    managed_cache INTEGER NOT NULL,
+                    container_storage INTEGER NOT NULL,
+                    scan_error INTEGER NOT NULL,
+                    no_target INTEGER NOT NULL,
+                    target_read_error INTEGER NOT NULL
+                );
+                ",
+            )
+            .unwrap();
+    }
+    if version >= 3 {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE scheduler_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at INTEGER NOT NULL,
+                    next_clean_at INTEGER NOT NULL,
+                    next_scan_at INTEGER NOT NULL
+                );
+                ",
+            )
+            .unwrap();
+    }
+    if version >= 4 {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE linked_worktrees (
+                    primary_path TEXT NOT NULL,
+                    linked_path TEXT NOT NULL,
+                    PRIMARY KEY (primary_path, linked_path)
+                );
+                CREATE INDEX idx_linked_worktrees_linked
+                    ON linked_worktrees(linked_path);
+                CREATE TABLE worktree_discovery_failures (
+                    primary_path TEXT PRIMARY KEY,
+                    failed_at INTEGER NOT NULL,
+                    message TEXT NOT NULL
+                );
+                ",
+            )
+            .unwrap();
+    }
+    if version >= 5 {
+        connection
+            .execute(
+                "ALTER TABLE worktree_discovery_failures ADD COLUMN canonical_primary_path TEXT",
+                [],
+            )
+            .unwrap();
+    }
+    if version >= 6 {
+        connection
+            .execute(
+                "ALTER TABLE linked_worktrees ADD COLUMN canonical_primary_path TEXT",
+                [],
+            )
+            .unwrap();
+    }
+    connection
+        .execute("INSERT INTO schema_version(version) VALUES (?1)", [version])
+        .unwrap();
+}
+
+fn observed_project(
+    path: &str,
+    project_device: u64,
+    project_inode: u64,
+    target: Option<(u64, u64)>,
+    observed_at: SystemTime,
+) -> ObservationReconciliation {
+    ObservationReconciliation {
+        project_path: PathBuf::from(path),
+        project_identity: FilesystemIdentity {
+            device: project_device,
+            inode: project_inode,
+        },
+        target_identity: target.map(|(device, inode)| FilesystemIdentity { device, inode }),
+        observed_at,
+        authorized: true,
+        blocked_reason: None,
+    }
+}
+
+fn completed_origin(
+    configured_path: &str,
+    observations: Vec<ObservationReconciliation>,
+) -> OriginReconciliation {
+    OriginReconciliation {
+        kind: DiscoveryOriginKind::ScanRoot,
+        configured_path: PathBuf::from(configured_path),
+        canonical_path: Some(PathBuf::from(configured_path)),
+        completed: true,
+        error: None,
+        observations,
+    }
+}
+
+#[test]
+fn discovery_generation_migrations_preserve_history_without_granting_authority() {
+    for version in [1, 4, 7, 8] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!("v{version}.db"));
+        create_legacy_database(&database, version);
+
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+
+        assert_eq!(
+            store.current_generation("policy-after-upgrade").unwrap(),
+            None,
+            "schema v{version} migration must not manufacture authority"
+        );
+        assert!(!store
+            .has_matching_generation("policy-after-upgrade")
+            .unwrap());
+        assert!(store.authorized_observations(999).unwrap().is_empty());
+        assert_eq!(store.all_projects().unwrap().len(), 2);
+        assert_eq!(
+            store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+            900
+        );
+        assert_eq!(store.last_forced_scan_at().unwrap(), None);
+
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        let schema_version = inspection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(schema_version, 9);
+    }
+}
+
+#[test]
+fn discovery_generation_reconciliation_authorizes_only_completed_origins() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let reconciliation = GenerationReconciliation {
+        policy_hash: "policy-a".to_string(),
+        boot_session_id: Some("boot-a".to_string()),
+        origins: vec![
+            completed_origin(
+                "/workspace",
+                vec![observed_project(
+                    "/workspace/allowed",
+                    7,
+                    11,
+                    Some((7, 12)),
+                    observed_at,
+                )],
+            ),
+            OriginReconciliation {
+                kind: DiscoveryOriginKind::ExplicitProject,
+                configured_path: PathBuf::from("/unreadable"),
+                canonical_path: Some(PathBuf::from("/unreadable")),
+                completed: false,
+                error: Some("permission denied".to_string()),
+                observations: vec![observed_project(
+                    "/unreadable/partial",
+                    8,
+                    21,
+                    Some((8, 22)),
+                    observed_at,
+                )],
+            },
+        ],
+    };
+
+    let generation = store
+        .reconcile_generation(observed_at, &reconciliation)
+        .unwrap();
+
+    assert_eq!(generation.policy_hash, "policy-a");
+    assert_eq!(generation.boot_session_id.as_deref(), Some("boot-a"));
+    assert_eq!(
+        store.current_generation("policy-a").unwrap(),
+        Some(generation.clone())
+    );
+    assert!(store.has_matching_generation("policy-a").unwrap());
+    assert!(!store.has_matching_generation("policy-b").unwrap());
+    let authorized = store.authorized_observations(generation.id).unwrap();
+    assert_eq!(authorized.len(), 1);
+    assert_eq!(
+        authorized[0].project_path,
+        PathBuf::from("/workspace/allowed")
+    );
+    assert_eq!(
+        authorized[0].project_identity,
+        FilesystemIdentity {
+            device: 7,
+            inode: 11
+        }
+    );
+    assert_eq!(
+        authorized[0].target_identity,
+        Some(FilesystemIdentity {
+            device: 7,
+            inode: 12
+        })
+    );
+    assert_eq!(store.all_projects().unwrap().len(), 2);
+}
+
+#[test]
+fn discovery_generation_new_snapshot_revokes_removed_projects_and_separates_policy_hashes() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let second_time = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+    let first = store
+        .reconcile_generation(
+            first_time,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![
+                        observed_project("/workspace/kept", 1, 2, Some((1, 3)), first_time),
+                        observed_project("/workspace/removed", 1, 4, Some((1, 5)), first_time),
+                    ],
+                )],
+            },
+        )
+        .unwrap();
+    let second = store
+        .reconcile_generation(
+            second_time,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/kept",
+                        1,
+                        2,
+                        Some((1, 3)),
+                        second_time,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
+    let other_policy = store
+        .reconcile_generation(
+            second_time + Duration::from_secs(1),
+            &GenerationReconciliation {
+                policy_hash: "policy-b".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin("/other", vec![])],
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .authorized_observations(first.id)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.project_path.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            PathBuf::from("/workspace/kept"),
+            PathBuf::from("/workspace/removed")
+        ]
+    );
+    assert_eq!(
+        store
+            .authorized_observations(second.id)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.project_path.clone())
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("/workspace/kept")]
+    );
+    assert_eq!(store.current_generation("policy-a").unwrap(), Some(second));
+    assert_eq!(
+        store.current_generation("policy-b").unwrap(),
+        Some(other_policy)
+    );
+    assert_eq!(store.all_projects().unwrap().len(), 2);
+}
+
+#[test]
+fn discovery_generation_reconciliation_rolls_back_generation_and_history_on_failure() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let duplicate = observed_project("/workspace/duplicate", 1, 2, Some((1, 3)), observed_at);
+    let result = store.reconcile_generation(
+        observed_at,
+        &GenerationReconciliation {
+            policy_hash: "policy-a".to_string(),
+            boot_session_id: None,
+            origins: vec![completed_origin(
+                "/workspace",
+                vec![duplicate.clone(), duplicate],
+            )],
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(store.current_generation("policy-a").unwrap(), None);
+    assert!(store.all_projects().unwrap().is_empty());
+}
+
+#[test]
+fn discovery_generation_reverification_replaces_persisted_identity() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let generation = store
+        .reconcile_generation(
+            observed_at,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: Some("boot-a".to_string()),
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/project",
+                        1,
+                        2,
+                        Some((1, 3)),
+                        observed_at,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
+    let reverified = ReviewedIdentity {
+        project: FilesystemIdentity {
+            device: 4,
+            inode: 5,
+        },
+        target: FilesystemIdentity {
+            device: 4,
+            inode: 6,
+        },
+        boot_session: Some(BootSessionId("boot-b".to_string())),
+    };
+
+    store
+        .mark_observation_reverified(generation.id, Path::new("/workspace/project"), &reverified)
+        .unwrap();
+
+    let observation = store.authorized_observations(generation.id).unwrap();
+    assert_eq!(observation.len(), 1);
+    assert_eq!(observation[0].project_identity, reverified.project);
+    assert_eq!(
+        observation[0].target_identity.as_ref(),
+        Some(&reverified.target)
+    );
+}
+
+#[test]
+fn discovery_generation_forced_scan_timestamp_round_trips() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+
+    assert_eq!(store.last_forced_scan_at().unwrap(), None);
+    store.record_forced_scan_at(when).unwrap();
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(when));
 }

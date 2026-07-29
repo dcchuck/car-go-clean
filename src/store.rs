@@ -1,5 +1,6 @@
+use crate::identity::{FilesystemIdentity, ReviewedIdentity};
 use crate::safety::ReviewSummary;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -69,6 +70,79 @@ pub struct SchedulerStatus {
     pub updated_at: SystemTime,
     pub next_clean_at: SystemTime,
     pub next_scan_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryGeneration {
+    pub id: i64,
+    pub created_at: SystemTime,
+    pub policy_hash: String,
+    pub boot_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryOriginKind {
+    ScanRoot,
+    ExplicitProject,
+}
+
+impl DiscoveryOriginKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ScanRoot => "scan_root",
+            Self::ExplicitProject => "explicit_project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryOriginRecord {
+    pub id: i64,
+    pub generation_id: i64,
+    pub kind: DiscoveryOriginKind,
+    pub configured_path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
+    pub completed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectObservation {
+    pub generation_id: i64,
+    pub origin_id: i64,
+    pub project_path: PathBuf,
+    pub project_identity: FilesystemIdentity,
+    pub target_identity: Option<FilesystemIdentity>,
+    pub observed_at: SystemTime,
+    pub authorized: bool,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationReconciliation {
+    pub project_path: PathBuf,
+    pub project_identity: FilesystemIdentity,
+    pub target_identity: Option<FilesystemIdentity>,
+    pub observed_at: SystemTime,
+    pub authorized: bool,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginReconciliation {
+    pub kind: DiscoveryOriginKind,
+    pub configured_path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
+    pub completed: bool,
+    pub error: Option<String>,
+    pub observations: Vec<ObservationReconciliation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationReconciliation {
+    pub policy_hash: String,
+    pub boot_session_id: Option<String>,
+    pub origins: Vec<OriginReconciliation>,
 }
 
 impl Store {
@@ -387,6 +461,72 @@ impl Store {
                 INSERT INTO schema_version (version) VALUES (8);
                 ",
             )?;
+            tx.commit()?;
+        }
+        if current < 9 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS scheduler_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at INTEGER NOT NULL,
+                    next_clean_at INTEGER NOT NULL,
+                    next_scan_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS discovery_generations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    boot_session_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_discovery_generations_policy_created
+                    ON discovery_generations(policy_hash, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS discovery_origins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generation_id INTEGER NOT NULL
+                        REFERENCES discovery_generations(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('scan_root', 'explicit_project')),
+                    configured_path TEXT NOT NULL,
+                    canonical_path TEXT,
+                    completed INTEGER NOT NULL CHECK(completed IN (0, 1)),
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS project_observations (
+                    generation_id INTEGER NOT NULL
+                        REFERENCES discovery_generations(id) ON DELETE CASCADE,
+                    origin_id INTEGER NOT NULL
+                        REFERENCES discovery_origins(id) ON DELETE CASCADE,
+                    project_path TEXT NOT NULL,
+                    project_device INTEGER NOT NULL,
+                    project_inode INTEGER NOT NULL,
+                    target_device INTEGER,
+                    target_inode INTEGER,
+                    observed_at INTEGER NOT NULL,
+                    authorized INTEGER NOT NULL CHECK(authorized IN (0, 1)),
+                    blocked_reason TEXT,
+                    PRIMARY KEY(generation_id, origin_id, project_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_project_observations_authorized
+                    ON project_observations(generation_id, authorized, project_path);
+                ",
+            )?;
+            let has_last_forced_scan_at = {
+                let mut statement = tx.prepare("PRAGMA table_info(scheduler_state)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                collect_rows(columns)?
+                    .into_iter()
+                    .any(|column| column == "last_forced_scan_at")
+            };
+            if !has_last_forced_scan_at {
+                tx.execute(
+                    "ALTER TABLE scheduler_state ADD COLUMN last_forced_scan_at INTEGER",
+                    [],
+                )?;
+            }
+            tx.execute("INSERT INTO schema_version(version) VALUES (9)", [])?;
             tx.commit()?;
         }
         Ok(())
@@ -915,6 +1055,210 @@ impl Store {
         Ok(count.max(0) as usize)
     }
 
+    pub fn reconcile_generation(
+        &self,
+        created_at: SystemTime,
+        reconciliation: &GenerationReconciliation,
+    ) -> Result<DiscoveryGeneration> {
+        let created_at_epoch = to_epoch(created_at)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "
+            INSERT INTO discovery_generations (created_at, policy_hash, boot_session_id)
+            VALUES (?1, ?2, ?3)
+            ",
+            params![
+                created_at_epoch,
+                reconciliation.policy_hash,
+                reconciliation.boot_session_id
+            ],
+        )?;
+        let generation_id = tx.last_insert_rowid();
+
+        for origin in &reconciliation.origins {
+            tx.execute(
+                "
+                INSERT INTO discovery_origins (
+                    generation_id, kind, configured_path, canonical_path, completed, error
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    generation_id,
+                    origin.kind.as_str(),
+                    path_to_string(&origin.configured_path)?,
+                    origin
+                        .canonical_path
+                        .as_deref()
+                        .map(path_to_string)
+                        .transpose()?,
+                    origin.completed,
+                    origin.error,
+                ],
+            )?;
+            let origin_id = tx.last_insert_rowid();
+
+            for observation in &origin.observations {
+                let project_path = path_to_string(&observation.project_path)?;
+                let authorized = origin.completed && observation.authorized;
+                let blocked_reason = if authorized {
+                    observation.blocked_reason.clone()
+                } else if !origin.completed && observation.blocked_reason.is_none() {
+                    Some(match origin.error.as_deref() {
+                        Some(error) => format!("origin incomplete: {error}"),
+                        None => "origin incomplete".to_string(),
+                    })
+                } else {
+                    observation.blocked_reason.clone()
+                };
+                tx.execute(
+                    "
+                    INSERT INTO project_observations (
+                        generation_id, origin_id, project_path,
+                        project_device, project_inode, target_device, target_inode,
+                        observed_at, authorized, blocked_reason
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    ",
+                    params![
+                        generation_id,
+                        origin_id,
+                        project_path,
+                        observation.project_identity.device,
+                        observation.project_identity.inode,
+                        observation
+                            .target_identity
+                            .as_ref()
+                            .map(|identity| identity.device),
+                        observation
+                            .target_identity
+                            .as_ref()
+                            .map(|identity| identity.inode),
+                        to_epoch(observation.observed_at)?,
+                        authorized,
+                        blocked_reason,
+                    ],
+                )?;
+                tx.execute(
+                    "
+                    INSERT INTO projects (path, discovered_at, last_seen_at)
+                    VALUES (?1, ?2, ?2)
+                    ON CONFLICT(path) DO UPDATE SET
+                        last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at)
+                    ",
+                    params![project_path, to_epoch(observation.observed_at)?],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(DiscoveryGeneration {
+            id: generation_id,
+            created_at,
+            policy_hash: reconciliation.policy_hash.clone(),
+            boot_session_id: reconciliation.boot_session_id.clone(),
+        })
+    }
+
+    pub fn current_generation(&self, policy_hash: &str) -> Result<Option<DiscoveryGeneration>> {
+        self.conn
+            .query_row(
+                "
+                SELECT id, created_at, policy_hash, boot_session_id
+                FROM discovery_generations
+                WHERE policy_hash = ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                ",
+                [policy_hash],
+                |row| {
+                    Ok(DiscoveryGeneration {
+                        id: row.get(0)?,
+                        created_at: from_epoch(row.get(1)?),
+                        policy_hash: row.get(2)?,
+                        boot_session_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn has_matching_generation(&self, policy_hash: &str) -> Result<bool> {
+        Ok(self.current_generation(policy_hash)?.is_some())
+    }
+
+    pub fn authorized_observations(&self, generation_id: i64) -> Result<Vec<ProjectObservation>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                observations.generation_id,
+                observations.origin_id,
+                observations.project_path,
+                observations.project_device,
+                observations.project_inode,
+                observations.target_device,
+                observations.target_inode,
+                observations.observed_at,
+                observations.authorized,
+                observations.blocked_reason
+            FROM project_observations AS observations
+            JOIN discovery_origins AS origins
+              ON origins.id = observations.origin_id
+             AND origins.generation_id = observations.generation_id
+            WHERE observations.generation_id = ?1
+              AND observations.authorized = 1
+              AND origins.completed = 1
+            ORDER BY observations.project_path, observations.origin_id
+            ",
+        )?;
+        let rows = statement.query_map([generation_id], project_observation_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn mark_observation_reverified(
+        &self,
+        generation_id: i64,
+        path: &Path,
+        identity: &ReviewedIdentity,
+    ) -> Result<()> {
+        let updated = self.conn.execute(
+            "
+            UPDATE project_observations
+            SET project_device = ?1,
+                project_inode = ?2,
+                target_device = ?3,
+                target_inode = ?4
+            WHERE generation_id = ?5
+              AND project_path = ?6
+              AND authorized = 1
+              AND EXISTS(
+                  SELECT 1
+                  FROM discovery_origins
+                  WHERE discovery_origins.id = project_observations.origin_id
+                    AND discovery_origins.generation_id =
+                        project_observations.generation_id
+                    AND discovery_origins.completed = 1
+              )
+            ",
+            params![
+                identity.project.device,
+                identity.project.inode,
+                identity.target.device,
+                identity.target.inode,
+                generation_id,
+                path_to_string(path)?,
+            ],
+        )?;
+        if updated == 0 {
+            bail!(
+                "no authorized observation for generation {generation_id} and path {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     pub fn start_run(&self, started_at: SystemTime) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO runs (started_at) VALUES (?1)",
@@ -1262,6 +1606,38 @@ impl Store {
             .optional()
             .map_err(Into::into)
     }
+
+    pub fn last_forced_scan_at(&self) -> Result<Option<SystemTime>> {
+        self.conn
+            .query_row(
+                "
+                SELECT last_forced_scan_at
+                FROM scheduler_state
+                WHERE id = 1
+                ",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten().map(from_epoch))
+            .map_err(Into::into)
+    }
+
+    pub fn record_forced_scan_at(&self, when: SystemTime) -> Result<()> {
+        let when = to_epoch(when)?;
+        self.conn.execute(
+            "
+            INSERT INTO scheduler_state (
+                id, updated_at, next_clean_at, next_scan_at, last_forced_scan_at
+            )
+            VALUES (1, ?1, ?1, ?1, ?1)
+            ON CONFLICT(id) DO UPDATE SET
+                last_forced_scan_at = excluded.last_forced_scan_at
+            ",
+            [when],
+        )?;
+        Ok(())
+    }
 }
 
 fn replace_project_path_in_transaction(
@@ -1493,6 +1869,35 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         projects_cleaned: row.get(3)?,
         bytes_recovered: row.get(4)?,
         errors_count: row.get(5)?,
+    })
+}
+
+fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectObservation> {
+    let target_device = row.get::<_, Option<u64>>(5)?;
+    let target_inode = row.get::<_, Option<u64>>(6)?;
+    let target_identity = match (target_device, target_inode) {
+        (Some(device), Some(inode)) => Some(FilesystemIdentity { device, inode }),
+        (None, None) => None,
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                5,
+                "target_device/target_inode".to_string(),
+                rusqlite::types::Type::Null,
+            ));
+        }
+    };
+    Ok(ProjectObservation {
+        generation_id: row.get(0)?,
+        origin_id: row.get(1)?,
+        project_path: PathBuf::from(row.get::<_, String>(2)?),
+        project_identity: FilesystemIdentity {
+            device: row.get(3)?,
+            inode: row.get(4)?,
+        },
+        target_identity,
+        observed_at: from_epoch(row.get(7)?),
+        authorized: row.get(8)?,
+        blocked_reason: row.get(9)?,
     })
 }
 
