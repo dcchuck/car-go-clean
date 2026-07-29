@@ -149,6 +149,7 @@ fn format_duration_display(duration: Duration) -> String {
 #[derive(Debug, Parser)]
 #[command(name = "car-go-clean")]
 #[command(about = "Periodically run cargo clean on Rust projects.")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -286,7 +287,20 @@ enum ConfigCommands {
 }
 
 pub fn run() -> std::process::ExitCode {
-    match execute(Cli::parse()) {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    CommandOutcome::Complete.code()
+                }
+                _ => CommandOutcome::Failed.code(),
+            };
+            let _ = error.print();
+            return std::process::ExitCode::from(code);
+        }
+    };
+    match execute(cli) {
         Ok(outcome) => std::process::ExitCode::from(outcome.code()),
         Err(error) => {
             eprintln!("Error: {error:#}");
@@ -686,6 +700,7 @@ fn project_reviews(
         .checked_sub(scan_interval)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let scan_errors = store.scan_error_paths_since(scan_error_since)?;
+    let scan_coverage_incomplete = store.scan_coverage_incomplete_since(scan_error_since)?;
     let discovery_blocks = store.blocked_worktree_discovery_paths()?;
     let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
 
@@ -706,7 +721,7 @@ fn project_reviews(
     store.record_review_status(now, source, &review_summary(&reviews))?;
     Ok(ReviewBatch {
         reviews,
-        coverage_incomplete: !scan_errors.is_empty() || !discovery_blocks.is_empty(),
+        coverage_incomplete: scan_coverage_incomplete || !discovery_blocks.is_empty(),
     })
 }
 

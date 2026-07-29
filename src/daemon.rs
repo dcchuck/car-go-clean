@@ -197,8 +197,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .checked_sub(self.opts.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let scan_coverage_incomplete = self
+            .store
+            .scan_coverage_incomplete_since(scan_error_since)?;
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
-        let coverage_incomplete = !scan_errors.is_empty() || !discovery_blocks.is_empty();
+        let coverage_incomplete = scan_coverage_incomplete || !discovery_blocks.is_empty();
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -251,11 +254,25 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         exit_code: result.exit_code,
                         stderr_excerpt: result.stderr_excerpt.clone(),
                     })?;
-                    if result.exit_code == 0 {
+                    let measurement_failed =
+                        if let Some(measurement_error) = &result.measurement_error {
+                            errors_count += 1;
+                            self.store.record_error(&ErrorRecord {
+                                id: 0,
+                                ts: now,
+                                category: "clean".to_string(),
+                                path: Some(project.path.clone()),
+                                message: measurement_error.clone(),
+                            })?;
+                            true
+                        } else {
+                            false
+                        };
+                    if result.exit_code == 0 && !measurement_failed {
                         projects_cleaned += 1;
                         bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
                         self.store.mark_project_cleaned(&project.path, now)?;
-                    } else {
+                    } else if result.exit_code != 0 {
                         errors_count += 1;
                         let detail = if result.stderr_excerpt.is_empty() {
                             format!("cargo clean exited {}", result.exit_code)

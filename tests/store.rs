@@ -30,6 +30,230 @@ fn open_creates_file_and_migrations_create_tables() {
 }
 
 #[test]
+fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let successful_path = dir.path().join("successful");
+    let failed_path = dir.path().join("partial-failure");
+    let successful_path = successful_path.to_string_lossy().into_owned();
+    let failed_path = failed_path.to_string_lossy().into_owned();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (7);
+            CREATE TABLE projects (
+                path TEXT PRIMARY KEY,
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_cleaned_at INTEGER
+            );
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                projects_cleaned INTEGER NOT NULL DEFAULT 0,
+                bytes_recovered INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE clean_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                ts INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                bytes_before INTEGER NOT NULL,
+                bytes_after INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER NOT NULL DEFAULT 0,
+                stderr_excerpt TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                path TEXT,
+                message TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO projects (path, discovered_at, last_seen_at, last_cleaned_at)
+            VALUES (?1, 10, 300, 999), (?2, 20, 300, 999)
+            ",
+            rusqlite::params![successful_path, failed_path],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO runs (
+                id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
+            ) VALUES
+                (1, 100, 300, 2, 1500, 0),
+                (2, 400, 500, 4, 444, 5);
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO clean_events (
+                id, run_id, ts, path, bytes_before, bytes_after,
+                duration_ms, exit_code, stderr_excerpt
+            ) VALUES
+                (1, 1, 200, ?1, 1000, 100, 25, 0, ''),
+                (2, 1, 210, ?2, 1000, 400, 30, 7, 'partial deletion failed')
+            ",
+            rusqlite::params![successful_path, failed_path],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO errors (ts, category, path, message)
+            VALUES (50, 'scan', NULL, 'unrelated scan history')
+            ",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    store.migrate().unwrap();
+
+    let inspection = rusqlite::Connection::open(&db).unwrap();
+    let runs = {
+        let mut statement = inspection
+            .prepare(
+                "
+                SELECT id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
+                FROM runs
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        runs,
+        vec![(1, 100, Some(300), 1, 900, 1), (2, 400, Some(500), 0, 0, 5),]
+    );
+    let schema_version = inspection
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(schema_version, 8);
+    drop(inspection);
+
+    let projects = store.all_projects().unwrap();
+    let successful_project = projects
+        .iter()
+        .find(|project| project.path == successful_path)
+        .unwrap();
+    assert_eq!(
+        successful_project.last_cleaned_at,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(200))
+    );
+    let failed_project = projects
+        .iter()
+        .find(|project| project.path == failed_path)
+        .unwrap();
+    assert!(failed_project.last_cleaned_at.is_none());
+
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        900
+    );
+    let ranking = store
+        .top_projects_by_bytes(SystemTime::UNIX_EPOCH, 10)
+        .unwrap();
+    assert_eq!(ranking.len(), 1);
+    assert_eq!(ranking[0].path, successful_path);
+    assert_eq!(ranking[0].bytes, 900);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let errors_after_first_migration = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors_after_first_migration.len(), 2);
+    assert!(errors_after_first_migration.iter().any(|error| {
+        error.category == "scan"
+            && error.path.is_none()
+            && error.message == "unrelated scan history"
+    }));
+    let historical_clean_error = errors_after_first_migration
+        .iter()
+        .find(|error| error.category == "clean")
+        .unwrap();
+    assert_eq!(
+        historical_clean_error.path.as_deref(),
+        Some(failed_path.as_str())
+    );
+    assert!(historical_clean_error.message.contains("exited 7"));
+    assert!(historical_clean_error
+        .message
+        .contains("partial deletion failed"));
+
+    let repaired_runs = runs;
+    let repaired_projects = projects;
+    store.migrate().unwrap();
+    assert_eq!(
+        store.errors_since(SystemTime::UNIX_EPOCH).unwrap(),
+        errors_after_first_migration
+    );
+    assert_eq!(store.all_projects().unwrap(), repaired_projects);
+    let inspection = rusqlite::Connection::open(&db).unwrap();
+    let runs_after_second_migration = {
+        let mut statement = inspection
+            .prepare(
+                "
+                SELECT id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
+                FROM runs
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(runs_after_second_migration, repaired_runs);
+}
+
+#[test]
 fn linked_worktree_failure_blocks_cached_children_until_success() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let root = tempfile::tempdir().unwrap();
@@ -681,6 +905,32 @@ fn migrated_broken_primary_alias_remains_globally_fail_closed_after_primary_succ
             last_seen_at INTEGER NOT NULL,
             last_cleaned_at INTEGER
         );
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            projects_cleaned INTEGER NOT NULL DEFAULT 0,
+            bytes_recovered INTEGER NOT NULL DEFAULT 0,
+            errors_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE clean_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id),
+            ts INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            bytes_before INTEGER NOT NULL,
+            bytes_after INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER NOT NULL DEFAULT 0,
+            stderr_excerpt TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            path TEXT,
+            message TEXT NOT NULL
+        );
         CREATE TABLE linked_worktrees (
             primary_path TEXT NOT NULL,
             linked_path TEXT NOT NULL,
@@ -754,6 +1004,32 @@ fn assert_v4_alias_association_blocks_child_after_fresh_primary_failure(retarget
             discovered_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
             last_cleaned_at INTEGER
+        );
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            projects_cleaned INTEGER NOT NULL DEFAULT 0,
+            bytes_recovered INTEGER NOT NULL DEFAULT 0,
+            errors_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE clean_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id),
+            ts INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            bytes_before INTEGER NOT NULL,
+            bytes_after INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER NOT NULL DEFAULT 0,
+            stderr_excerpt TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            path TEXT,
+            message TEXT NOT NULL
         );
         CREATE TABLE linked_worktrees (
             primary_path TEXT NOT NULL,
@@ -853,6 +1129,32 @@ fn reused_v4_untrusted_primary_spelling_does_not_claim_historical_association() 
             discovered_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
             last_cleaned_at INTEGER
+        );
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            projects_cleaned INTEGER NOT NULL DEFAULT 0,
+            bytes_recovered INTEGER NOT NULL DEFAULT 0,
+            errors_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE clean_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id),
+            ts INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            bytes_before INTEGER NOT NULL,
+            bytes_after INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER NOT NULL DEFAULT 0,
+            stderr_excerpt TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            path TEXT,
+            message TEXT NOT NULL
         );
         CREATE TABLE linked_worktrees (
             primary_path TEXT NOT NULL,
@@ -1046,6 +1348,52 @@ fn scan_error_paths_since_returns_only_scan_paths() {
 }
 
 #[test]
+fn scan_coverage_incomplete_since_includes_recent_pathless_errors() {
+    let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let recent = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+    let scan_store = test_store(&tempfile::tempdir().unwrap().path().join("scan.db"));
+    scan_store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: cutoff - Duration::from_secs(1),
+            category: "scan".to_string(),
+            path: None,
+            message: "old pathless scan failure".to_string(),
+        })
+        .unwrap();
+    assert!(!scan_store.scan_coverage_incomplete_since(cutoff).unwrap());
+    scan_store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: recent,
+            category: "scan".to_string(),
+            path: None,
+            message: "recent pathless scan failure".to_string(),
+        })
+        .unwrap();
+    assert!(scan_store.scan_coverage_incomplete_since(cutoff).unwrap());
+    assert!(scan_store
+        .scan_error_paths_since(cutoff)
+        .unwrap()
+        .is_empty());
+
+    let discovery_store = test_store(&tempfile::tempdir().unwrap().path().join("discovery.db"));
+    discovery_store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: recent,
+            category: "worktree_discovery".to_string(),
+            path: None,
+            message: "pathless discovery failure".to_string(),
+        })
+        .unwrap();
+    assert!(discovery_store
+        .scan_coverage_incomplete_since(cutoff)
+        .unwrap());
+}
+
+#[test]
 fn resolved_discovery_error_stops_blocking_without_hiding_ordinary_scan_error() {
     let root = tempfile::tempdir().unwrap();
     let primary = root.path().join("primary");
@@ -1084,6 +1432,9 @@ fn resolved_discovery_error_stops_blocking_without_hiding_ordinary_scan_error() 
             .unwrap(),
         vec![primary.clone(), unrelated.clone()]
     );
+    assert!(store
+        .scan_coverage_incomplete_since(SystemTime::UNIX_EPOCH)
+        .unwrap());
 
     store.replace_linked_worktrees(&primary, &[]).unwrap();
     assert_eq!(

@@ -7,6 +7,45 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 #[test]
+fn unknown_argument_exits_one_instead_of_incomplete() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("--definitely-unknown")
+        .assert()
+        .code(1)
+        .stderr(contains("unexpected argument"));
+}
+
+#[test]
+fn missing_subcommand_exits_one_instead_of_incomplete() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .assert()
+        .code(1)
+        .stderr(contains("Usage:"));
+}
+
+#[test]
+fn top_level_help_parse_request_exits_zero() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .code(0)
+        .stdout(contains("Usage:"));
+}
+
+#[test]
+fn top_level_version_parse_request_exits_zero() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .code(0)
+        .stdout(contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn exit_code_zero_for_complete_scan() {
     let work = tempfile::tempdir().unwrap();
     let root = work.path().join("root");
@@ -1012,6 +1051,77 @@ fn cargo_failure_is_audited_without_recovery_accounting() {
     assert_eq!(stats["failed_clean_attempts"], 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn post_cargo_measurement_failure_exits_one_without_losing_the_audit_event() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nrm -rf target\nprintf 'replacement' > target\nprintf 'cargo warning\\n' >&2\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let root = work.path().join("tree");
+    let project = root.join("proj");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stdout(contains("Run complete: cleaned=0"))
+        .stdout(contains("recovered=0"))
+        .stdout(contains("errors=1"));
+
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert_eq!(run.bytes_recovered, 0);
+    assert_eq!(run.errors_count, 1);
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, 0);
+    assert_eq!(events[0].stderr_excerpt, "cargo warning\n");
+    assert_eq!(events[0].bytes_after, events[0].bytes_before);
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "clean");
+    assert!(errors[0]
+        .message
+        .contains("measure target after cargo clean"));
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
+}
+
 #[test]
 fn run_dry_run_reports_without_invoking_cargo_clean() {
     let work = tempfile::tempdir().unwrap();
@@ -1136,6 +1246,58 @@ fn non_forced_cli_reviews_honor_durable_discovery_blocks_and_force_bypasses_them
         .assert()
         .code(2)
         .stdout(contains("Cleanable projects: 1"));
+}
+
+#[test]
+fn pathless_scan_error_keeps_cached_review_commands_incomplete() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("tree");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&project, SystemTime::now()).unwrap();
+    store
+        .record_error(&car_go_clean::store::ErrorRecord {
+            id: 0,
+            ts: SystemTime::now(),
+            category: "scan".to_string(),
+            path: None,
+            message: "scan failed before resolving a path".to_string(),
+        })
+        .unwrap();
+    drop(store);
+
+    for args in [
+        vec!["projects", "--all"],
+        vec!["status", "--refresh"],
+        vec!["run", "--dry-run", "--no-scan", "--force"],
+    ] {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .args(args)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .assert()
+            .code(2);
+    }
 }
 
 #[cfg(unix)]

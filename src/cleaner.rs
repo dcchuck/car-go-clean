@@ -20,6 +20,7 @@ pub struct CleanResult {
     pub duration: Duration,
     pub exit_code: i32,
     pub stderr_excerpt: String,
+    pub measurement_error: Option<String>,
     pub skipped: bool,
 }
 
@@ -66,6 +67,7 @@ impl<R: CommandRunner> Cleaner<R> {
             duration: Duration::ZERO,
             exit_code: 0,
             stderr_excerpt: String::new(),
+            measurement_error: None,
             skipped: false,
         };
 
@@ -86,11 +88,14 @@ impl<R: CommandRunner> Cleaner<R> {
         result.duration = start.elapsed();
         result.exit_code = outcome.exit_code;
         result.stderr_excerpt = stderr_excerpt(&outcome.stderr);
-        result.bytes_after = if target_dir.exists() {
-            dir_size(&target_dir)?
-        } else {
-            0
-        };
+        match dir_size(&target_dir) {
+            Ok(bytes_after) => result.bytes_after = bytes_after,
+            Err(error) => {
+                result.bytes_after = result.bytes_before;
+                result.measurement_error =
+                    Some(format!("measure target after cargo clean: {error:#}"));
+            }
+        }
         Ok(result)
     }
 }
