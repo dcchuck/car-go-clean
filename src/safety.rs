@@ -454,7 +454,7 @@ pub fn bind_review_to_observation(
 #[allow(clippy::too_many_arguments)]
 pub fn revalidate_before_clean(
     review: &ProjectReview,
-    policy: Option<&ScopePolicy>,
+    policy: &ScopePolicy,
     identity_provider: &dyn IdentityProvider,
     activity: &dyn ProcessInspector,
     scan_error_paths: &[PathBuf],
@@ -471,10 +471,8 @@ pub fn revalidate_before_clean(
         ));
     };
 
-    if let Some(policy) = policy {
-        if let Some(reason) = policy_block_reason(policy, review, opts) {
-            return Ok(CleanDecision::Skipped(reason));
-        }
+    if let Some(reason) = policy_block_reason(policy, review, opts) {
+        return Ok(CleanDecision::Skipped(reason));
     }
 
     let activity = activity.active_projects(std::slice::from_ref(&review.path))?;
@@ -539,10 +537,8 @@ pub fn revalidate_before_clean(
     if target_identity != reviewed_identity.target {
         return Ok(CleanDecision::Skipped(SkipReason::TargetIdentityChanged));
     }
-    if let Some(policy) = policy {
-        if let Some(reason) = policy_block_reason(policy, review, opts) {
-            return Ok(CleanDecision::Skipped(reason));
-        }
+    if let Some(reason) = policy_block_reason(policy, review, opts) {
+        return Ok(CleanDecision::Skipped(reason));
     }
 
     Ok(CleanDecision::Cleanable)

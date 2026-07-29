@@ -1,7 +1,6 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
-use crate::identity::BootSessionId;
 use crate::logging::Logger;
 use crate::safety::{
     bind_review_to_observation, revalidate_before_clean, review_project_with_identity_provider,
@@ -214,10 +213,6 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let run_id = self.store.start_run(started)?;
         let (observations, generation) = self.authorized_observations()?;
         let generation_missing = generation.is_none();
-        let observed_boot = generation
-            .as_ref()
-            .and_then(|generation| generation.boot_session_id.as_ref())
-            .map(|boot| BootSessionId(boot.clone()));
         let project_paths: Vec<PathBuf> = observations
             .iter()
             .map(|observation| observation.project_path.clone())
@@ -253,17 +248,28 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             )?;
 
             if review.decision == CleanDecision::Cleanable {
-                if let Some(policy) = self.scanner.policy() {
-                    if !policy.contains_project(&path) {
+                match self.scanner.policy() {
+                    Some(policy) if !policy.contains_project(&path) => {
                         review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
-                    } else if policy.is_excluded(&path) || policy.is_excluded(&review.target_path) {
+                    }
+                    Some(policy)
+                        if policy.is_excluded(&path) || policy.is_excluded(&review.target_path) =>
+                    {
                         review.decision = CleanDecision::Skipped(SkipReason::Excluded);
+                    }
+                    Some(_) => {}
+                    None => {
+                        review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
                     }
                 }
             }
 
             let mut reverified_across_boot = false;
             if review.decision == CleanDecision::Cleanable {
+                let observed_boot = observation
+                    .boot_session_id
+                    .as_ref()
+                    .map(|boot| crate::identity::BootSessionId(boot.clone()));
                 reverified_across_boot = bind_review_to_observation(
                     &mut review,
                     &observation.project_identity,
@@ -276,16 +282,19 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 // measures the target and spawns Cargo. The filesystem can still
                 // change after this returns, so this narrows but cannot eliminate
                 // the residual TOCTOU window.
-                review.decision = revalidate_before_clean(
-                    &review,
-                    self.scanner.policy(),
-                    self.scanner.identity_provider(),
-                    inspector,
-                    &scan_errors,
-                    &discovery_blocks,
-                    SystemTime::now(),
-                    &safety,
-                )?;
+                review.decision = match self.scanner.policy() {
+                    Some(policy) => revalidate_before_clean(
+                        &review,
+                        policy,
+                        self.scanner.identity_provider(),
+                        inspector,
+                        &scan_errors,
+                        &discovery_blocks,
+                        SystemTime::now(),
+                        &safety,
+                    )?,
+                    None => CleanDecision::Skipped(SkipReason::OutOfScope),
+                };
             }
             if review.decision == CleanDecision::Cleanable && reverified_across_boot {
                 if let (Some(generation), Some(identity)) =
@@ -405,6 +414,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     fn authorized_observations(
         &self,
     ) -> Result<(Vec<ProjectObservation>, Option<DiscoveryGeneration>)> {
+        if self.scanner.policy().is_none() {
+            return Ok((Vec::new(), None));
+        }
         let Some(generation) = self.store.current_generation(self.scanner.policy_hash())? else {
             return Ok((Vec::new(), None));
         };

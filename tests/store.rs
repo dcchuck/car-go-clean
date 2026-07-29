@@ -167,7 +167,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 9);
+    assert_eq!(schema_version, 10);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1766,8 +1766,83 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 9);
+        assert_eq!(schema_version, 10);
     }
+}
+
+#[test]
+fn version_nine_observations_inherit_their_generation_boot_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("v9.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version(version) VALUES (9);
+            CREATE TABLE discovery_generations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                policy_hash TEXT NOT NULL,
+                boot_session_id TEXT
+            );
+            CREATE TABLE discovery_origins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                configured_path TEXT NOT NULL,
+                canonical_path TEXT,
+                completed INTEGER NOT NULL,
+                error TEXT
+            );
+            CREATE TABLE project_observations (
+                generation_id INTEGER NOT NULL,
+                origin_id INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                project_device INTEGER NOT NULL,
+                project_inode INTEGER NOT NULL,
+                target_device INTEGER,
+                target_inode INTEGER,
+                observed_at INTEGER NOT NULL,
+                authorized INTEGER NOT NULL,
+                blocked_reason TEXT,
+                PRIMARY KEY(generation_id, origin_id, project_path)
+            );
+            INSERT INTO discovery_generations (
+                id, created_at, policy_hash, boot_session_id
+            ) VALUES (1, 100, 'policy-a', 'boot-a');
+            INSERT INTO discovery_origins (
+                id, generation_id, kind, configured_path,
+                canonical_path, completed, error
+            ) VALUES (
+                1, 1, 'scan_root', '/workspace', '/workspace', 1, NULL
+            );
+            INSERT INTO project_observations (
+                generation_id, origin_id, project_path,
+                project_device, project_inode, target_device, target_inode,
+                observed_at, authorized, blocked_reason
+            ) VALUES (
+                1, 1, '/workspace/project', 7, 11, 7, 12,
+                100, 1, NULL
+            );
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+
+    let observations = store.authorized_observations(1).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].boot_session_id.as_deref(), Some("boot-a"));
+    let inspection = rusqlite::Connection::open(database).unwrap();
+    let schema_version = inspection
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(schema_version, 10);
 }
 
 #[test]
@@ -2031,6 +2106,7 @@ fn discovery_generation_reverification_replaces_persisted_identity() {
         observation[0].target_identity.as_ref(),
         Some(&reverified.target)
     );
+    assert_eq!(observation[0].boot_session_id.as_deref(), Some("boot-b"));
 }
 
 #[test]

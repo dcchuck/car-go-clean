@@ -15,7 +15,9 @@ use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::config;
 use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
-use car_go_clean::identity::{BootSessionId, FilesystemIdentity, IdentityProvider};
+use car_go_clean::identity::{
+    BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
+};
 use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::policy::{Environment, ScopePolicy};
 use car_go_clean::safety::SafetyOptions;
@@ -29,6 +31,39 @@ use predicates::str::contains;
 fn write_file(path: &Path, body: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, body).unwrap();
+}
+
+fn authoritative_scanner(options: ScannerOptions) -> Scanner {
+    let scanner = Scanner::new(options.clone());
+    bind_test_authority(scanner, &options)
+}
+
+fn authoritative_scanner_with_resolver(
+    options: ScannerOptions,
+    resolver: Arc<dyn GitWorktreeResolver>,
+) -> Scanner {
+    let scanner = Scanner::with_worktree_resolver(options.clone(), resolver);
+    bind_test_authority(scanner, &options)
+}
+
+fn bind_test_authority(scanner: Scanner, options: &ScannerOptions) -> Scanner {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("config.toml");
+    let body = format!(
+        "scan_dirs = {}\nproject_dirs = {}\noverride_excludes = {}\ntarget_quiet_period = \"1ms\"\n",
+        serde_json::to_string(&options.roots).unwrap(),
+        serde_json::to_string(&options.project_dirs).unwrap(),
+        serde_json::to_string(&options.excludes).unwrap(),
+    );
+    fs::write(&config_path, body).unwrap();
+    let config = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(
+        &config,
+        Path::new("/car-go-clean/tests/config.toml"),
+        &EmptyEnvironment,
+    )
+    .unwrap();
+    scanner.with_authority(policy, Arc::new(SystemIdentityProvider))
 }
 
 #[test]
@@ -106,7 +141,7 @@ fn failed_origin_preserves_history_but_grants_no_current_authority() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -157,7 +192,7 @@ fn cache_eviction_preserves_association_for_a_later_discovery_failure() {
     let successful = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             options.clone(),
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -188,7 +223,7 @@ fn cache_eviction_preserves_association_for_a_later_discovery_failure() {
     let failed = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             options.clone(),
             Arc::new(FakeWorktreeResolver::failure("git failed")),
         ),
@@ -220,7 +255,7 @@ fn cache_eviction_preserves_association_for_a_later_discovery_failure() {
     let successful = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             options,
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -305,7 +340,7 @@ fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -391,7 +426,7 @@ fn first_v4_scan_reconciles_v3_cached_out_of_scope_worktree_without_provenance()
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -487,7 +522,7 @@ fn successful_out_of_scope_reconciliation_preserves_explicit_project_dir() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![canonical_explicit.clone()],
@@ -560,7 +595,7 @@ fn configured_project_dir_does_not_override_exclusion_reconciliation() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![explicit.clone()],
@@ -626,7 +661,7 @@ fn daemon_does_not_clean_a_persisted_alias_of_a_managed_cache_project() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![alias.clone()],
             project_dirs: vec![],
             excludes: vec![],
@@ -768,7 +803,7 @@ fn daemon_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
         let daemon = Daemon::new(
             &store,
             Cache::new(&store),
-            Scanner::new(ScannerOptions {
+            authoritative_scanner(ScannerOptions {
                 roots: vec![root_path.clone()],
                 project_dirs: vec![],
                 excludes: vec![],
@@ -867,7 +902,7 @@ fn daemon_reused_v4_untrusted_primary_does_not_release_historical_child() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![],
                 project_dirs: vec![reused],
@@ -935,7 +970,7 @@ fn daemon_cache_review_cannot_retarget_trusted_linked_provenance() {
     let successful = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::paths(vec![canonical_linked.clone()])),
         ),
@@ -967,7 +1002,7 @@ fn daemon_cache_review_cannot_retarget_trusted_linked_provenance() {
     let failed = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::failure("git failed")),
         ),
@@ -1034,13 +1069,19 @@ struct ActiveOnSecondInspector {
 }
 
 struct SwitchableIdentityProvider {
-    phase: AtomicUsize,
+    boot_phase: AtomicUsize,
+    target_revision: AtomicUsize,
     cross_device: AtomicUsize,
 }
 
 impl SwitchableIdentityProvider {
     fn switch_boot(&self) {
-        self.phase.store(1, Ordering::SeqCst);
+        self.boot_phase.store(1, Ordering::SeqCst);
+        self.target_revision.store(1, Ordering::SeqCst);
+    }
+
+    fn replace_target_in_same_boot(&self) {
+        self.target_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     fn move_target_to_other_device(&self) {
@@ -1050,7 +1091,7 @@ impl SwitchableIdentityProvider {
 
 impl IdentityProvider for SwitchableIdentityProvider {
     fn boot_session(&self) -> anyhow::Result<Option<BootSessionId>> {
-        let boot = if self.phase.load(Ordering::SeqCst) == 0 {
+        let boot = if self.boot_phase.load(Ordering::SeqCst) == 0 {
             "boot-a"
         } else {
             "boot-b"
@@ -1059,7 +1100,6 @@ impl IdentityProvider for SwitchableIdentityProvider {
     }
 
     fn identity(&self, path: &Path) -> anyhow::Result<FilesystemIdentity> {
-        let phase = self.phase.load(Ordering::SeqCst) as u64;
         Ok(FilesystemIdentity {
             device: if path.file_name() == Some(OsStr::new("target"))
                 && self.cross_device.load(Ordering::SeqCst) != 0
@@ -1069,9 +1109,9 @@ impl IdentityProvider for SwitchableIdentityProvider {
                 7
             },
             inode: if path.file_name() == Some(OsStr::new("target")) {
-                20 + phase
+                20 + self.target_revision.load(Ordering::SeqCst) as u64
             } else {
-                10 + phase
+                10 + self.boot_phase.load(Ordering::SeqCst) as u64
             },
         })
     }
@@ -1273,7 +1313,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1332,7 +1372,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_out_dir_argument() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1399,7 +1439,7 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1515,7 +1555,7 @@ fn daemon_skips_non_utf8_nested_rust_argument_paths_with_outside_cwd() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1664,7 +1704,7 @@ fn daemon_scan_and_run_cycle_record_state() {
     let store = Store::open(db_dir.path().join("state.db")).unwrap();
     store.migrate().unwrap();
 
-    let scanner = Scanner::new(ScannerOptions {
+    let scanner = authoritative_scanner(ScannerOptions {
         roots: vec![root.path().to_path_buf()],
         project_dirs: vec![],
         excludes: vec![],
@@ -1716,7 +1756,7 @@ fn same_generation_target_identity_replacement_is_rejected_before_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1766,7 +1806,7 @@ fn target_identity_replacement_after_review_is_revalidated_before_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1827,7 +1867,7 @@ fn project_identity_replacement_after_review_is_revalidated_before_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1894,7 +1934,7 @@ fn target_symlink_swap_after_review_is_rejected_before_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -1953,7 +1993,8 @@ fn cross_device_target_change_after_review_is_rejected_before_cargo() {
     let cfg = config::load(&config_path).unwrap();
     let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
     let identity = Arc::new(SwitchableIdentityProvider {
-        phase: AtomicUsize::new(0),
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
     });
 
@@ -1967,7 +2008,7 @@ fn cross_device_target_change_after_review_is_rejected_before_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: cfg.scan_dirs.clone(),
             project_dirs: cfg.project_dirs.clone(),
             excludes: cfg.effective_excludes(),
@@ -2020,7 +2061,7 @@ fn activity_that_appears_after_review_blocks_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2073,7 +2114,7 @@ fn recent_write_after_review_blocks_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2127,7 +2168,8 @@ fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope()
     let cfg = config::load(&config_path).unwrap();
     let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
     let identity = Arc::new(SwitchableIdentityProvider {
-        phase: AtomicUsize::new(0),
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
     });
 
@@ -2141,7 +2183,7 @@ fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope()
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: cfg.scan_dirs.clone(),
             project_dirs: cfg.project_dirs.clone(),
             excludes: cfg.effective_excludes(),
@@ -2173,6 +2215,85 @@ fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope()
 }
 
 #[test]
+fn cross_boot_reverification_scopes_identity_to_new_boot_for_later_cycles() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    identity.switch_boot();
+
+    let first_boot_b = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(first_boot_b.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    runner.calls.lock().unwrap().clear();
+
+    identity.replace_target_in_same_boot();
+    let second_boot_b = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(second_boot_b.cleaned, 0);
+    assert_eq!(second_boot_b.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
 fn changed_scope_has_no_matching_generation_and_never_calls_cargo() {
     let root = tempfile::tempdir().unwrap();
     let old_scope = root.path().join("old-scope");
@@ -2188,7 +2309,7 @@ fn changed_scope_has_no_matching_generation_and_never_calls_cargo() {
     let scan_daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![old_scope],
             project_dirs: vec![],
             excludes: vec![],
@@ -2205,7 +2326,7 @@ fn changed_scope_has_no_matching_generation_and_never_calls_cargo() {
     let narrowed = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![new_scope],
             project_dirs: vec![],
             excludes: vec![],
@@ -2217,6 +2338,54 @@ fn changed_scope_has_no_matching_generation_and_never_calls_cargo() {
         },
     );
     let result = narrowed
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(result.coverage_incomplete);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn policyless_scanner_generation_never_authorizes_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    let result = daemon
         .run_cycle_with_safety(
             SafetyOptions {
                 target_quiet_period: Duration::ZERO,
@@ -2250,7 +2419,7 @@ fn removed_explicit_project_has_no_matching_generation_and_never_calls_cargo() {
     let scan_daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![retained_root.clone()],
             project_dirs: vec![project.clone()],
             excludes: vec![],
@@ -2267,7 +2436,7 @@ fn removed_explicit_project_has_no_matching_generation_and_never_calls_cargo() {
     let removed = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![retained_root],
             project_dirs: vec![],
             excludes: vec![],
@@ -2313,7 +2482,7 @@ fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2400,7 +2569,7 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2510,7 +2679,7 @@ fn daemon_logs_run_cycle_summary() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2574,7 +2743,7 @@ fn daemon_uses_persisted_overdue_clean_schedule_after_restart() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2640,7 +2809,7 @@ fn scheduler_scans_before_cleaning_when_equal_deadlines_are_overdue() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -2714,7 +2883,7 @@ fn scheduler_reconciles_successful_exclusions_before_equal_due_clean() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -2791,7 +2960,7 @@ fn scheduler_retries_initial_empty_store_scan_persistence_failure() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2891,7 +3060,7 @@ fn scheduler_defers_clean_and_retry_after_scan_persistence_failure() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -2945,7 +3114,7 @@ fn daemon_run_cycle_skips_recent_targets_by_default() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -2987,7 +3156,7 @@ fn daemon_run_cycle_skips_symlinked_target_even_with_force_compatibility() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -3031,7 +3200,7 @@ fn daemon_run_cycle_reports_pathless_scan_error_as_incomplete_coverage() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -3094,7 +3263,7 @@ fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
@@ -3141,7 +3310,7 @@ fn daemon_shutdown_flag_stops_forever_loop_after_initial_scan() {
         delete_target: true,
         ..FakeRunner::default()
     };
-    let scanner = Scanner::new(ScannerOptions {
+    let scanner = authoritative_scanner(ScannerOptions {
         roots: vec![root.path().to_path_buf()],
         project_dirs: vec![],
         excludes: vec![],
@@ -3183,7 +3352,7 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
     let store = Store::open(db_dir.path().join("state.db")).unwrap();
     store.migrate().unwrap();
 
-    let scanner = Scanner::new(ScannerOptions {
+    let scanner = authoritative_scanner(ScannerOptions {
         roots: vec![root.path().to_path_buf()],
         project_dirs: vec![],
         excludes: vec![],
@@ -3273,7 +3442,7 @@ fn reconciliation_uncertainty_aborts_before_cargo_without_mutation() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![alias_root],
             project_dirs: vec![],
             excludes: vec![],
@@ -3333,7 +3502,7 @@ fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() 
     let successful_scan = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -3345,7 +3514,7 @@ fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() 
     let failed_scan = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::failure("git failed")),
         ),
@@ -3382,7 +3551,7 @@ fn daemon_blocks_cached_linked_worktree_after_discovery_failure_until_success() 
     let successful_scan = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::paths(vec![linked])),
         ),
@@ -3435,7 +3604,7 @@ fn daemon_excludes_canonical_git_candidate_beneath_multi_component_exclusion() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -3516,7 +3685,7 @@ fn successful_canonical_discovery_clears_alias_keyed_failure_and_stale_provenanc
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -3611,7 +3780,7 @@ fn daemon_success_at_retargeted_primary_alias_destination_preserves_original_fai
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![],
                 project_dirs: vec![canonical_replacement.clone()],
@@ -3717,7 +3886,7 @@ fn daemon_migrated_broken_primary_alias_stays_fail_closed_after_primary_success(
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![],
                 project_dirs: vec![canonical_primary.clone()],
@@ -3905,7 +4074,7 @@ fn failed_discovery_blocks_canonical_child_from_alias_only_provenance() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -3991,7 +4160,7 @@ fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery()
     let failed_state = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::failure("still failing")),
         ),
@@ -4033,7 +4202,7 @@ fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery()
     let repaired_state = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -4113,7 +4282,7 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
     let failed_state = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::failure("still failing")),
         ),
@@ -4142,7 +4311,7 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
     let repaired_state = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -4197,7 +4366,7 @@ fn daemon_durably_blocks_exact_primary_and_saved_linked_paths_without_recent_sca
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -4253,7 +4422,7 @@ fn daemon_non_utf8_discovery_failure_preserves_prior_association_and_block() {
     let successful = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options.clone(),
             Arc::new(FakeWorktreeResolver::paths(vec![saved.clone()])),
         ),
@@ -4265,7 +4434,7 @@ fn daemon_non_utf8_discovery_failure_preserves_prior_association_and_block() {
     let rejected = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             scanner_options,
             Arc::new(FakeWorktreeResolver::paths(vec![non_utf8])),
         ),
@@ -4304,7 +4473,7 @@ fn malformed_successful_git_output_preserves_prior_association_and_failure() {
     let successful = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             options.clone(),
             Arc::new(FakeWorktreeResolver::paths(vec![linked.clone()])),
         ),
@@ -4324,7 +4493,7 @@ fn malformed_successful_git_output_preserves_prior_association_and_failure() {
     let malformed_scan = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             options,
             Arc::new(SuccessfulOutputResolver { stdout: malformed }),
         ),
@@ -4361,7 +4530,7 @@ fn daemon_cache_sync_does_not_clear_failed_association_when_primary_disappears()
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -4449,7 +4618,7 @@ fn successful_scan_prunes_cached_excluded_candidates_and_failures() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::with_worktree_resolver(
+        authoritative_scanner_with_resolver(
             ScannerOptions {
                 roots: vec![root.path().to_path_buf()],
                 project_dirs: vec![],
@@ -4522,7 +4691,7 @@ fn successful_scan_reconciles_removed_exclusion_through_symlinked_home() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![physical_home],
             project_dirs: vec![],
             excludes: vec![symlinked_home
@@ -4653,7 +4822,7 @@ fn upgraded_nonempty_cache_prunes_exclusions_when_clean_is_due_before_scan() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        Scanner::new(ScannerOptions {
+        authoritative_scanner(ScannerOptions {
             roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![

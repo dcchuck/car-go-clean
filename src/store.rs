@@ -113,6 +113,7 @@ pub struct ProjectObservation {
     pub project_path: PathBuf,
     pub project_identity: FilesystemIdentity,
     pub target_identity: Option<FilesystemIdentity>,
+    pub boot_session_id: Option<String>,
     pub observed_at: SystemTime,
     pub authorized: bool,
     pub blocked_reason: Option<String>,
@@ -507,6 +508,7 @@ impl Store {
                     observed_at INTEGER NOT NULL,
                     authorized INTEGER NOT NULL CHECK(authorized IN (0, 1)),
                     blocked_reason TEXT,
+                    boot_session_id TEXT,
                     PRIMARY KEY(generation_id, origin_id, project_path)
                 );
                 CREATE INDEX IF NOT EXISTS idx_project_observations_authorized
@@ -527,6 +529,37 @@ impl Store {
                 )?;
             }
             tx.execute("INSERT INTO schema_version(version) VALUES (9)", [])?;
+            tx.commit()?;
+        }
+        if current < 10 {
+            let tx = self.conn.unchecked_transaction()?;
+            let has_boot_session_id = {
+                let mut statement = tx.prepare("PRAGMA table_info(project_observations)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                collect_rows(columns)?
+                    .into_iter()
+                    .any(|column| column == "boot_session_id")
+            };
+            if !has_boot_session_id {
+                tx.execute(
+                    "ALTER TABLE project_observations ADD COLUMN boot_session_id TEXT",
+                    [],
+                )?;
+            }
+            tx.execute(
+                "
+                UPDATE project_observations
+                SET boot_session_id = (
+                    SELECT boot_session_id
+                    FROM discovery_generations
+                    WHERE discovery_generations.id =
+                        project_observations.generation_id
+                )
+                WHERE boot_session_id IS NULL
+                ",
+                [],
+            )?;
+            tx.execute("INSERT INTO schema_version(version) VALUES (10)", [])?;
             tx.commit()?;
         }
         Ok(())
@@ -1116,9 +1149,9 @@ impl Store {
                     INSERT INTO project_observations (
                         generation_id, origin_id, project_path,
                         project_device, project_inode, target_device, target_inode,
-                        observed_at, authorized, blocked_reason
+                        observed_at, authorized, blocked_reason, boot_session_id
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                     ",
                     params![
                         generation_id,
@@ -1137,6 +1170,7 @@ impl Store {
                         to_epoch(observation.observed_at)?,
                         authorized,
                         blocked_reason,
+                        reconciliation.boot_session_id,
                     ],
                 )?;
                 tx.execute(
@@ -1201,7 +1235,8 @@ impl Store {
                 observations.target_inode,
                 observations.observed_at,
                 observations.authorized,
-                observations.blocked_reason
+                observations.blocked_reason,
+                observations.boot_session_id
             FROM project_observations AS observations
             JOIN discovery_origins AS origins
               ON origins.id = observations.origin_id
@@ -1228,9 +1263,10 @@ impl Store {
             SET project_device = ?1,
                 project_inode = ?2,
                 target_device = ?3,
-                target_inode = ?4
-            WHERE generation_id = ?5
-              AND project_path = ?6
+                target_inode = ?4,
+                boot_session_id = ?5
+            WHERE generation_id = ?6
+              AND project_path = ?7
               AND authorized = 1
               AND EXISTS(
                   SELECT 1
@@ -1246,6 +1282,10 @@ impl Store {
                 identity.project.inode,
                 identity.target.device,
                 identity.target.inode,
+                identity
+                    .boot_session
+                    .as_ref()
+                    .map(|boot_session| &boot_session.0),
                 generation_id,
                 path_to_string(path)?,
             ],
@@ -1895,6 +1935,7 @@ fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pro
             inode: row.get(4)?,
         },
         target_identity,
+        boot_session_id: row.get(10)?,
         observed_at: from_epoch(row.get(7)?),
         authorized: row.get(8)?,
         blocked_reason: row.get(9)?,

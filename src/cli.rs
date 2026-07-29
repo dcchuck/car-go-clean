@@ -767,10 +767,6 @@ fn project_reviews(
         Some(generation) => store.authorized_observations(generation.id)?,
         None => Vec::new(),
     };
-    let observed_boot = generation
-        .as_ref()
-        .and_then(|generation| generation.boot_session_id.as_ref())
-        .map(|boot| BootSessionId(boot.clone()));
     let paths: Vec<PathBuf> = observations
         .iter()
         .map(|observation| observation.project_path.clone())
@@ -805,6 +801,10 @@ fn project_reviews(
                 }
             }
             if review.decision == CleanDecision::Cleanable {
+                let observed_boot = observation
+                    .boot_session_id
+                    .as_ref()
+                    .map(|boot| BootSessionId(boot.clone()));
                 bind_review_to_observation(
                     &mut review,
                     &observation.project_identity,
