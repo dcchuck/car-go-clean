@@ -619,6 +619,9 @@ fn run_once(options: RunOptions) -> Result<()> {
         "Run complete: cleaned={} skipped={} recovered={} errors={}",
         result.cleaned, result.skipped, result.bytes_recovered, result.errors
     );
+    if result.errors > 0 {
+        bail!("{} cargo clean attempt(s) failed", result.errors);
+    }
     Ok(())
 }
 
@@ -862,16 +865,19 @@ fn stats(state_dir: Option<PathBuf>, since: Option<String>, top: usize, json: bo
     let store = open_store(state_dir.as_deref())?;
     let total = store.total_bytes_recovered(since_time)?;
     let top_projects = store.top_projects_by_bytes(since_time, top)?;
+    let failed_clean_attempts = store.failed_clean_attempts(since_time)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "total_bytes": total,
                 "top_projects": top_projects,
+                "failed_clean_attempts": failed_clean_attempts,
             })
         );
     } else {
         println!("Bytes recovered: {total}");
+        println!("Failed clean attempts: {failed_clean_attempts}");
         for (idx, project) in top_projects.iter().enumerate() {
             println!("  {}. {} - {} bytes", idx + 1, project.path, project.bytes);
         }

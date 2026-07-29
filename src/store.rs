@@ -1001,7 +1001,7 @@ impl Store {
         let total = self.conn.query_row(
             "
             SELECT COALESCE(SUM(bytes_before - bytes_after), 0)
-            FROM clean_events WHERE ts >= ?1
+            FROM clean_events WHERE ts >= ?1 AND exit_code = 0
             ",
             [to_epoch(since)?],
             |row| row.get(0),
@@ -1014,7 +1014,7 @@ impl Store {
             "
             SELECT path, SUM(bytes_before - bytes_after) AS recovered
             FROM clean_events
-            WHERE ts >= ?1
+            WHERE ts >= ?1 AND exit_code = 0
             GROUP BY path
             ORDER BY recovered DESC
             LIMIT ?2
@@ -1027,6 +1027,16 @@ impl Store {
             })
         })?;
         collect_rows(rows)
+    }
+
+    pub fn failed_clean_attempts(&self, since: SystemTime) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM clean_events WHERE ts >= ?1 AND exit_code <> 0",
+                [to_epoch(since)?],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn record_review_status(

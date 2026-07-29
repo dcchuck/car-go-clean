@@ -617,6 +617,101 @@ fn scan_run_stats_work_with_fake_cargo() {
         .stdout(contains("Source: run (pre-clean snapshot)"));
 }
 
+#[cfg(unix)]
+#[test]
+fn cargo_failure_is_audited_without_recovery_accounting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nrm -f target/removed.bin\nprintf 'cargo failed: λ\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let root = work.path().join("tree");
+    let project = root.join("proj");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/removed.bin"), vec![0; 2048]).unwrap();
+    fs::write(project.join("target/retained.bin"), vec![0; 1024]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", &path)
+        .assert()
+        .failure()
+        .stdout(contains("Run complete: cleaned=0"))
+        .stdout(contains("errors=1"));
+
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert_eq!(run.bytes_recovered, 0);
+    assert_eq!(run.errors_count, 1);
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, 7);
+    assert!(events[0].bytes_before > events[0].bytes_after);
+    assert_eq!(events[0].stderr_excerpt, "cargo failed: λ\n");
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert!(errors.iter().any(|error| {
+        error.category == "clean"
+            && error.message.contains("cargo clean exited 7")
+            && error.message.contains("cargo failed: λ")
+    }));
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["stats", "--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains("Bytes recovered: 0"))
+        .stdout(contains("Failed clean attempts: 1"));
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["stats", "--json", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stats: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stats["total_bytes"], 0);
+    assert_eq!(stats["failed_clean_attempts"], 1);
+}
+
 #[test]
 fn run_dry_run_reports_without_invoking_cargo_clean() {
     let work = tempfile::tempdir().unwrap();

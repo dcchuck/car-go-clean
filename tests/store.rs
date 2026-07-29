@@ -963,12 +963,12 @@ fn records_runs_clean_events_errors_and_stats() {
         .record_clean_event(&CleanEvent {
             id: 0,
             run_id,
-            ts: t0,
+            ts: t0 + Duration::from_secs(10),
             path: "/b".to_string(),
             bytes_before: 500,
             bytes_after: 0,
             duration_ms: 10,
-            exit_code: 0,
+            exit_code: 9,
             stderr_excerpt: String::new(),
         })
         .unwrap();
@@ -982,20 +982,32 @@ fn records_runs_clean_events_errors_and_stats() {
         })
         .unwrap();
     store
-        .finish_run(run_id, t0 + Duration::from_secs(60), 2, 1400, 1)
+        .finish_run(run_id, t0 + Duration::from_secs(60), 1, 900, 1)
         .unwrap();
 
     let run = store.last_run().unwrap();
-    assert_eq!(run.projects_cleaned, 2);
-    assert_eq!(run.bytes_recovered, 1400);
+    assert_eq!(run.projects_cleaned, 1);
+    assert_eq!(run.bytes_recovered, 900);
     assert_eq!(
         store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
-        1400
+        900
+    );
+    assert_eq!(
+        store
+            .total_bytes_recovered(t0 + Duration::from_secs(5))
+            .unwrap(),
+        0
     );
     let top = store
-        .top_projects_by_bytes(SystemTime::UNIX_EPOCH, 1)
+        .top_projects_by_bytes(SystemTime::UNIX_EPOCH, 10)
         .unwrap();
+    assert_eq!(top.len(), 1);
     assert_eq!(top[0].path, "/a");
+    assert_eq!(top[0].bytes, 900);
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
+    );
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
 }
 

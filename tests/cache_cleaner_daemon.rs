@@ -933,6 +933,7 @@ fn daemon_cache_review_cannot_retarget_trusted_linked_provenance() {
 struct FakeRunner {
     calls: Arc<Mutex<Vec<FakeCall>>>,
     delete_target: bool,
+    delete_relative_path: Option<PathBuf>,
     exit_code: i32,
     stderr: String,
 }
@@ -979,6 +980,9 @@ impl CommandRunner for FakeRunner {
         });
         if self.delete_target {
             let _ = fs::remove_dir_all(dir.join("target"));
+        }
+        if let Some(relative) = &self.delete_relative_path {
+            fs::remove_file(dir.join("target").join(relative)).unwrap();
         }
         Ok(CleanOutcome {
             exit_code: self.exit_code,
@@ -1512,6 +1516,79 @@ fn daemon_scan_and_run_cycle_record_state() {
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert!(run.bytes_recovered >= 2048);
+}
+
+#[test]
+fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/removed.bin"), &[0; 2048]);
+    write_file(&project.join("target/retained.bin"), &[0; 1024]);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(store_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&project, SystemTime::now()).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new(
+            "cargo",
+            FakeRunner {
+                delete_relative_path: Some(PathBuf::from("removed.bin")),
+                exit_code: 7,
+                stderr: "cargo metadata failed".to_string(),
+                ..FakeRunner::default()
+            },
+            Duration::from_secs(60),
+        ),
+        DaemonOptions {
+            target_quiet_period: Duration::from_millis(1),
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_millis(1),
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.bytes_recovered, 0);
+    assert_eq!(result.errors, 1);
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert_eq!(run.bytes_recovered, 0);
+    assert_eq!(run.errors_count, 1);
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, 7);
+    assert!(events[0].bytes_before > events[0].bytes_after);
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert!(errors.iter().any(|error| {
+        error.category == "clean"
+            && error.message.contains("cargo clean exited 7")
+            && error.message.contains("cargo metadata failed")
+    }));
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
 }
 
 #[test]

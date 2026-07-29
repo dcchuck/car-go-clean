@@ -229,8 +229,6 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     cleaner_skipped += 1;
                 }
                 Ok(result) => {
-                    projects_cleaned += 1;
-                    bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
                     let now = SystemTime::now();
                     self.store.record_clean_event(&CleanEvent {
                         id: 0,
@@ -241,9 +239,30 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         bytes_after: result.bytes_after,
                         duration_ms: result.duration.as_millis() as i64,
                         exit_code: result.exit_code,
-                        stderr_excerpt: result.stderr_excerpt,
+                        stderr_excerpt: result.stderr_excerpt.clone(),
                     })?;
-                    self.store.mark_project_cleaned(&project.path, now)?;
+                    if result.exit_code == 0 {
+                        projects_cleaned += 1;
+                        bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
+                        self.store.mark_project_cleaned(&project.path, now)?;
+                    } else {
+                        errors_count += 1;
+                        let detail = if result.stderr_excerpt.is_empty() {
+                            format!("cargo clean exited {}", result.exit_code)
+                        } else {
+                            format!(
+                                "cargo clean exited {}: {}",
+                                result.exit_code, result.stderr_excerpt
+                            )
+                        };
+                        self.store.record_error(&ErrorRecord {
+                            id: 0,
+                            ts: now,
+                            category: "clean".to_string(),
+                            path: Some(project.path.clone()),
+                            message: detail,
+                        })?;
+                    }
                 }
                 Err(err) => {
                     errors_count += 1;
