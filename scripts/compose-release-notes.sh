@@ -13,7 +13,8 @@ esac
 
 version=${tag#v}
 if ! printf '%s\n' "$version" |
-  awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { valid=1 } END { exit !valid }'
+  awk 'NR == 1 && /^[0-9]+\.[0-9]+\.[0-9]+$/ { valid=1 }
+       END { exit !(valid && NR == 1) }'
 then
   echo "tag must be vX.Y.Z" >&2
   exit 2
