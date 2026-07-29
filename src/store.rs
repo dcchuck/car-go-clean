@@ -1167,7 +1167,7 @@ impl Store {
                 SELECT id, created_at, policy_hash, boot_session_id
                 FROM discovery_generations
                 WHERE policy_hash = ?1
-                ORDER BY created_at DESC, id DESC
+                ORDER BY id DESC
                 LIMIT 1
                 ",
                 [policy_hash],

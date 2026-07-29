@@ -1921,6 +1921,49 @@ fn discovery_generation_new_snapshot_revokes_removed_projects_and_separates_poli
 }
 
 #[test]
+fn discovery_generation_clock_regression_still_selects_latest_inserted_generation() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let later_wall_time = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+    let earlier_wall_time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let first = store
+        .reconcile_generation(
+            later_wall_time,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/removed",
+                        1,
+                        2,
+                        Some((1, 3)),
+                        later_wall_time,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
+    let second = store
+        .reconcile_generation(
+            earlier_wall_time,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin("/workspace", vec![])],
+            },
+        )
+        .unwrap();
+
+    assert!(second.id > first.id);
+    assert_eq!(
+        store.current_generation("policy-a").unwrap(),
+        Some(second.clone())
+    );
+    assert!(store.authorized_observations(second.id).unwrap().is_empty());
+}
+
+#[test]
 fn discovery_generation_reconciliation_rolls_back_generation_and_history_on_failure() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
