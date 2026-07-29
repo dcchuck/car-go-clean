@@ -1771,7 +1771,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
 }
 
 #[test]
-fn version_nine_observations_inherit_their_generation_boot_scope() {
+fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("v9.db");
     let connection = rusqlite::Connection::open(&database).unwrap();
@@ -1833,10 +1833,62 @@ fn version_nine_observations_inherit_their_generation_boot_scope() {
     let store = Store::open(&database).unwrap();
     store.migrate().unwrap();
 
-    let observations = store.authorized_observations(1).unwrap();
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].boot_session_id.as_deref(), Some("boot-a"));
+    assert!(store.authorized_observations(1).unwrap().is_empty());
+    assert_eq!(store.current_generation("policy-a").unwrap(), None);
+
     let inspection = rusqlite::Connection::open(database).unwrap();
+    let preserved_generation = inspection
+        .query_row(
+            "
+            SELECT policy_hash, boot_session_id
+            FROM discovery_generations
+            WHERE id = 1
+            ",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        preserved_generation,
+        ("policy-a".to_string(), Some("boot-a".to_string()))
+    );
+    let preserved_observation = inspection
+        .query_row(
+            "
+            SELECT
+                project_device, project_inode, target_device, target_inode,
+                authorized, blocked_reason, boot_session_id
+            FROM project_observations
+            WHERE generation_id = 1
+              AND origin_id = 1
+              AND project_path = '/workspace/project'
+            ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        preserved_observation,
+        (
+            7,
+            11,
+            Some(7),
+            Some(12),
+            false,
+            Some("migration requires fresh discovery".to_string()),
+            None,
+        )
+    );
     let schema_version = inspection
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, i64>(0)

@@ -479,7 +479,9 @@ impl Store {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at INTEGER NOT NULL,
                     policy_hash TEXT NOT NULL,
-                    boot_session_id TEXT
+                    boot_session_id TEXT,
+                    authority_valid INTEGER NOT NULL DEFAULT 1
+                        CHECK(authority_valid IN (0, 1))
                 );
                 CREATE INDEX IF NOT EXISTS idx_discovery_generations_policy_created
                     ON discovery_generations(policy_hash, created_at DESC);
@@ -531,8 +533,27 @@ impl Store {
             tx.execute("INSERT INTO schema_version(version) VALUES (9)", [])?;
             tx.commit()?;
         }
-        if current < 10 {
+        let has_generation_authority_valid = {
+            let mut statement = self
+                .conn
+                .prepare("PRAGMA table_info(discovery_generations)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            collect_rows(columns)?
+                .into_iter()
+                .any(|column| column == "authority_valid")
+        };
+        if current < 10 || !has_generation_authority_valid {
             let tx = self.conn.unchecked_transaction()?;
+            if !has_generation_authority_valid {
+                tx.execute(
+                    "
+                    ALTER TABLE discovery_generations
+                    ADD COLUMN authority_valid INTEGER NOT NULL DEFAULT 1
+                        CHECK(authority_valid IN (0, 1))
+                    ",
+                    [],
+                )?;
+            }
             let has_boot_session_id = {
                 let mut statement = tx.prepare("PRAGMA table_info(project_observations)")?;
                 let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -549,17 +570,22 @@ impl Store {
             tx.execute(
                 "
                 UPDATE project_observations
-                SET boot_session_id = (
-                    SELECT boot_session_id
-                    FROM discovery_generations
-                    WHERE discovery_generations.id =
-                        project_observations.generation_id
-                )
-                WHERE boot_session_id IS NULL
+                SET boot_session_id = NULL,
+                    blocked_reason = CASE
+                        WHEN authorized = 1 THEN COALESCE(
+                            blocked_reason,
+                            'migration requires fresh discovery'
+                        )
+                        ELSE blocked_reason
+                    END,
+                    authorized = 0
                 ",
                 [],
             )?;
-            tx.execute("INSERT INTO schema_version(version) VALUES (10)", [])?;
+            tx.execute("UPDATE discovery_generations SET authority_valid = 0", [])?;
+            if current < 10 {
+                tx.execute("INSERT INTO schema_version(version) VALUES (10)", [])?;
+            }
             tx.commit()?;
         }
         Ok(())
@@ -1097,8 +1123,10 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "
-            INSERT INTO discovery_generations (created_at, policy_hash, boot_session_id)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO discovery_generations (
+                created_at, policy_hash, boot_session_id, authority_valid
+            )
+            VALUES (?1, ?2, ?3, 1)
             ",
             params![
                 created_at_epoch,
@@ -1200,9 +1228,14 @@ impl Store {
                 "
                 SELECT id, created_at, policy_hash, boot_session_id
                 FROM discovery_generations
-                WHERE policy_hash = ?1
-                ORDER BY id DESC
-                LIMIT 1
+                WHERE authority_valid = 1
+                  AND id = (
+                      SELECT id
+                      FROM discovery_generations
+                      WHERE policy_hash = ?1
+                      ORDER BY id DESC
+                      LIMIT 1
+                  )
                 ",
                 [policy_hash],
                 |row| {

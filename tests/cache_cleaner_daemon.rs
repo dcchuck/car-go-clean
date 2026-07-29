@@ -66,6 +66,42 @@ fn bind_test_authority(scanner: Scanner, options: &ScannerOptions) -> Scanner {
     scanner.with_authority(policy, Arc::new(SystemIdentityProvider))
 }
 
+fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let mut rows = statement.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        if row.get::<_, String>(1).unwrap() == column {
+            return true;
+        }
+    }
+    false
+}
+
+fn downgrade_runtime_database_to_version_nine(database: &Path) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    if sqlite_column_exists(&connection, "project_observations", "boot_session_id") {
+        connection
+            .execute(
+                "ALTER TABLE project_observations DROP COLUMN boot_session_id",
+                [],
+            )
+            .unwrap();
+    }
+    if sqlite_column_exists(&connection, "discovery_generations", "authority_valid") {
+        connection
+            .execute(
+                "ALTER TABLE discovery_generations DROP COLUMN authority_valid",
+                [],
+            )
+            .unwrap();
+    }
+    connection
+        .execute("DELETE FROM schema_version WHERE version >= 10", [])
+        .unwrap();
+}
+
 #[test]
 fn cache_verify_and_sync_remove_dead_projects() {
     let db_dir = tempfile::tempdir().unwrap();
@@ -2291,6 +2327,133 @@ fn cross_boot_reverification_scopes_identity_to_new_boot_for_later_cycles() {
     assert_eq!(second_boot_b.skipped, 1);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn migrated_v9_cross_boot_refresh_requires_fresh_discovery_before_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+    let options = ScannerOptions {
+        roots: cfg.scan_dirs.clone(),
+        project_dirs: cfg.project_dirs.clone(),
+        excludes: cfg.effective_excludes(),
+    };
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let database = db_dir.path().join("state.db");
+    {
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+        let refresh_runner = FakeRunner {
+            delete_target: true,
+            ..FakeRunner::default()
+        };
+        let daemon = Daemon::new(
+            &store,
+            Cache::new(&store),
+            authoritative_scanner(options.clone()).with_authority(policy.clone(), identity.clone()),
+            Cleaner::new("cargo", refresh_runner.clone(), Duration::from_secs(60)),
+            DaemonOptions {
+                target_quiet_period: Duration::ZERO,
+                ..DaemonOptions::default()
+            },
+        );
+        daemon.scan_cycle().unwrap();
+        identity.switch_boot();
+        let refreshed = daemon
+            .run_cycle_with_safety(
+                SafetyOptions {
+                    target_quiet_period: Duration::ZERO,
+                    include_managed_cache: false,
+                    include_active: false,
+                    force: true,
+                },
+                &NoopProcessInspector,
+            )
+            .unwrap();
+        assert_eq!(refreshed.cleaned, 1);
+        assert_eq!(refresh_runner.calls.lock().unwrap().len(), 1);
+        assert!(store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap() >= 2048);
+    }
+
+    write_file(&project.join("target/rebuilt.bin"), &[0; 2048]);
+    downgrade_runtime_database_to_version_nine(&database);
+    identity.replace_target_in_same_boot();
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    assert!(store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap() >= 2048);
+    assert_eq!(store.current_generation(policy.hash()).unwrap(), None);
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(options).with_authority(policy.clone(), identity),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let blocked = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert!(blocked.coverage_incomplete);
+    assert_eq!(blocked.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/rebuilt.bin").exists());
+
+    let fresh = daemon.scan_cycle().unwrap();
+    let generation = store.current_generation(policy.hash()).unwrap().unwrap();
+    assert_eq!(generation.id, fresh.generation);
+    let observations = store.authorized_observations(generation.id).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].boot_session_id.as_deref(), Some("boot-b"));
+
+    let allowed = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+    assert_eq!(allowed.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert!(!project.join("target").exists());
 }
 
 #[test]
