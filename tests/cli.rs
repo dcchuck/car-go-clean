@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use car_go_clean::config::load;
 use car_go_clean::store::Store;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -74,8 +75,9 @@ fn run_no_scan_prunes_physically_excluded_cached_alias_before_review() {
     fs::write(
         &config,
         format!(
-            "scan_dirs = []\nexcludes = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
-            library.display()
+            "scan_dirs = [\"{}\"]\nexcludes = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().display(),
+            library.display(),
         ),
     )
     .unwrap();
@@ -115,6 +117,35 @@ fn run_no_scan_prunes_physically_excluded_cached_alias_before_review() {
     let store = Store::open(state.join("state.db")).unwrap();
     store.migrate().unwrap();
     assert!(store.all_projects().unwrap().is_empty());
+}
+
+#[test]
+fn config_command_keeps_warning_off_round_trippable_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.toml");
+    let round_trip = dir.path().join("round-trip.toml");
+    fs::write(
+        &input,
+        format!(
+            "scan_dirs = [\"{}\"]\nexcludes = [\"vendor\"]\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "--config"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deprecated"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("override_excludes"));
+    assert!(!stdout.lines().any(|line| line.starts_with("excludes =")));
+    fs::write(&round_trip, stdout).unwrap();
+    assert!(load(&round_trip).unwrap().warnings().is_empty());
 }
 
 #[test]
@@ -1049,8 +1080,17 @@ fn cli_blocks_v4_primary_alias_associations_after_fresh_canonical_failure() {
                 .unwrap();
         }
 
+        let scan_root = work.path().join("scope");
+        fs::create_dir_all(&scan_root).unwrap();
         let config = work.path().join("config.toml");
-        fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+        fs::write(
+            &config,
+            format!(
+                "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+                scan_root.display()
+            ),
+        )
+        .unwrap();
         let bin_dir = work.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let marker = work.path().join("cargo-ran");
@@ -1662,8 +1702,17 @@ fn cli_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
         )
         .unwrap();
         fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let scan_root = work_path.join("scope");
+        fs::create_dir_all(&scan_root).unwrap();
         let config = work_path.join("config.toml");
-        fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+        fs::write(
+            &config,
+            format!(
+                "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+                scan_root.display()
+            ),
+        )
+        .unwrap();
         let mut path = bin_dir.into_os_string();
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
@@ -1765,8 +1814,17 @@ fn cli_reused_v4_untrusted_primary_does_not_release_historical_child() {
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let scan_root = work_path.join("scope");
+    fs::create_dir_all(&scan_root).unwrap();
     let config = work_path.join("config.toml");
-    fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            scan_root.display()
+        ),
+    )
+    .unwrap();
     let mut path = bin_dir.into_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
@@ -1868,8 +1926,17 @@ fn cli_successful_discovery_resolves_only_its_effective_scan_error() {
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let scan_root = work_path.join("scope");
+    fs::create_dir_all(&scan_root).unwrap();
     let config = work_path.join("config.toml");
-    fs::write(&config, "scan_dirs = []\ntarget_quiet_period = \"1ms\"\n").unwrap();
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            scan_root.display()
+        ),
+    )
+    .unwrap();
     let mut path = bin_dir.into_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());

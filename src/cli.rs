@@ -1,7 +1,7 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
-use crate::config::{default_path, load, paths, Config, PathSet};
+use crate::config::{default_path, load, paths, Config, ConfigWarning, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
@@ -294,7 +294,7 @@ fn execute(cli: Cli) -> Result<()> {
         } => health(config, state_dir, skip_cargo),
         Commands::Config { config } => {
             let cfg = load_config(config)?;
-            print!("{}", toml::to_string_pretty(&cfg)?);
+            print!("{}", cfg.to_toml()?);
             Ok(())
         }
         Commands::Status {
@@ -432,6 +432,9 @@ fn health(
     let since = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let errors = store.errors_since(since)?;
     println!("OK");
+    if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
+        println!("WARN: legacy `excludes` is deprecated; run `car-go-clean config migrate`");
+    }
     if !errors.is_empty() {
         println!("WARN: {} errors in last 24h", errors.len());
     }
@@ -871,6 +874,11 @@ fn load_config(config_path: Option<PathBuf>) -> Result<Config> {
     let path = config_path.unwrap_or_else(default_path);
     let cfg = load(path)?;
     cfg.validate()?;
+    if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
+        eprintln!(
+            "warning: `excludes` is deprecated in v0.4; run `car-go-clean config migrate` to rename it to `override_excludes` before v0.5"
+        );
+    }
     Ok(cfg)
 }
 
@@ -936,7 +944,7 @@ fn scanner_for(cfg: &Config) -> Scanner {
     Scanner::new(ScannerOptions {
         roots: cfg.scan_dirs.clone(),
         project_dirs: cfg.project_dirs.clone(),
-        excludes: cfg.excludes.clone(),
+        excludes: cfg.effective_excludes(),
     })
 }
 

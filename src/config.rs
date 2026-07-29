@@ -6,22 +6,50 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWarning {
+    LegacyExcludes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    #[serde(default)]
     pub scan_dirs: Vec<PathBuf>,
-    #[serde(default)]
     pub project_dirs: Vec<PathBuf>,
-    #[serde(default = "default_excludes")]
-    pub excludes: Vec<String>,
-    #[serde(default = "default_clean_interval", with = "humantime_serde")]
     pub clean_interval: Duration,
-    #[serde(default = "default_scan_interval", with = "humantime_serde")]
     pub scan_interval: Duration,
-    #[serde(default = "default_target_quiet_period", with = "humantime_serde")]
     pub target_quiet_period: Duration,
-    #[serde(default = "default_log_level")]
     pub log_level: String,
+    editable_default_excludes: Vec<String>,
+    extra_excludes: Vec<String>,
+    override_excludes: Option<Vec<String>>,
+    warnings: Vec<ConfigWarning>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawConfig {
+    scan_dirs: Option<Vec<PathBuf>>,
+    project_dirs: Option<Vec<PathBuf>>,
+    extra_excludes: Option<Vec<String>>,
+    override_excludes: Option<Vec<String>>,
+    excludes: Option<Vec<String>>,
+    clean_interval: Option<String>,
+    scan_interval: Option<String>,
+    target_quiet_period: Option<String>,
+    log_level: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ConfigOutput<'a> {
+    scan_dirs: &'a [PathBuf],
+    project_dirs: &'a [PathBuf],
+    extra_excludes: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    override_excludes: Option<&'a [String]>,
+    clean_interval: String,
+    scan_interval: String,
+    target_quiet_period: String,
+    log_level: &'a str,
 }
 
 impl Default for Config {
@@ -35,16 +63,46 @@ impl Default for Config {
         Self {
             scan_dirs,
             project_dirs: Vec::new(),
-            excludes: default_excludes(),
             clean_interval: default_clean_interval(),
             scan_interval: default_scan_interval(),
             target_quiet_period: default_target_quiet_period(),
             log_level: default_log_level(),
+            editable_default_excludes: default_excludes(),
+            extra_excludes: Vec::new(),
+            override_excludes: None,
+            warnings: Vec::new(),
         }
     }
 }
 
 impl Config {
+    pub fn effective_excludes(&self) -> Vec<String> {
+        let mut values = self
+            .override_excludes
+            .clone()
+            .unwrap_or_else(|| self.editable_default_excludes.clone());
+        values.extend(self.extra_excludes.iter().cloned());
+        values
+    }
+
+    pub fn warnings(&self) -> &[ConfigWarning] {
+        &self.warnings
+    }
+
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(&ConfigOutput {
+            scan_dirs: &self.scan_dirs,
+            project_dirs: &self.project_dirs,
+            extra_excludes: &self.extra_excludes,
+            override_excludes: self.override_excludes.as_deref(),
+            clean_interval: humantime::format_duration(self.clean_interval).to_string(),
+            scan_interval: humantime::format_duration(self.scan_interval).to_string(),
+            target_quiet_period: humantime::format_duration(self.target_quiet_period).to_string(),
+            log_level: &self.log_level,
+        })
+        .context("serialize effective configuration")
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.clean_interval.is_zero() {
             return Err(anyhow!("clean_interval must be positive"));
@@ -56,11 +114,17 @@ impl Config {
             return Err(anyhow!("target_quiet_period must be positive"));
         }
         match self.log_level.as_str() {
-            "debug" | "info" | "warn" | "error" => Ok(()),
+            "debug" | "info" | "warn" | "error" => {}
             other => Err(anyhow!(
                 "log_level {other:?}: must be one of debug, info, warn, error"
-            )),
+            ))?,
         }
+        if self.scan_dirs.is_empty() && self.project_dirs.is_empty() {
+            return Err(anyhow!("scan_dirs and project_dirs cannot both be empty"));
+        }
+        require_absolute(&self.scan_dirs, "scan_dirs")?;
+        require_absolute(&self.project_dirs, "project_dirs")?;
+        Ok(())
     }
 }
 
@@ -96,33 +160,112 @@ pub fn paths() -> PathSet {
 pub fn load(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
     if !path.exists() {
-        return Ok(Config::default());
+        let cfg = Config::default();
+        cfg.validate()?;
+        return Ok(cfg);
     }
     let body = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut cfg: Config =
+    let raw: RawConfig =
         toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    cfg.scan_dirs = expand_all(cfg.scan_dirs);
-    cfg.project_dirs = expand_all(cfg.project_dirs);
+    apply_overlay(raw).with_context(|| format!("validate {}", path.display()))
+}
+
+fn apply_overlay(raw: RawConfig) -> Result<Config> {
+    if raw.excludes.is_some() && raw.override_excludes.is_some() {
+        return Err(anyhow!("excludes and override_excludes cannot both be set"));
+    }
+
+    let legacy = raw.excludes.is_some();
+    let override_field = if legacy {
+        "excludes"
+    } else {
+        "override_excludes"
+    };
+    let override_excludes = raw.override_excludes.or(raw.excludes);
+    let mut cfg = Config::default();
+
+    if let Some(paths) = raw.scan_dirs {
+        cfg.scan_dirs = expand_paths(paths, "scan_dirs")?;
+    }
+    if let Some(paths) = raw.project_dirs {
+        cfg.project_dirs = expand_paths(paths, "project_dirs")?;
+    }
+    if let Some(values) = raw.extra_excludes {
+        cfg.extra_excludes = expand_excludes(values, "extra_excludes")?;
+    }
+    if let Some(values) = override_excludes {
+        cfg.override_excludes = Some(expand_excludes(values, override_field)?);
+    }
+    if let Some(value) = raw.clean_interval {
+        cfg.clean_interval = parse_duration(&value, "clean_interval")?;
+    }
+    if let Some(value) = raw.scan_interval {
+        cfg.scan_interval = parse_duration(&value, "scan_interval")?;
+    }
+    if let Some(value) = raw.target_quiet_period {
+        cfg.target_quiet_period = parse_duration(&value, "target_quiet_period")?;
+    }
+    if let Some(value) = raw.log_level {
+        cfg.log_level = value;
+    }
+    if legacy {
+        cfg.warnings.push(ConfigWarning::LegacyExcludes);
+    }
+
+    cfg.validate()?;
     Ok(cfg)
 }
 
-fn expand_all(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    paths.into_iter().map(expand_path).collect()
+fn parse_duration(value: &str, field: &str) -> Result<Duration> {
+    humantime::parse_duration(value).with_context(|| format!("{field}: invalid duration {value:?}"))
 }
 
-fn expand_path(path: PathBuf) -> PathBuf {
+fn expand_paths(paths: Vec<PathBuf>, field: &str) -> Result<Vec<PathBuf>> {
+    paths
+        .into_iter()
+        .map(|path| expand_path(path, field))
+        .collect()
+}
+
+fn expand_excludes(values: Vec<String>, field: &str) -> Result<Vec<String>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let started_absolute = Path::new(&value).is_absolute();
+            let expanded = expand_path(PathBuf::from(value), field)?;
+            if started_absolute && !expanded.is_absolute() {
+                return Err(anyhow!(
+                    "{field} absolute entry {} became relative",
+                    expanded.display()
+                ));
+            }
+            Ok(expanded.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn require_absolute(paths: &[PathBuf], field: &str) -> Result<()> {
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(anyhow!("{field} entry {} must be absolute", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn expand_path(path: PathBuf, field: &str) -> Result<PathBuf> {
     let raw = path.to_string_lossy();
-    let expanded_env = expand_env_vars(&raw);
+    let expanded_env = expand_env_vars(&raw, field)?;
     if expanded_env == "~" {
-        return current_home_dir();
+        return Ok(current_home_dir());
     }
     if let Some(rest) = expanded_env.strip_prefix("~/") {
-        return current_home_dir().join(rest);
+        return Ok(current_home_dir().join(rest));
     }
-    PathBuf::from(expanded_env)
+    Ok(PathBuf::from(expanded_env))
 }
 
-fn expand_env_vars(input: &str) -> String {
+fn expand_env_vars(input: &str, field: &str) -> Result<String> {
     let mut out = String::new();
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -133,13 +276,22 @@ fn expand_env_vars(input: &str) -> String {
         if chars.peek() == Some(&'{') {
             chars.next();
             let mut name = String::new();
-            for c in chars.by_ref() {
-                if c == '}' {
-                    break;
+            loop {
+                match chars.next() {
+                    Some('}') => break,
+                    Some(c) => name.push(c),
+                    None => return Err(anyhow!("{field}: unterminated environment variable")),
                 }
-                name.push(c);
             }
-            out.push_str(&env::var(name).unwrap_or_default());
+            if name.is_empty() {
+                return Err(anyhow!(
+                    "{field}: environment variable name cannot be empty"
+                ));
+            }
+            let value = env::var(&name).with_context(|| {
+                format!("{field}: environment variable {name} is not set or not Unicode")
+            })?;
+            out.push_str(&value);
             continue;
         }
         let mut name = String::new();
@@ -154,10 +306,13 @@ fn expand_env_vars(input: &str) -> String {
         if name.is_empty() {
             out.push('$');
         } else {
-            out.push_str(&env::var(name).unwrap_or_default());
+            let value = env::var(&name).with_context(|| {
+                format!("{field}: environment variable {name} is not set or not Unicode")
+            })?;
+            out.push_str(&value);
         }
     }
-    out
+    Ok(out)
 }
 
 fn default_clean_interval() -> Duration {
