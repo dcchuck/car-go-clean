@@ -896,6 +896,10 @@ fn decision_label(decision: &CleanDecision) -> &'static str {
             SkipReason::ContainerStorage => "skipped:container_storage",
             SkipReason::ScanError => "skipped:scan_error",
             SkipReason::TargetReadError => "skipped:target_read_error",
+            SkipReason::InvalidManifest => "skipped:invalid_manifest",
+            SkipReason::ProjectIdentityUnavailable => "skipped:project_identity_unavailable",
+            SkipReason::TargetIdentityUnavailable => "skipped:target_identity_unavailable",
+            SkipReason::CrossDeviceTarget => "skipped:cross_device_target",
         },
     }
 }

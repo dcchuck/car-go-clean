@@ -1,9 +1,11 @@
 use crate::activity::{path_is_within, ActivitySignal};
+use crate::identity::{IdentityProvider, SystemIdentityProvider};
 use crate::storage::{classify_protected_path_for, current_home_dir, HostPlatform, ProtectedKind};
 
 use anyhow::Result;
 use serde::Serialize;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -32,6 +34,10 @@ pub enum SkipReason {
     ContainerStorage,
     ScanError,
     TargetReadError,
+    InvalidManifest,
+    ProjectIdentityUnavailable,
+    TargetIdentityUnavailable,
+    CrossDeviceTarget,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,8 +101,12 @@ pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
                     SkipReason::ActiveProcess => summary.active_process += 1,
                     SkipReason::ManagedCache => summary.managed_cache += 1,
                     SkipReason::ContainerStorage => summary.container_storage += 1,
-                    SkipReason::ScanError => summary.scan_error += 1,
-                    SkipReason::TargetReadError => summary.target_read_error += 1,
+                    SkipReason::ScanError
+                    | SkipReason::InvalidManifest
+                    | SkipReason::ProjectIdentityUnavailable => summary.scan_error += 1,
+                    SkipReason::TargetReadError
+                    | SkipReason::TargetIdentityUnavailable
+                    | SkipReason::CrossDeviceTarget => summary.target_read_error += 1,
                 }
             }
         }
@@ -149,16 +159,102 @@ pub fn review_project_with_discovery_blocks(
     now: SystemTime,
     opts: &SafetyOptions,
 ) -> Result<ProjectReview> {
+    review_project_with_identity_provider(
+        project,
+        scan_error_paths,
+        discovery_blocked_paths,
+        activity,
+        now,
+        opts,
+        &SystemIdentityProvider,
+    )
+}
+
+#[doc(hidden)]
+pub fn review_project_with_identity_provider(
+    project: &Path,
+    scan_error_paths: &[PathBuf],
+    discovery_blocked_paths: &[PathBuf],
+    activity: &[ActivitySignal],
+    now: SystemTime,
+    opts: &SafetyOptions,
+    identity_provider: &dyn IdentityProvider,
+) -> Result<ProjectReview> {
     let class = classify_project(project);
     let target_path = project.join("target");
 
-    if !is_direct_directory(&target_path) {
+    if !is_direct_regular_file(&project.join("Cargo.toml")) {
         return Ok(review(
             project,
             class,
             target_path,
             0,
-            CleanDecision::Skipped(SkipReason::NoTarget),
+            CleanDecision::Skipped(SkipReason::InvalidManifest),
+        ));
+    }
+
+    if !is_direct_directory(project) {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            0,
+            CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable),
+        ));
+    }
+    let project_identity = match identity_provider.identity(project) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Ok(review(
+                project,
+                class,
+                target_path,
+                0,
+                CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable),
+            ));
+        }
+    };
+
+    match fs::symlink_metadata(&target_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(review(
+                project,
+                class,
+                target_path,
+                0,
+                CleanDecision::Skipped(SkipReason::NoTarget),
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) | Err(_) => {
+            return Ok(review(
+                project,
+                class,
+                target_path,
+                0,
+                CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable),
+            ));
+        }
+    }
+    let target_identity = match identity_provider.identity(&target_path) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Ok(review(
+                project,
+                class,
+                target_path,
+                0,
+                CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable),
+            ));
+        }
+    };
+    if project_identity.device != target_identity.device {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            0,
+            CleanDecision::Skipped(SkipReason::CrossDeviceTarget),
         ));
     }
 
@@ -282,6 +378,12 @@ fn contains_sequence(parts: &[String], needle: &[&str]) -> bool {
 fn is_direct_directory(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn is_direct_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false)
 }
 

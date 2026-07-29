@@ -552,7 +552,7 @@ fn missing_direct_target_is_skipped_even_with_force() {
 
 #[cfg(unix)]
 #[test]
-fn symlinked_target_is_skipped_as_missing_target() {
+fn symlinked_target_has_unavailable_identity() {
     use std::os::unix::fs::symlink;
 
     let project = tempfile::tempdir().unwrap();
@@ -567,7 +567,53 @@ fn symlinked_target_is_skipped_as_missing_target() {
 
     assert_eq!(
         review.decision,
-        CleanDecision::Skipped(SkipReason::NoTarget)
+        CleanDecision::Skipped(SkipReason::TargetIdentityUnavailable)
+    );
+}
+
+#[test]
+fn missing_manifest_is_invalid_even_when_target_is_direct() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+
+    let review = review_project(project.path(), &[], &[], SystemTime::now(), &options()).unwrap();
+
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::InvalidManifest)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_manifest_is_invalid_even_when_it_resolves_to_a_file() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let manifest = project.path().join("real-manifest.toml");
+    write_file(&manifest, b"[package]\n");
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+    symlink(&manifest, project.path().join("Cargo.toml")).unwrap();
+
+    let review = review_project(project.path(), &[], &[], SystemTime::now(), &options()).unwrap();
+
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::InvalidManifest)
+    );
+}
+
+#[test]
+fn manifest_directory_is_invalid() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("Cargo.toml")).unwrap();
+    write_file(&project.path().join("target/debug/blob.bin"), &[0; 4096]);
+
+    let review = review_project(project.path(), &[], &[], SystemTime::now(), &options()).unwrap();
+
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::InvalidManifest)
     );
 }
 
@@ -704,7 +750,7 @@ fn force_bypasses_exact_discovery_failure_block() {
 
 #[cfg(unix)]
 #[test]
-fn canonical_discovery_block_matches_a_legacy_symlink_project_alias() {
+fn symlink_project_identity_is_unavailable_before_discovery_checks() {
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().unwrap();
@@ -727,7 +773,7 @@ fn canonical_discovery_block_matches_a_legacy_symlink_project_alias() {
 
     assert_eq!(
         review.decision,
-        CleanDecision::Skipped(SkipReason::ScanError)
+        CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable)
     );
 }
 
@@ -771,6 +817,7 @@ fn review_summary_counts_cleanable_and_skip_reasons() {
     let cleanable = review_project(project.path(), &[], &[], old, &options()).unwrap();
 
     let missing = tempfile::tempdir().unwrap();
+    write_file(&missing.path().join("Cargo.toml"), b"[package]\n");
     let skipped = review_project(missing.path(), &[], &[], old, &options()).unwrap();
 
     let summary = review_summary(&[cleanable, skipped]);
