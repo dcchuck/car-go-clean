@@ -720,6 +720,57 @@ fn run_no_scan_uses_only_cached_state() {
     assert!(store.all_projects().unwrap().is_empty());
 }
 
+#[test]
+fn dry_run_no_scan_rejects_target_replaced_after_matching_generation() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("tree");
+    let project = root.join("proj");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/original.bin"), vec![0; 4096]).unwrap();
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    fs::rename(project.join("target"), project.join("target-observed")).unwrap();
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("target/replacement.bin"), vec![0; 4096]).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--dry-run",
+            "--no-scan",
+            "--force",
+            "--all",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .code(0)
+        .stdout(contains("Total projects: 1"))
+        .stdout(contains("Cleanable projects: 0"));
+}
+
 #[cfg(unix)]
 #[test]
 fn run_scans_fresh_state_before_real_cleanup() {

@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -12,8 +13,11 @@ use car_go_clean::activity::{
 };
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
+use car_go_clean::config;
 use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::identity::{BootSessionId, FilesystemIdentity, IdentityProvider};
 use car_go_clean::logging::{Logger, LoggerOptions};
+use car_go_clean::policy::{Environment, ScopePolicy};
 use car_go_clean::safety::SafetyOptions;
 use car_go_clean::scanner::{
     GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, SystemGitWorktreeResolver,
@@ -1018,6 +1022,79 @@ struct ArgumentsProcessInspector {
     cwd: Option<PathBuf>,
 }
 
+struct MutatingProcessInspector {
+    calls: AtomicUsize,
+    mutate_on_call: usize,
+    mutation: Box<dyn Fn() + Send + Sync>,
+}
+
+struct ActiveOnSecondInspector {
+    calls: AtomicUsize,
+    project: PathBuf,
+}
+
+struct SwitchableIdentityProvider {
+    phase: AtomicUsize,
+    cross_device: AtomicUsize,
+}
+
+impl SwitchableIdentityProvider {
+    fn switch_boot(&self) {
+        self.phase.store(1, Ordering::SeqCst);
+    }
+
+    fn move_target_to_other_device(&self) {
+        self.cross_device.store(1, Ordering::SeqCst);
+    }
+}
+
+impl IdentityProvider for SwitchableIdentityProvider {
+    fn boot_session(&self) -> anyhow::Result<Option<BootSessionId>> {
+        let boot = if self.phase.load(Ordering::SeqCst) == 0 {
+            "boot-a"
+        } else {
+            "boot-b"
+        };
+        Ok(Some(BootSessionId(boot.to_string())))
+    }
+
+    fn identity(&self, path: &Path) -> anyhow::Result<FilesystemIdentity> {
+        let phase = self.phase.load(Ordering::SeqCst) as u64;
+        Ok(FilesystemIdentity {
+            device: if path.file_name() == Some(OsStr::new("target"))
+                && self.cross_device.load(Ordering::SeqCst) != 0
+            {
+                8
+            } else {
+                7
+            },
+            inode: if path.file_name() == Some(OsStr::new("target")) {
+                20 + phase
+            } else {
+                10 + phase
+            },
+        })
+    }
+}
+
+struct EmptyEnvironment;
+
+impl Environment for EmptyEnvironment {
+    fn var_os(&self, _name: &str) -> Option<std::ffi::OsString> {
+        None
+    }
+}
+
+impl MutatingProcessInspector {
+    fn on_second_call(mutation: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            mutate_on_call: 2,
+            mutation: Box::new(mutation),
+        }
+    }
+}
+
 impl ProcessInspector for ArgumentsProcessInspector {
     fn active_projects(
         &self,
@@ -1029,6 +1106,36 @@ impl ProcessInspector for ArgumentsProcessInspector {
             &self.arguments,
             projects,
         ))
+    }
+}
+
+impl ProcessInspector for MutatingProcessInspector {
+    fn active_projects(
+        &self,
+        _projects: &[PathBuf],
+    ) -> anyhow::Result<Vec<car_go_clean::activity::ActivitySignal>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.mutate_on_call {
+            (self.mutation)();
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl ProcessInspector for ActiveOnSecondInspector {
+    fn active_projects(
+        &self,
+        _projects: &[PathBuf],
+    ) -> anyhow::Result<Vec<car_go_clean::activity::ActivitySignal>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok((call >= 2)
+            .then(|| car_go_clean::activity::ActivitySignal {
+                pid: 42,
+                project_path: self.project.clone(),
+                reason: "became active after review".to_string(),
+            })
+            .into_iter()
+            .collect())
     }
 }
 
@@ -1590,6 +1697,604 @@ fn daemon_scan_and_run_cycle_record_state() {
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert!(run.bytes_recovered >= 2048);
+}
+
+#[test]
+fn same_generation_target_identity_replacement_is_rejected_before_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    fs::rename(project.join("target"), project.join("target-observed")).unwrap();
+    write_file(&project.join("target/replacement.bin"), &[0; 2048]);
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/replacement.bin").exists());
+}
+
+#[test]
+fn target_identity_replacement_after_review_is_revalidated_before_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let project_for_mutation = project.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        fs::rename(
+            project_for_mutation.join("target"),
+            project_for_mutation.join("target-reviewed"),
+        )
+        .unwrap();
+        write_file(
+            &project_for_mutation.join("target/replacement.bin"),
+            &[0; 2048],
+        );
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(inspector.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/replacement.bin").exists());
+}
+
+#[test]
+fn project_identity_replacement_after_review_is_revalidated_before_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let project_for_mutation = project.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        fs::rename(
+            &project_for_mutation,
+            project_for_mutation.with_extension("reviewed"),
+        )
+        .unwrap();
+        write_file(&project_for_mutation.join("Cargo.toml"), b"[package]\n");
+        write_file(
+            &project_for_mutation.join("target/replacement.bin"),
+            &[0; 2048],
+        );
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(inspector.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/replacement.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn target_symlink_swap_after_review_is_rejected_before_cargo() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    let external_target = root.path().join("external-target");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    write_file(&external_target.join("external.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let project_for_mutation = project.clone();
+    let external_for_mutation = external_target.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        fs::rename(
+            project_for_mutation.join("target"),
+            project_for_mutation.join("target-reviewed"),
+        )
+        .unwrap();
+        symlink(&external_for_mutation, project_for_mutation.join("target")).unwrap();
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(external_target.join("external.bin").exists());
+}
+
+#[test]
+fn cross_device_target_change_after_review_is_rejected_before_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        phase: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let identity_for_mutation = identity.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        identity_for_mutation.move_target_to_other_device();
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn activity_that_appears_after_review_blocks_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let inspector = ActiveOnSecondInspector {
+        calls: AtomicUsize::new(0),
+        project: project.canonicalize().unwrap(),
+    };
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(inspector.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn recent_write_after_review_blocks_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::from_millis(50),
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    thread::sleep(Duration::from_millis(75));
+
+    let project_for_mutation = project.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        write_file(&project_for_mutation.join("target/new-write.bin"), &[0; 16]);
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_millis(50),
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/new-write.bin").exists());
+}
+
+#[test]
+fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        phase: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    identity.switch_boot();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn changed_scope_has_no_matching_generation_and_never_calls_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let old_scope = root.path().join("old-scope");
+    let new_scope = root.path().join("new-scope");
+    let project = old_scope.join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    fs::create_dir_all(&new_scope).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let scan_daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![old_scope],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+    scan_daemon.scan_cycle().unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let narrowed = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![new_scope],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let result = narrowed
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(result.coverage_incomplete);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn removed_explicit_project_has_no_matching_generation_and_never_calls_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("explicit");
+    let retained_root = root.path().join("retained");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    fs::create_dir_all(&retained_root).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let scan_daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![retained_root.clone()],
+            project_dirs: vec![project.clone()],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+    scan_daemon.scan_cycle().unwrap();
+
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let removed = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![retained_root],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let result = removed
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(result.coverage_incomplete);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
 }
 
 #[test]

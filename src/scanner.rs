@@ -282,6 +282,14 @@ impl Scanner {
         &self.policy_hash
     }
 
+    pub(crate) fn policy(&self) -> Option<&ScopePolicy> {
+        self.policy.as_ref()
+    }
+
+    pub(crate) fn identity_provider(&self) -> &dyn IdentityProvider {
+        self.identity_provider.as_ref()
+    }
+
     pub fn scan(&self) -> Result<Vec<PathBuf>> {
         Ok(self.scan_with_errors()?.projects)
     }

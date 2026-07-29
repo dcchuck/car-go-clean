@@ -1,22 +1,24 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
+use crate::identity::BootSessionId;
 use crate::logging::Logger;
 use crate::safety::{
-    review_project_with_discovery_blocks, review_summary, CleanDecision, SafetyOptions,
+    bind_review_to_observation, revalidate_before_clean, review_project_with_identity_provider,
+    review_summary, CleanDecision, ObservationIdentityStatus, SafetyOptions, SkipReason,
 };
 use crate::scanner::{
     DiscoveryOriginKind as ScannerOriginKind, DiscoveryOriginResult, ScanErrorKind, Scanner,
     WorktreeDiscovery,
 };
 use crate::store::{
-    CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
-    ObservationReconciliation, OriginReconciliation, Project, SchedulerStatus, Store,
+    CleanEvent, DiscoveryGeneration, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
+    ObservationReconciliation, OriginReconciliation, ProjectObservation, SchedulerStatus, Store,
 };
 use anyhow::Result;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -210,10 +212,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self.reconcile_cached_state()?;
         let started = SystemTime::now();
         let run_id = self.store.start_run(started)?;
-        let (projects, generation_missing) = self.authorized_projects()?;
-        let project_paths: Vec<PathBuf> = projects
+        let (observations, generation) = self.authorized_observations()?;
+        let generation_missing = generation.is_none();
+        let observed_boot = generation
+            .as_ref()
+            .and_then(|generation| generation.boot_session_id.as_ref())
+            .map(|boot| BootSessionId(boot.clone()));
+        let project_paths: Vec<PathBuf> = observations
             .iter()
-            .map(|project| PathBuf::from(&project.path))
+            .map(|observation| observation.project_path.clone())
             .collect();
         let scan_error_since = started
             .checked_sub(self.opts.scan_interval)
@@ -226,24 +233,69 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let coverage_incomplete =
             generation_missing || scan_coverage_incomplete || !discovery_blocks.is_empty();
         let activity = inspector.active_projects(&project_paths)?;
-        let mut reviews = Vec::with_capacity(projects.len());
+        let mut reviews = Vec::with_capacity(observations.len());
 
         let mut projects_cleaned = 0;
         let mut cleaner_skipped = 0;
         let mut bytes_recovered = 0;
         let mut errors_count = 0;
 
-        for project in &projects {
-            let path = PathBuf::from(&project.path);
-            let review = review_project_with_discovery_blocks(
+        for observation in &observations {
+            let path = observation.project_path.clone();
+            let mut review = review_project_with_identity_provider(
                 &path,
                 &scan_errors,
                 &discovery_blocks,
                 &activity,
                 started,
                 &safety,
+                self.scanner.identity_provider(),
             )?;
-            let should_clean = review.decision == CleanDecision::Cleanable;
+
+            if review.decision == CleanDecision::Cleanable {
+                if let Some(policy) = self.scanner.policy() {
+                    if !policy.contains_project(&path) {
+                        review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
+                    } else if policy.is_excluded(&path) || policy.is_excluded(&review.target_path) {
+                        review.decision = CleanDecision::Skipped(SkipReason::Excluded);
+                    }
+                }
+            }
+
+            let mut reverified_across_boot = false;
+            if review.decision == CleanDecision::Cleanable {
+                reverified_across_boot = bind_review_to_observation(
+                    &mut review,
+                    &observation.project_identity,
+                    observation.target_identity.as_ref(),
+                    observed_boot.as_ref(),
+                ) == ObservationIdentityStatus::ReverifiedAcrossBoot;
+            }
+            if review.decision == CleanDecision::Cleanable {
+                // This is the last validation boundary available before Cleaner
+                // measures the target and spawns Cargo. The filesystem can still
+                // change after this returns, so this narrows but cannot eliminate
+                // the residual TOCTOU window.
+                review.decision = revalidate_before_clean(
+                    &review,
+                    self.scanner.policy(),
+                    self.scanner.identity_provider(),
+                    inspector,
+                    &scan_errors,
+                    &discovery_blocks,
+                    SystemTime::now(),
+                    &safety,
+                )?;
+            }
+            if review.decision == CleanDecision::Cleanable && reverified_across_boot {
+                if let (Some(generation), Some(identity)) =
+                    (generation.as_ref(), review.reviewed_identity.as_ref())
+                {
+                    self.store
+                        .mark_observation_reverified(generation.id, &path, identity)?;
+                }
+            }
+
             if review.decision == CleanDecision::Skipped(crate::safety::SkipReason::TargetReadError)
             {
                 self.store.record_error(&ErrorRecord {
@@ -255,12 +307,13 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         .to_string(),
                 })?;
             }
+            let should_clean = review.decision == CleanDecision::Cleanable;
             reviews.push(review);
             if !should_clean {
                 continue;
             }
 
-            match self.cleaner.clean(&project.path) {
+            match self.cleaner.clean(&path) {
                 Ok(result) if result.skipped => {
                     cleaner_skipped += 1;
                 }
@@ -270,7 +323,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         id: 0,
                         run_id,
                         ts: now,
-                        path: project.path.clone(),
+                        path: path.to_string_lossy().into_owned(),
                         bytes_before: result.bytes_before,
                         bytes_after: result.bytes_after,
                         duration_ms: result.duration.as_millis() as i64,
@@ -284,7 +337,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                                 id: 0,
                                 ts: now,
                                 category: "clean".to_string(),
-                                path: Some(project.path.clone()),
+                                path: path.to_str().map(str::to_owned),
                                 message: measurement_error.clone(),
                             })?;
                             true
@@ -294,7 +347,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     if result.exit_code == 0 && !measurement_failed {
                         projects_cleaned += 1;
                         bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
-                        self.store.mark_project_cleaned(&project.path, now)?;
+                        self.store.mark_project_cleaned(&path, now)?;
                     } else if result.exit_code != 0 {
                         errors_count += 1;
                         let detail = if result.stderr_excerpt.is_empty() {
@@ -309,7 +362,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                             id: 0,
                             ts: now,
                             category: "clean".to_string(),
-                            path: Some(project.path.clone()),
+                            path: path.to_str().map(str::to_owned),
                             message: detail,
                         })?;
                     }
@@ -320,7 +373,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         id: 0,
                         ts: SystemTime::now(),
                         category: "clean".to_string(),
-                        path: Some(project.path.clone()),
+                        path: path.to_str().map(str::to_owned),
                         message: err.to_string(),
                     })?;
                 }
@@ -349,23 +402,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         Ok(result)
     }
 
-    fn authorized_projects(&self) -> Result<(Vec<Project>, bool)> {
+    fn authorized_observations(
+        &self,
+    ) -> Result<(Vec<ProjectObservation>, Option<DiscoveryGeneration>)> {
         let Some(generation) = self.store.current_generation(self.scanner.policy_hash())? else {
-            return Ok((Vec::new(), true));
+            return Ok((Vec::new(), None));
         };
-        let authorized_paths = self
-            .store
-            .authorized_observations(generation.id)?
-            .into_iter()
-            .map(|observation| observation.project_path)
-            .collect::<BTreeSet<_>>();
-        let projects = self
-            .store
-            .all_projects()?
-            .into_iter()
-            .filter(|project| authorized_paths.contains(Path::new(&project.path)))
-            .collect();
-        Ok((projects, false))
+        let observations = self.store.authorized_observations(generation.id)?;
+        Ok((observations, Some(generation)))
     }
 
     fn log_run_cycle(&self, result: &RunCycleResult) {

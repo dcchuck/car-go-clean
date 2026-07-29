@@ -3,14 +3,14 @@ use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
-use crate::identity::SystemIdentityProvider;
+use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
 use crate::logging::Logger;
 use crate::outcome::CommandOutcome;
 use crate::policy::{ProcessEnvironment, ScopePolicy};
 use crate::safety::{
-    review_project_with_discovery_blocks, review_summary, CleanDecision, ProjectClass,
-    ProjectReview, SafetyOptions, SkipReason,
+    bind_review_to_observation, review_project_with_identity_provider, review_summary,
+    CleanDecision, ProjectClass, ProjectReview, SafetyOptions, SkipReason,
 };
 use crate::scanner::{Scanner, ScannerOptions};
 use crate::service::{
@@ -763,22 +763,17 @@ fn project_reviews(
 ) -> Result<ReviewBatch> {
     let now = SystemTime::now();
     let generation = store.current_generation(policy.hash())?;
-    let authorized_paths = match &generation {
-        Some(generation) => store
-            .authorized_observations(generation.id)?
-            .into_iter()
-            .map(|observation| observation.project_path)
-            .collect::<BTreeSet<_>>(),
-        None => BTreeSet::new(),
+    let observations = match &generation {
+        Some(generation) => store.authorized_observations(generation.id)?,
+        None => Vec::new(),
     };
-    let projects = store
-        .all_projects()?
-        .into_iter()
-        .filter(|project| authorized_paths.contains(Path::new(&project.path)))
-        .collect::<Vec<_>>();
-    let paths: Vec<PathBuf> = projects
+    let observed_boot = generation
+        .as_ref()
+        .and_then(|generation| generation.boot_session_id.as_ref())
+        .map(|boot| BootSessionId(boot.clone()));
+    let paths: Vec<PathBuf> = observations
         .iter()
-        .map(|project| PathBuf::from(&project.path))
+        .map(|observation| observation.project_path.clone())
         .collect();
     let scan_error_since = now
         .checked_sub(scan_interval)
@@ -788,17 +783,36 @@ fn project_reviews(
     let discovery_blocks = store.blocked_worktree_discovery_paths()?;
     let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
 
-    let reviews = projects
+    let reviews = observations
         .iter()
-        .map(|project| {
-            review_project_with_discovery_blocks(
-                Path::new(&project.path),
+        .map(|observation| {
+            let mut review = review_project_with_identity_provider(
+                &observation.project_path,
                 &scan_errors,
                 &discovery_blocks,
                 &activity,
                 now,
                 safety,
-            )
+                &SystemIdentityProvider,
+            )?;
+            if review.decision == CleanDecision::Cleanable {
+                if !policy.contains_project(&review.path) {
+                    review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
+                } else if policy.is_excluded(&review.path)
+                    || policy.is_excluded(&review.target_path)
+                {
+                    review.decision = CleanDecision::Skipped(SkipReason::Excluded);
+                }
+            }
+            if review.decision == CleanDecision::Cleanable {
+                bind_review_to_observation(
+                    &mut review,
+                    &observation.project_identity,
+                    observation.target_identity.as_ref(),
+                    observed_boot.as_ref(),
+                );
+            }
+            Ok(review)
         })
         .collect::<Result<Vec<_>>>()?;
     record_review_diagnostics(store, &reviews)?;
@@ -986,6 +1000,10 @@ fn decision_label(decision: &CleanDecision) -> &'static str {
             SkipReason::ProjectIdentityUnavailable => "skipped:project_identity_unavailable",
             SkipReason::TargetIdentityUnavailable => "skipped:target_identity_unavailable",
             SkipReason::CrossDeviceTarget => "skipped:cross_device_target",
+            SkipReason::ProjectIdentityChanged => "skipped:project_identity_changed",
+            SkipReason::TargetIdentityChanged => "skipped:target_identity_changed",
+            SkipReason::OutOfScope => "skipped:out_of_scope",
+            SkipReason::Excluded => "skipped:excluded",
         },
     }
 }

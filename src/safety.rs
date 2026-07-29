@@ -1,5 +1,9 @@
-use crate::activity::{path_is_within, ActivitySignal};
-use crate::identity::{IdentityProvider, ReviewedIdentity, SystemIdentityProvider};
+use crate::activity::{path_is_within, ActivitySignal, ProcessInspector};
+use crate::identity::{
+    compare_persisted, BootSessionId, FilesystemIdentity, IdentityComparison, IdentityProvider,
+    ReviewedIdentity, SystemIdentityProvider,
+};
+use crate::policy::{ProtectedRootKind, ScopePolicy};
 use crate::storage::{classify_protected_path_for, current_home_dir, HostPlatform, ProtectedKind};
 
 use anyhow::Result;
@@ -38,6 +42,10 @@ pub enum SkipReason {
     ProjectIdentityUnavailable,
     TargetIdentityUnavailable,
     CrossDeviceTarget,
+    ProjectIdentityChanged,
+    TargetIdentityChanged,
+    OutOfScope,
+    Excluded,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,10 +112,14 @@ pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
                     SkipReason::ContainerStorage => summary.container_storage += 1,
                     SkipReason::ScanError
                     | SkipReason::InvalidManifest
-                    | SkipReason::ProjectIdentityUnavailable => summary.scan_error += 1,
+                    | SkipReason::ProjectIdentityUnavailable
+                    | SkipReason::ProjectIdentityChanged
+                    | SkipReason::OutOfScope
+                    | SkipReason::Excluded => summary.scan_error += 1,
                     SkipReason::TargetReadError
                     | SkipReason::TargetIdentityUnavailable
-                    | SkipReason::CrossDeviceTarget => summary.target_read_error += 1,
+                    | SkipReason::CrossDeviceTarget
+                    | SkipReason::TargetIdentityChanged => summary.target_read_error += 1,
                 }
             }
         }
@@ -377,6 +389,213 @@ pub fn review_project_with_identity_provider(
         reviewed_identity,
         CleanDecision::Cleanable,
     ))
+}
+
+pub type ExecutionDecision = CleanDecision;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationIdentityStatus {
+    Current,
+    ReverifiedAcrossBoot,
+    Rejected,
+}
+
+pub fn bind_review_to_observation(
+    review: &mut ProjectReview,
+    observed_project: &FilesystemIdentity,
+    observed_target: Option<&FilesystemIdentity>,
+    observed_boot: Option<&BootSessionId>,
+) -> ObservationIdentityStatus {
+    if review.decision != CleanDecision::Cleanable {
+        return ObservationIdentityStatus::Rejected;
+    }
+    let Some(current) = review.reviewed_identity.as_ref() else {
+        review.decision = CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable);
+        return ObservationIdentityStatus::Rejected;
+    };
+
+    let project_comparison = compare_persisted(
+        observed_boot,
+        current.boot_session.as_ref(),
+        observed_project,
+        &current.project,
+    );
+    if project_comparison == IdentityComparison::Replaced {
+        review.decision = CleanDecision::Skipped(SkipReason::ProjectIdentityChanged);
+        return ObservationIdentityStatus::Rejected;
+    }
+
+    let target_comparison = match observed_target {
+        Some(observed_target) => compare_persisted(
+            observed_boot,
+            current.boot_session.as_ref(),
+            observed_target,
+            &current.target,
+        ),
+        None if project_comparison == IdentityComparison::StaleAcrossBoot => {
+            IdentityComparison::StaleAcrossBoot
+        }
+        None => IdentityComparison::Replaced,
+    };
+    if target_comparison == IdentityComparison::Replaced {
+        review.decision = CleanDecision::Skipped(SkipReason::TargetIdentityChanged);
+        return ObservationIdentityStatus::Rejected;
+    }
+
+    if project_comparison == IdentityComparison::StaleAcrossBoot
+        || target_comparison == IdentityComparison::StaleAcrossBoot
+    {
+        ObservationIdentityStatus::ReverifiedAcrossBoot
+    } else {
+        ObservationIdentityStatus::Current
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn revalidate_before_clean(
+    review: &ProjectReview,
+    policy: Option<&ScopePolicy>,
+    identity_provider: &dyn IdentityProvider,
+    activity: &dyn ProcessInspector,
+    scan_error_paths: &[PathBuf],
+    discovery_blocked_paths: &[PathBuf],
+    now: SystemTime,
+    opts: &SafetyOptions,
+) -> Result<ExecutionDecision> {
+    if review.decision != CleanDecision::Cleanable {
+        return Ok(review.decision.clone());
+    }
+    let Some(reviewed_identity) = review.reviewed_identity.as_ref() else {
+        return Ok(CleanDecision::Skipped(
+            SkipReason::ProjectIdentityUnavailable,
+        ));
+    };
+
+    if let Some(policy) = policy {
+        if let Some(reason) = policy_block_reason(policy, review, opts) {
+            return Ok(CleanDecision::Skipped(reason));
+        }
+    }
+
+    let activity = activity.active_projects(std::slice::from_ref(&review.path))?;
+    let refreshed = review_project_with_identity_provider(
+        &review.path,
+        scan_error_paths,
+        discovery_blocked_paths,
+        &activity,
+        now,
+        opts,
+        identity_provider,
+    )?;
+    if refreshed.decision != CleanDecision::Cleanable {
+        return Ok(refreshed.decision);
+    }
+    let Some(refreshed_identity) = refreshed.reviewed_identity.as_ref() else {
+        return Ok(CleanDecision::Skipped(
+            SkipReason::ProjectIdentityUnavailable,
+        ));
+    };
+    if refreshed_identity.project != reviewed_identity.project {
+        return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));
+    }
+    if refreshed_identity.target != reviewed_identity.target {
+        return Ok(CleanDecision::Skipped(SkipReason::TargetIdentityChanged));
+    }
+
+    if !is_direct_regular_file(&review.path.join("Cargo.toml"))
+        || !is_direct_directory(&review.path)
+    {
+        return Ok(CleanDecision::Skipped(
+            SkipReason::ProjectIdentityUnavailable,
+        ));
+    }
+    if !is_direct_directory(&review.target_path) {
+        return Ok(CleanDecision::Skipped(
+            SkipReason::TargetIdentityUnavailable,
+        ));
+    }
+    let project_identity = match identity_provider.identity(&review.path) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Ok(CleanDecision::Skipped(
+                SkipReason::ProjectIdentityUnavailable,
+            ));
+        }
+    };
+    let target_identity = match identity_provider.identity(&review.target_path) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Ok(CleanDecision::Skipped(
+                SkipReason::TargetIdentityUnavailable,
+            ));
+        }
+    };
+    if project_identity.device != target_identity.device {
+        return Ok(CleanDecision::Skipped(SkipReason::CrossDeviceTarget));
+    }
+    if project_identity != reviewed_identity.project {
+        return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));
+    }
+    if target_identity != reviewed_identity.target {
+        return Ok(CleanDecision::Skipped(SkipReason::TargetIdentityChanged));
+    }
+    if let Some(policy) = policy {
+        if let Some(reason) = policy_block_reason(policy, review, opts) {
+            return Ok(CleanDecision::Skipped(reason));
+        }
+    }
+
+    Ok(CleanDecision::Cleanable)
+}
+
+fn policy_block_reason(
+    policy: &ScopePolicy,
+    review: &ProjectReview,
+    opts: &SafetyOptions,
+) -> Option<SkipReason> {
+    if !policy.contains_project(&review.path) {
+        return Some(SkipReason::OutOfScope);
+    }
+    if policy.is_excluded(&review.path) || policy.is_excluded(&review.target_path) {
+        return Some(SkipReason::Excluded);
+    }
+    if !opts.include_managed_cache {
+        return policy_protected_class(policy, &review.path).map(|class| match class {
+            ProjectClass::ManagedCache => SkipReason::ManagedCache,
+            ProjectClass::ContainerStorage => SkipReason::ContainerStorage,
+            ProjectClass::Workspace => unreachable!("protected roots are not workspaces"),
+        });
+    }
+    None
+}
+
+fn policy_protected_class(policy: &ScopePolicy, path: &Path) -> Option<ProjectClass> {
+    let physical_path = fs::canonicalize(path).ok();
+    policy
+        .diagnostics()
+        .protected_roots
+        .iter()
+        .find(|root| {
+            path == root.path
+                || path.starts_with(&root.path)
+                || physical_path.as_deref().is_some_and(|physical| {
+                    physical == root.path
+                        || physical.starts_with(&root.path)
+                        || fs::canonicalize(&root.path)
+                            .ok()
+                            .is_some_and(|physical_root| {
+                                physical == physical_root || physical.starts_with(physical_root)
+                            })
+                })
+        })
+        .map(|root| match root.kind {
+            ProtectedRootKind::Container => ProjectClass::ContainerStorage,
+            ProtectedRootKind::Cargo
+            | ProtectedRootKind::Rustup
+            | ProtectedRootKind::GoModule
+            | ProtectedRootKind::Bun
+            | ProtectedRootKind::ManagedCache => ProjectClass::ManagedCache,
+        })
 }
 
 fn path_components(path: &Path) -> Vec<String> {
