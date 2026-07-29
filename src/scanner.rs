@@ -171,18 +171,21 @@ impl Scanner {
             .opts
             .roots
             .iter()
-            .filter_map(|root| fs::canonicalize(root).ok())
+            .chain(&self.opts.project_dirs)
+            .filter(|path| !self.should_skip(path))
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .filter(|path| !self.should_skip(path))
             .collect();
-        canonical_roots.extend(
-            self.opts
-                .project_dirs
-                .iter()
-                .filter_map(|project| fs::canonicalize(project).ok()),
-        );
         canonical_roots.sort();
         canonical_roots.dedup();
         for root in &self.opts.roots {
+            if self.should_skip(root) {
+                continue;
+            }
             let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            if self.should_skip(&canonical_root) {
+                continue;
+            }
             self.walk(
                 &canonical_root,
                 &[],
@@ -193,6 +196,9 @@ impl Scanner {
             )?;
         }
         for project in &self.opts.project_dirs {
+            if self.should_skip(project) {
+                continue;
+            }
             if has_cargo_toml(project) {
                 self.add_cargo_project(
                     project,
@@ -220,6 +226,9 @@ impl Scanner {
         outcomes: &mut Vec<WorktreeDiscovery>,
         errors: &mut Vec<ScanError>,
     ) {
+        if honor_excludes && self.should_skip(project) {
+            return;
+        }
         let project = match fs::canonicalize(project) {
             Ok(project) => project,
             Err(err) => {
@@ -227,6 +236,9 @@ impl Scanner {
                 return;
             }
         };
+        if honor_excludes && self.should_skip(&project) {
+            return;
+        }
         if project.to_str().is_none() {
             if project.join(".git").is_dir() {
                 record_discovery_failure(&project, non_utf8_discovery_message(), outcomes, errors);
@@ -235,7 +247,7 @@ impl Scanner {
             }
             return;
         }
-        if (honor_excludes && self.should_skip(&project)) || !has_cargo_toml(&project) {
+        if !has_cargo_toml(&project) {
             return;
         }
         found.insert(project.clone());
@@ -253,6 +265,9 @@ impl Scanner {
         outcomes: &mut Vec<WorktreeDiscovery>,
         errors: &mut Vec<ScanError>,
     ) -> Result<()> {
+        if self.should_skip(dir) {
+            return Ok(());
+        }
         let meta = match fs::metadata(dir) {
             Ok(meta) => meta,
             Err(err) => {
@@ -260,7 +275,7 @@ impl Scanner {
                 return Ok(());
             }
         };
-        if !meta.is_dir() || self.should_skip(dir) || is_ignored(parent_ignores, dir, true) {
+        if !meta.is_dir() || is_ignored(parent_ignores, dir, true) {
             return Ok(());
         }
         if has_cargo_toml(dir) {
@@ -283,22 +298,19 @@ impl Scanner {
                     continue;
                 }
             };
+            let path = entry.path();
+            if self.should_skip(&path) {
+                continue;
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) => {
-                    errors.push(scan_error(entry.path(), err));
+                    errors.push(scan_error(path, err));
                     continue;
                 }
             };
             if file_type.is_dir() && !file_type.is_symlink() {
-                self.walk(
-                    &entry.path(),
-                    &ignores,
-                    canonical_roots,
-                    found,
-                    outcomes,
-                    errors,
-                )?;
+                self.walk(&path, &ignores, canonical_roots, found, outcomes, errors)?;
             }
         }
         Ok(())
@@ -318,11 +330,7 @@ impl Scanner {
 
         match self.worktree_resolver.linked_worktrees(primary) {
             Ok(candidates) => {
-                if primary.to_str().is_none()
-                    || candidates
-                        .iter()
-                        .any(|candidate| candidate.to_str().is_none())
-                {
+                if primary.to_str().is_none() {
                     record_discovery_failure(
                         primary,
                         non_utf8_discovery_message(),
@@ -335,9 +343,27 @@ impl Scanner {
                 let mut excluded = BTreeSet::new();
                 let mut out_of_scope = BTreeSet::new();
                 for candidate in candidates {
-                    let Ok(candidate) = fs::canonicalize(candidate) else {
+                    if self.should_skip(&candidate) {
+                        excluded.insert(candidate);
                         continue;
+                    }
+                    let candidate = match fs::canonicalize(&candidate) {
+                        Ok(candidate) => candidate,
+                        Err(_) if candidate.to_str().is_none() => {
+                            record_discovery_failure(
+                                primary,
+                                non_utf8_discovery_message(),
+                                outcomes,
+                                errors,
+                            );
+                            return;
+                        }
+                        Err(_) => continue,
                     };
+                    if self.should_skip(&candidate) {
+                        excluded.insert(candidate);
+                        continue;
+                    }
                     if candidate.to_str().is_none() {
                         record_discovery_failure(
                             primary,

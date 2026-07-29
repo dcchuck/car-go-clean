@@ -425,14 +425,13 @@ fn scan_rejects_configured_excluded_linked_worktree() {
 
     let report = scanner.scan_with_errors().unwrap();
     let canonical_primary = primary.canonicalize().unwrap();
-    let canonical_linked = linked.canonicalize().unwrap();
     assert_eq!(report.projects, vec![canonical_primary.clone()]);
     assert_eq!(
         report.worktree_discoveries,
         vec![WorktreeDiscovery::Success {
             primary: canonical_primary,
             linked: vec![],
-            excluded: vec![canonical_linked],
+            excluded: vec![linked],
             out_of_scope: vec![],
         }]
     );
@@ -472,7 +471,7 @@ fn scan_rejects_git_candidates_beneath_a_multi_component_exclusion_after_canonic
         vec![WorktreeDiscovery::Success {
             primary: canonical_primary,
             linked: vec![],
-            excluded: vec![canonical_excluded],
+            excluded: vec![canonical_excluded, excluded],
             out_of_scope: vec![],
         }]
     );
@@ -714,5 +713,72 @@ fn absolute_home_exclusion_prunes_before_manifest_and_git_discovery() {
 
     assert_eq!(report.projects, vec![legitimate.canonicalize().unwrap()]);
     assert!(report.errors.is_empty());
+    assert!(resolver.calls().is_empty());
+}
+
+#[test]
+fn excluded_missing_scan_root_produces_no_error() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("Library");
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![missing.clone()],
+        project_dirs: vec![],
+        excludes: vec![missing.to_string_lossy().into_owned()],
+    });
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert!(report.projects.is_empty());
+    assert!(report.errors.is_empty());
+    assert!(report.worktree_discoveries.is_empty());
+}
+
+#[test]
+fn excluded_explicit_project_does_not_resolve_worktrees() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("excluded-project");
+    write_file(&project.join("Cargo.toml"), "[workspace]\n");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    let resolver = FakeResolver::paths(vec![]);
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![project.clone()],
+            excludes: vec![project.to_string_lossy().into_owned()],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert!(report.projects.is_empty());
+    assert!(report.errors.is_empty());
+    assert!(report.worktree_discoveries.is_empty());
+    assert!(resolver.calls().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn alias_to_excluded_root_is_rejected_after_canonicalization() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let excluded = root.path().join("Library/copied-crate");
+    let alias = root.path().join("legacy-crate");
+    write_file(&excluded.join("Cargo.toml"), "[workspace]\n");
+    fs::create_dir_all(excluded.join(".git")).unwrap();
+    symlink(&excluded, &alias).unwrap();
+    let resolver = FakeResolver::paths(vec![]);
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![alias],
+            project_dirs: vec![],
+            excludes: vec![root.path().join("Library").to_string_lossy().into_owned()],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert!(report.projects.is_empty());
+    assert!(report.errors.is_empty());
+    assert!(report.worktree_discoveries.is_empty());
     assert!(resolver.calls().is_empty());
 }
