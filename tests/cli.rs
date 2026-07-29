@@ -286,6 +286,7 @@ fn exit_code_one_for_config_and_lock_failures() {
     fs::create_dir_all(&state).unwrap();
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(state.join("daemon.lock"))

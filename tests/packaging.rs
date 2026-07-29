@@ -125,6 +125,7 @@ fn configuration_reference_preserves_operational_contract() {
         "project_dirs",
         "extra_excludes",
         "override_excludes",
+        "legacy `excludes`",
         "config migrate",
         "unknown keys",
         "absolute",
