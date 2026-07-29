@@ -34,6 +34,12 @@ struct AbsoluteExclusion {
     canonical: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct CargoProjectOptions {
+    honor_excludes: bool,
+    report_canonicalization_error: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub projects: Vec<PathBuf>,
@@ -199,16 +205,17 @@ impl Scanner {
             if self.should_skip(project) {
                 continue;
             }
-            if has_cargo_toml(project) {
-                self.add_cargo_project(
-                    project,
-                    &canonical_roots,
-                    true,
-                    &mut found,
-                    &mut worktree_discoveries,
-                    &mut errors,
-                );
-            }
+            self.add_cargo_project(
+                project,
+                &canonical_roots,
+                CargoProjectOptions {
+                    honor_excludes: true,
+                    report_canonicalization_error: false,
+                },
+                &mut found,
+                &mut worktree_discoveries,
+                &mut errors,
+            );
         }
         Ok(ScanReport {
             projects: found.into_iter().collect(),
@@ -221,22 +228,24 @@ impl Scanner {
         &self,
         project: &Path,
         canonical_roots: &[PathBuf],
-        honor_excludes: bool,
+        options: CargoProjectOptions,
         found: &mut BTreeSet<PathBuf>,
         outcomes: &mut Vec<WorktreeDiscovery>,
         errors: &mut Vec<ScanError>,
     ) {
-        if honor_excludes && self.should_skip(project) {
+        if options.honor_excludes && self.should_skip(project) {
             return;
         }
         let project = match fs::canonicalize(project) {
             Ok(project) => project,
             Err(err) => {
-                errors.push(scan_error(project, err));
+                if options.report_canonicalization_error {
+                    errors.push(scan_error(project, err));
+                }
                 return;
             }
         };
-        if honor_excludes && self.should_skip(&project) {
+        if options.honor_excludes && self.should_skip(&project) {
             return;
         }
         if project.to_str().is_none() {
@@ -279,7 +288,17 @@ impl Scanner {
             return Ok(());
         }
         if has_cargo_toml(dir) {
-            self.add_cargo_project(dir, canonical_roots, true, found, outcomes, errors);
+            self.add_cargo_project(
+                dir,
+                canonical_roots,
+                CargoProjectOptions {
+                    honor_excludes: true,
+                    report_canonicalization_error: true,
+                },
+                found,
+                outcomes,
+                errors,
+            );
             return Ok(());
         }
         let ignores = ignores_for(dir, parent_ignores);

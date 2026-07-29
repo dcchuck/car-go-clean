@@ -782,3 +782,31 @@ fn alias_to_excluded_root_is_rejected_after_canonicalization() {
     assert!(report.worktree_discoveries.is_empty());
     assert!(resolver.calls().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn alias_to_excluded_explicit_project_is_rejected_after_canonicalization() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let excluded = root.path().join("Library/copied-crate");
+    let alias = root.path().join("legacy-crate");
+    write_file(&excluded.join("Cargo.toml"), "[workspace]\n");
+    fs::create_dir_all(excluded.join(".git")).unwrap();
+    symlink(&excluded, &alias).unwrap();
+    let resolver = FakeResolver::paths(vec![]);
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![],
+            project_dirs: vec![alias],
+            excludes: vec![root.path().join("Library").to_string_lossy().into_owned()],
+        },
+        Arc::new(resolver.clone()),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    assert!(report.projects.is_empty());
+    assert!(report.errors.is_empty());
+    assert!(report.worktree_discoveries.is_empty());
+    assert!(resolver.calls().is_empty());
+}
