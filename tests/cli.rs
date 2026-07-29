@@ -49,8 +49,9 @@ fn run_help_explains_default_scan_and_safety_flags() {
         ))
         .stdout(contains("Include projects used by running processes"))
         .stdout(contains(
-            "Bypass policy gates except the direct readable target requirement",
-        ));
+            "Bypass scan-error, activity, and quiet-period gates; managed storage still",
+        ))
+        .stdout(contains("requires --include-managed-cache"));
 }
 
 #[test]

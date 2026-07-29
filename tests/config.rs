@@ -28,6 +28,21 @@ fn default_config_scans_home_and_has_intervals() {
             .to_string_lossy()
             .into_owned()
     ));
+    for relative in [
+        ".cache",
+        ".bun/install/cache",
+        "go/pkg/mod",
+        ".colima",
+        ".lima",
+        ".local/share/containers",
+    ] {
+        assert!(cfg.excludes.contains(
+            &PathBuf::from(&home)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
     assert!(!cfg.excludes.contains(&"target".to_string()));
 
     match std::env::consts::OS {

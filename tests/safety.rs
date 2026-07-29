@@ -71,6 +71,56 @@ fn similar_looking_paths_remain_workspaces() {
 }
 
 #[test]
+fn default_cleanup_classification_protects_every_current_platform_root() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let mut relatives = vec![
+        ".cargo",
+        ".rustup",
+        ".cache",
+        ".bun/install/cache",
+        "go/pkg/mod",
+        ".colima",
+        ".lima",
+        ".local/share/containers",
+    ];
+    if cfg!(target_os = "macos") {
+        relatives.extend(["Library", ".Trash", "OrbStack"]);
+    } else if cfg!(target_os = "linux") {
+        relatives.extend([
+            ".local/share/docker",
+            ".docker/desktop",
+            ".local/share/rancher-desktop",
+            ".local/share/Trash",
+        ]);
+    }
+
+    for relative in relatives {
+        let class = classify_project(&home.join(relative).join("copied-crate"));
+        assert_ne!(class, ProjectClass::Workspace, "{relative}");
+    }
+}
+
+#[test]
+fn force_does_not_authorize_managed_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join(".cargo/registry/src/copied-crate");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 4096]);
+
+    let mut opts = options();
+    opts.force = true;
+    let review = review_project(&project, &[], &[], SystemTime::now(), &opts).unwrap();
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::ManagedCache)
+    );
+
+    opts.include_managed_cache = true;
+    let review = review_project(&project, &[], &[], SystemTime::now(), &opts).unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+}
+
+#[test]
 fn path_matching_treats_project_and_target_descendants_as_active() {
     let project = Path::new("/Users/me/src/app");
     assert!(path_is_within(Path::new("/Users/me/src/app"), project));

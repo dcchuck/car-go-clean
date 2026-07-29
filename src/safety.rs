@@ -1,4 +1,5 @@
 use crate::activity::{path_is_within, ActivitySignal};
+use crate::storage::{classify_protected_path_for, current_home_dir, HostPlatform, ProtectedKind};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -105,6 +106,15 @@ pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
 }
 
 pub fn classify_project(path: &Path) -> ProjectClass {
+    let protected = classify_protected_path_for(path, &current_home_dir(), HostPlatform::current());
+    match protected {
+        Some(ProtectedKind::ManagedCache) => ProjectClass::ManagedCache,
+        Some(ProtectedKind::ContainerStorage) => ProjectClass::ContainerStorage,
+        None => classify_legacy_component_patterns(path),
+    }
+}
+
+fn classify_legacy_component_patterns(path: &Path) -> ProjectClass {
     let parts = path_components(path);
 
     if contains_sequence(&parts, &[".bun", "install", "cache"])
@@ -165,7 +175,7 @@ pub fn review_project_with_discovery_blocks(
         }
     };
 
-    if !opts.force && !opts.include_managed_cache {
+    if !opts.include_managed_cache {
         match class {
             ProjectClass::ManagedCache => {
                 return Ok(review(

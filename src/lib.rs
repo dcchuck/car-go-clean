@@ -9,4 +9,5 @@ pub mod logging;
 pub mod safety;
 pub mod scanner;
 pub mod service;
+mod storage;
 pub mod store;

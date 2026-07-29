@@ -1,3 +1,4 @@
+use crate::storage::{current_home_dir, protected_roots_for, HostPlatform};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -25,7 +26,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let scan_dirs = env::var_os("HOME").map(PathBuf::from).into_iter().collect();
+        let home = current_home_dir();
+        let scan_dirs = if home.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            vec![home]
+        };
         Self {
             scan_dirs,
             project_dirs: Vec::new(),
@@ -70,14 +76,14 @@ pub fn default_path() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(xdg).join("car-go-clean/config.toml");
     }
-    home_dir().join(".config/car-go-clean/config.toml")
+    current_home_dir().join(".config/car-go-clean/config.toml")
 }
 
 pub fn paths() -> PathSet {
     let state_dir = if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
         PathBuf::from(xdg).join("car-go-clean")
     } else {
-        home_dir().join(".local/state/car-go-clean")
+        current_home_dir().join(".local/state/car-go-clean")
     };
     PathSet {
         db_path: state_dir.join("state.db"),
@@ -108,10 +114,10 @@ fn expand_path(path: PathBuf) -> PathBuf {
     let raw = path.to_string_lossy();
     let expanded_env = expand_env_vars(&raw);
     if expanded_env == "~" {
-        return home_dir();
+        return current_home_dir();
     }
     if let Some(rest) = expanded_env.strip_prefix("~/") {
-        return home_dir().join(rest);
+        return current_home_dir().join(rest);
     }
     PathBuf::from(expanded_env)
 }
@@ -154,10 +160,6 @@ fn expand_env_vars(input: &str) -> String {
     out
 }
 
-fn home_dir() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
-}
-
 fn default_clean_interval() -> Duration {
     Duration::from_secs(24 * 60 * 60)
 }
@@ -174,60 +176,17 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostPlatform {
-    MacOs,
-    Linux,
-    Other,
-}
-
-impl HostPlatform {
-    fn current() -> Self {
-        match env::consts::OS {
-            "macos" => Self::MacOs,
-            "linux" => Self::Linux,
-            _ => Self::Other,
-        }
-    }
-}
-
 fn default_excludes() -> Vec<String> {
-    default_excludes_for(&home_dir(), HostPlatform::current())
+    default_excludes_for(&current_home_dir(), HostPlatform::current())
 }
 
 fn default_excludes_for(home: &Path, platform: HostPlatform) -> Vec<String> {
     let mut excludes = vec![".git".to_string(), "node_modules".to_string()];
-
-    if home.is_absolute() {
-        for relative in [
-            ".cargo",
-            ".rustup",
-            ".cache",
-            ".bun/install/cache",
-            "go/pkg/mod",
-            ".colima",
-            ".lima",
-            ".local/share/containers",
-        ] {
-            excludes.push(home.join(relative).to_string_lossy().into_owned());
-        }
-
-        let platform_paths: &[&str] = match platform {
-            HostPlatform::MacOs => &["Library", ".Trash", "OrbStack"],
-            HostPlatform::Linux => &[
-                ".local/share/docker",
-                ".docker/desktop",
-                ".local/share/rancher-desktop",
-                ".local/share/Trash",
-            ],
-            HostPlatform::Other => &[],
-        };
-        excludes.extend(
-            platform_paths
-                .iter()
-                .map(|relative| home.join(relative).to_string_lossy().into_owned()),
-        );
-    }
+    excludes.extend(
+        protected_roots_for(home, platform)
+            .into_iter()
+            .map(|root| root.path.to_string_lossy().into_owned()),
+    );
 
     excludes
 }

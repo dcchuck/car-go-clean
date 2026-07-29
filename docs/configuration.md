@@ -94,8 +94,9 @@ compiler path options still protect the matching canonical project.
 - `run --dry-run --all` lists every cleanable target.
 - `run --include-managed-cache` and `run --include-active` expand the review
   policy for those named risks.
-- `run --force` bypasses policy gates except the direct readable
-  `project/target` requirement.
+- `run --force` bypasses scan-error, activity, and quiet-period gates; it does
+  not bypass the direct readable-target requirement or managed-storage
+  authorization.
 - `status --refresh`, `projects`, `projects --all`, `projects --risky`,
   `projects --active`, and `projects --json` expose the saved or refreshed
   review.

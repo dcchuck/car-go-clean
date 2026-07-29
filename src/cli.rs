@@ -219,7 +219,8 @@ enum Commands {
         /// Include projects used by running processes.
         #[arg(long)]
         include_active: bool,
-        /// Bypass policy gates except the direct readable target requirement.
+        /// Bypass scan-error, activity, and quiet-period gates; managed storage still
+        /// requires --include-managed-cache.
         #[arg(long)]
         force: bool,
         /// Show every cleanable target in dry-run output.
