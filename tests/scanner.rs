@@ -463,6 +463,9 @@ fn scan_rejects_git_candidates_beneath_a_multi_component_exclusion_after_canonic
 
     let canonical_primary = primary.canonicalize().unwrap();
     let canonical_excluded = excluded.canonicalize().unwrap();
+    let mut expected_excluded = vec![canonical_excluded, excluded];
+    expected_excluded.sort();
+    expected_excluded.dedup();
     let report = scanner.scan_with_errors().unwrap();
 
     assert_eq!(report.projects, vec![canonical_primary.clone()]);
@@ -471,7 +474,7 @@ fn scan_rejects_git_candidates_beneath_a_multi_component_exclusion_after_canonic
         vec![WorktreeDiscovery::Success {
             primary: canonical_primary,
             linked: vec![],
-            excluded: vec![canonical_excluded, excluded],
+            excluded: expected_excluded,
             out_of_scope: vec![],
         }]
     );
