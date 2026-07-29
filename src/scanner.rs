@@ -1,5 +1,11 @@
+use crate::identity::{
+    BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
+};
+use crate::policy::ScopePolicy;
 use anyhow::Result;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -20,6 +26,9 @@ pub struct Scanner {
     opts: ScannerOptions,
     exclusion_matchers: ExclusionMatchers,
     worktree_resolver: Arc<dyn GitWorktreeResolver>,
+    policy: Option<ScopePolicy>,
+    policy_hash: String,
+    identity_provider: Arc<dyn IdentityProvider>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,6 +54,33 @@ pub struct ScanReport {
     pub projects: Vec<PathBuf>,
     pub errors: Vec<ScanError>,
     pub worktree_discoveries: Vec<WorktreeDiscovery>,
+    pub origins: Vec<DiscoveryOriginResult>,
+    pub policy_hash: String,
+    pub boot_session_id: Option<BootSessionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryOriginKind {
+    ScanRoot,
+    ExplicitProject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscoveryOriginResult {
+    pub kind: DiscoveryOriginKind,
+    pub configured_path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
+    pub completed: bool,
+    pub error: Option<String>,
+    pub projects: Vec<ObservedProject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservedProject {
+    pub path: PathBuf,
+    pub project_identity: FilesystemIdentity,
+    pub target_identity: Option<FilesystemIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +108,68 @@ pub enum WorktreeDiscovery {
         primary: PathBuf,
         message: String,
     },
+}
+
+struct OriginScan {
+    result: DiscoveryOriginResult,
+    projects: Vec<ObservedProject>,
+    errors: Vec<ScanError>,
+    worktree_discoveries: Vec<WorktreeDiscovery>,
+}
+
+impl OriginScan {
+    fn completed_empty(kind: DiscoveryOriginKind, configured_path: &Path) -> Self {
+        Self::completed_empty_with_optional_canonical(kind, configured_path, None)
+    }
+
+    fn completed_empty_with_canonical(
+        kind: DiscoveryOriginKind,
+        configured_path: &Path,
+        canonical_path: PathBuf,
+    ) -> Self {
+        Self::completed_empty_with_optional_canonical(kind, configured_path, Some(canonical_path))
+    }
+
+    fn completed_empty_with_optional_canonical(
+        kind: DiscoveryOriginKind,
+        configured_path: &Path,
+        canonical_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            result: DiscoveryOriginResult {
+                kind,
+                configured_path: configured_path.to_path_buf(),
+                canonical_path,
+                completed: true,
+                error: None,
+                projects: Vec::new(),
+            },
+            projects: Vec::new(),
+            errors: Vec::new(),
+            worktree_discoveries: Vec::new(),
+        }
+    }
+
+    fn failed(
+        kind: DiscoveryOriginKind,
+        configured_path: &Path,
+        canonical_path: Option<PathBuf>,
+        error: ScanError,
+    ) -> Self {
+        Self {
+            result: DiscoveryOriginResult {
+                kind,
+                configured_path: configured_path.to_path_buf(),
+                canonical_path,
+                completed: false,
+                error: Some(error.message.clone()),
+                projects: Vec::new(),
+            },
+            projects: Vec::new(),
+            errors: vec![error],
+            worktree_discoveries: Vec::new(),
+        }
+    }
 }
 
 pub trait GitWorktreeResolver {
@@ -155,6 +253,7 @@ impl Scanner {
         opts: ScannerOptions,
         resolver: Arc<dyn GitWorktreeResolver>,
     ) -> Self {
+        let policy_hash = scanner_scope_hash(&opts);
         let exclusion_matchers = ExclusionMatchers::new(
             std::iter::once("target").chain(opts.excludes.iter().map(String::as_str)),
         );
@@ -162,7 +261,25 @@ impl Scanner {
             opts,
             exclusion_matchers,
             worktree_resolver: resolver,
+            policy: None,
+            policy_hash,
+            identity_provider: Arc::new(SystemIdentityProvider),
         }
+    }
+
+    pub fn with_authority(
+        mut self,
+        policy: ScopePolicy,
+        identity_provider: Arc<dyn IdentityProvider>,
+    ) -> Self {
+        self.policy_hash = policy.hash().to_string();
+        self.policy = Some(policy);
+        self.identity_provider = identity_provider;
+        self
+    }
+
+    pub(crate) fn policy_hash(&self) -> &str {
+        &self.policy_hash
     }
 
     pub fn scan(&self) -> Result<Vec<PathBuf>> {
@@ -170,58 +287,196 @@ impl Scanner {
     }
 
     pub fn scan_with_errors(&self) -> Result<ScanReport> {
-        let mut found = BTreeSet::new();
+        let boot_session_id = self.identity_provider.boot_session()?;
+        let mut all_projects = BTreeSet::new();
         let mut errors = Vec::new();
         let mut worktree_discoveries = Vec::new();
-        let mut canonical_roots: Vec<_> = self
-            .opts
-            .roots
-            .iter()
-            .chain(&self.opts.project_dirs)
-            .filter(|path| !self.should_skip(path))
-            .filter_map(|path| fs::canonicalize(path).ok())
-            .filter(|path| !self.should_skip(path))
-            .collect();
-        canonical_roots.sort();
-        canonical_roots.dedup();
+        let canonical_roots = self.canonical_authority_roots();
+        let mut origins = Vec::with_capacity(self.opts.roots.len() + self.opts.project_dirs.len());
+
         for root in &self.opts.roots {
-            if self.should_skip(root) {
-                continue;
-            }
-            let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            if self.should_skip(&canonical_root) {
-                continue;
-            }
-            self.walk(
-                &canonical_root,
-                &[],
-                &canonical_roots,
-                &mut found,
-                &mut worktree_discoveries,
-                &mut errors,
-            )?;
+            let origin = self.scan_origin(DiscoveryOriginKind::ScanRoot, root, &canonical_roots)?;
+            all_projects.extend(origin.projects.iter().map(|project| project.path.clone()));
+            errors.extend(origin_errors(&origin));
+            worktree_discoveries.extend(origin.worktree_discoveries);
+            origins.push(origin.result);
         }
         for project in &self.opts.project_dirs {
-            if self.should_skip(project) {
-                continue;
-            }
-            self.add_cargo_project(
+            let origin = self.scan_origin(
+                DiscoveryOriginKind::ExplicitProject,
                 project,
                 &canonical_roots,
+            )?;
+            all_projects.extend(origin.projects.iter().map(|project| project.path.clone()));
+            errors.extend(origin_errors(&origin));
+            worktree_discoveries.extend(origin.worktree_discoveries);
+            origins.push(origin.result);
+        }
+
+        Ok(ScanReport {
+            projects: all_projects.into_iter().collect(),
+            errors,
+            worktree_discoveries,
+            origins,
+            policy_hash: self.policy_hash.clone(),
+            boot_session_id,
+        })
+    }
+
+    fn scan_origin(
+        &self,
+        kind: DiscoveryOriginKind,
+        configured_path: &Path,
+        canonical_roots: &[PathBuf],
+    ) -> Result<OriginScan> {
+        if self.should_skip(configured_path) {
+            return Ok(OriginScan::completed_empty(kind, configured_path));
+        }
+
+        let canonical_path = match fs::canonicalize(configured_path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OriginScan::completed_empty(kind, configured_path));
+            }
+            Err(error) => {
+                return Ok(OriginScan::failed(
+                    kind,
+                    configured_path,
+                    None,
+                    scan_error(configured_path, error),
+                ));
+            }
+        };
+        if self.should_skip(&canonical_path) {
+            return Ok(OriginScan::completed_empty_with_canonical(
+                kind,
+                configured_path,
+                canonical_path,
+            ));
+        }
+        if !self.policy_allows_origin(kind, &canonical_path) {
+            return Ok(OriginScan::failed(
+                kind,
+                configured_path,
+                Some(canonical_path.clone()),
+                ScanError {
+                    path: canonical_path,
+                    message: format!(
+                        "configured {} changed after policy construction",
+                        origin_kind_label(kind)
+                    ),
+                    kind: ScanErrorKind::Scan,
+                },
+            ));
+        }
+
+        let mut found = BTreeSet::new();
+        let mut worktree_discoveries = Vec::new();
+        let mut local_errors = Vec::new();
+        match kind {
+            DiscoveryOriginKind::ScanRoot => self.walk(
+                &canonical_path,
+                &[],
+                canonical_roots,
+                &mut found,
+                &mut worktree_discoveries,
+                &mut local_errors,
+            )?,
+            DiscoveryOriginKind::ExplicitProject => self.add_cargo_project(
+                &canonical_path,
+                canonical_roots,
                 CargoProjectOptions {
                     honor_excludes: true,
-                    report_canonicalization_error: false,
+                    report_canonicalization_error: true,
                 },
                 &mut found,
                 &mut worktree_discoveries,
-                &mut errors,
-            );
+                &mut local_errors,
+            ),
         }
-        Ok(ScanReport {
-            projects: found.into_iter().collect(),
-            errors,
+
+        let mut projects = Vec::with_capacity(found.len());
+        for path in found {
+            match self.observe_project(&path) {
+                Ok(project) => projects.push(project),
+                Err(error) => local_errors.push(ScanError {
+                    path,
+                    message: error.to_string(),
+                    kind: ScanErrorKind::Scan,
+                }),
+            }
+        }
+        let completed = local_errors.is_empty();
+        let error = joined_error_messages(&local_errors);
+        Ok(OriginScan {
+            result: DiscoveryOriginResult {
+                kind,
+                configured_path: configured_path.to_path_buf(),
+                canonical_path: Some(canonical_path),
+                completed,
+                error,
+                projects: projects.clone(),
+            },
+            projects,
+            errors: local_errors,
             worktree_discoveries,
         })
+    }
+
+    fn observe_project(&self, path: &Path) -> Result<ObservedProject> {
+        let project_identity = self.identity_provider.identity(path)?;
+        let target_path = path.join("target");
+        let target_identity = match fs::symlink_metadata(&target_path) {
+            Ok(_) => self.identity_provider.identity(&target_path).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => None,
+        };
+        Ok(ObservedProject {
+            path: path.to_path_buf(),
+            project_identity,
+            target_identity,
+        })
+    }
+
+    fn canonical_authority_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = if let Some(policy) = &self.policy {
+            let diagnostics = policy.diagnostics();
+            diagnostics
+                .canonical_scan_roots
+                .iter()
+                .chain(diagnostics.canonical_project_paths)
+                .cloned()
+                .collect()
+        } else {
+            self.opts
+                .roots
+                .iter()
+                .chain(&self.opts.project_dirs)
+                .filter(|path| !self.should_skip(path))
+                .filter_map(|path| fs::canonicalize(path).ok())
+                .filter(|path| !self.should_skip(path))
+                .collect()
+        };
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    fn policy_allows_origin(&self, kind: DiscoveryOriginKind, canonical_path: &Path) -> bool {
+        let Some(policy) = &self.policy else {
+            return true;
+        };
+        let diagnostics = policy.diagnostics();
+        match kind {
+            DiscoveryOriginKind::ScanRoot => diagnostics
+                .canonical_scan_roots
+                .iter()
+                .any(|path| path == canonical_path),
+            DiscoveryOriginKind::ExplicitProject => diagnostics
+                .canonical_project_paths
+                .iter()
+                .any(|path| path == canonical_path),
+        }
     }
 
     fn add_cargo_project(
@@ -485,6 +740,40 @@ impl ExclusionMatchers {
                     .all(|(actual, expected)| *actual == expected.as_os_str())
             })
         })
+    }
+}
+
+fn scanner_scope_hash(options: &ScannerOptions) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-scope-v1\0");
+    hasher.update(format!("{options:?}").as_bytes());
+    let digest = hasher.finalize();
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hash
+}
+
+fn origin_errors(origin: &OriginScan) -> Vec<ScanError> {
+    origin.errors.clone()
+}
+
+fn joined_error_messages(errors: &[ScanError]) -> Option<String> {
+    let mut messages = errors
+        .iter()
+        .map(|error| error.message.clone())
+        .collect::<Vec<_>>();
+    messages.sort();
+    messages.dedup();
+    (!messages.is_empty()).then(|| messages.join("; "))
+}
+
+fn origin_kind_label(kind: DiscoveryOriginKind) -> &'static str {
+    match kind {
+        DiscoveryOriginKind::ScanRoot => "scan root",
+        DiscoveryOriginKind::ExplicitProject => "explicit project",
     }
 }
 

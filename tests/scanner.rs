@@ -7,7 +7,8 @@ use car_go_clean::safety::{
     review_project, CleanDecision, ProjectClass, SafetyOptions, SkipReason,
 };
 use car_go_clean::scanner::{
-    GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, WorktreeDiscovery,
+    DiscoveryOriginKind, GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions,
+    WorktreeDiscovery,
 };
 
 #[derive(Clone)]
@@ -812,4 +813,156 @@ fn alias_to_excluded_explicit_project_is_rejected_after_canonicalization() {
     assert!(report.errors.is_empty());
     assert!(report.worktree_discoveries.is_empty());
     assert!(resolver.calls().is_empty());
+}
+
+#[test]
+fn origin_results_isolate_a_failed_root_and_preserve_the_completed_root() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), "[package]\n");
+    let failing_root = tempfile::tempdir().unwrap();
+    let failing_project = failing_root.path().join("project");
+    write_file(&failing_project.join("Cargo.toml"), "[package]\n");
+    fs::create_dir_all(failing_project.join(".git")).unwrap();
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf(), failing_root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::failure("resolver unavailable")),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+
+    assert_eq!(report.origins.len(), 2);
+    assert_eq!(report.origins[0].kind, DiscoveryOriginKind::ScanRoot);
+    assert_eq!(report.origins[0].configured_path, root.path());
+    assert_eq!(
+        report.origins[0]
+            .projects
+            .iter()
+            .map(|project| project.path.clone())
+            .collect::<Vec<_>>(),
+        vec![project.canonicalize().unwrap()]
+    );
+    assert!(report.origins[0].completed);
+    assert!(report.origins[0].error.is_none());
+
+    assert_eq!(report.origins[1].kind, DiscoveryOriginKind::ScanRoot);
+    assert_eq!(report.origins[1].configured_path, failing_root.path());
+    assert!(!report.origins[1].completed);
+    assert!(report.origins[1]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("resolver unavailable")));
+    assert_eq!(
+        report.origins[1]
+            .projects
+            .iter()
+            .map(|project| project.path.clone())
+            .collect::<Vec<_>>(),
+        vec![failing_project.canonicalize().unwrap()]
+    );
+}
+
+#[test]
+fn explicit_project_is_a_distinct_origin() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), "[package]\n");
+    let scanner = Scanner::new(ScannerOptions {
+        roots: vec![],
+        project_dirs: vec![project.path().to_path_buf()],
+        excludes: vec![],
+    });
+
+    let report = scanner.scan_with_errors().unwrap();
+
+    assert_eq!(report.origins.len(), 1);
+    assert_eq!(report.origins[0].kind, DiscoveryOriginKind::ExplicitProject);
+    assert_eq!(report.origins[0].configured_path, project.path());
+    assert_eq!(
+        report.origins[0].projects[0].path,
+        project.path().canonicalize().unwrap()
+    );
+    assert!(report.origins[0].completed);
+}
+
+#[test]
+fn linked_worktree_stays_attached_to_the_primary_project_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    let linked = other_root.path().join("feature");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), "[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), "[workspace]\n");
+    let scanner = Scanner::with_worktree_resolver(
+        ScannerOptions {
+            roots: vec![root.path().to_path_buf(), other_root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        },
+        Arc::new(FakeResolver::paths(vec![linked.clone()])),
+    );
+
+    let report = scanner.scan_with_errors().unwrap();
+    let linked = linked.canonicalize().unwrap();
+
+    assert!(report.origins[0]
+        .projects
+        .iter()
+        .any(|project| project.path == linked));
+    assert!(report.origins[1]
+        .projects
+        .iter()
+        .any(|project| project.path == linked));
+}
+
+#[cfg(unix)]
+#[test]
+fn retargeted_root_alias_is_incomplete_against_the_bound_policy() {
+    use car_go_clean::config::load;
+    use car_go_clean::identity::SystemIdentityProvider;
+    use car_go_clean::policy::{ProcessEnvironment, ScopePolicy};
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    write_file(&second.join("Cargo.toml"), "[package]\n");
+    let alias = root.path().join("root-alias");
+    symlink(&first, &alias).unwrap();
+    let config_path = root.path().join("config.toml");
+    write_file(
+        &config_path,
+        &format!("scan_dirs = [\"{}\"]\n", alias.display()),
+    );
+    let config = load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&config, &config_path, &ProcessEnvironment).unwrap();
+    fs::remove_file(&alias).unwrap();
+    symlink(&second, &alias).unwrap();
+
+    let report = Scanner::new(ScannerOptions {
+        roots: vec![alias],
+        project_dirs: vec![],
+        excludes: vec![],
+    })
+    .with_authority(policy, Arc::new(SystemIdentityProvider))
+    .scan_with_errors()
+    .unwrap();
+
+    assert_eq!(report.origins.len(), 1);
+    assert_eq!(
+        report.origins[0].canonical_path.as_deref(),
+        Some(second.canonicalize().unwrap().as_path())
+    );
+    assert!(!report.origins[0].completed);
+    assert!(report.origins[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("changed after policy construction")));
+    assert!(report.origins[0].projects.is_empty());
 }

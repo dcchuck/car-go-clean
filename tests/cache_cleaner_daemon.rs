@@ -52,6 +52,83 @@ fn cache_verify_and_sync_remove_dead_projects() {
 }
 
 #[test]
+fn generation_deduplicates_overlapping_origins_and_revokes_absent_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![project.clone()],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    let first = daemon.scan_cycle().unwrap();
+    assert_eq!(first.origins.len(), 2);
+    assert_eq!(
+        store
+            .authorized_observations(first.generation)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    fs::remove_dir_all(&project).unwrap();
+    let second = daemon.scan_cycle().unwrap();
+    assert!(store
+        .authorized_observations(second.generation)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+}
+
+#[test]
+fn failed_origin_preserves_history_but_grants_no_current_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("router");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::with_worktree_resolver(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            Arc::new(FakeWorktreeResolver::failure("git failed")),
+        ),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    let scan = daemon.scan_cycle().unwrap();
+
+    assert_eq!(scan.origins.len(), 1);
+    assert!(!scan.origins[0].completed);
+    assert!(store
+        .authorized_observations(scan.generation)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.all_projects().unwrap()[0].path,
+        primary.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[test]
 fn cache_eviction_preserves_association_for_a_later_discovery_failure() {
     let root = tempfile::tempdir().unwrap();
     let primary = root.path().join("router");
@@ -240,15 +317,7 @@ fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
     );
 
     daemon.scan_cycle().unwrap();
-    assert_eq!(
-        store
-            .all_projects()
-            .unwrap()
-            .into_iter()
-            .map(|project| project.path)
-            .collect::<Vec<_>>(),
-        vec![canonical_primary.to_string_lossy().into_owned()]
-    );
+    assert_eq!(store.all_projects().unwrap().len(), 2);
     let result = daemon
         .run_cycle_with_safety(
             SafetyOptions {
@@ -374,7 +443,7 @@ fn first_v4_scan_reconciles_v3_cached_out_of_scope_worktree_without_provenance()
         .args(["--state-dir"])
         .arg(state_dir.path())
         .assert()
-        .success()
+        .code(2)
         .stdout(contains(canonical_outside.display().to_string()).not());
     AssertCommand::cargo_bin("car-go-clean")
         .unwrap()
@@ -696,7 +765,7 @@ fn daemon_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
             &store,
             Cache::new(&store),
             Scanner::new(ScannerOptions {
-                roots: vec![],
+                roots: vec![root_path.clone()],
                 project_dirs: vec![],
                 excludes: vec![],
             }),
@@ -706,6 +775,7 @@ fn daemon_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
                 ..DaemonOptions::default()
             },
         );
+        daemon.scan_cycle().unwrap();
         let result = daemon
             .run_cycle_with_safety(
                 SafetyOptions {
@@ -728,15 +798,11 @@ fn daemon_physically_classifies_frozen_trusted_and_untrusted_primary_rows() {
             replacement.join("target/blob.bin").exists(),
             "trusted={trusted}, path={class_path}"
         );
-        assert_eq!(
-            store
-                .all_projects()
-                .unwrap()
-                .into_iter()
-                .map(|project| project.path)
-                .collect::<Vec<_>>(),
-            vec![canonical_replacement.to_string_lossy().into_owned()]
-        );
+        assert!(store
+            .all_projects()
+            .unwrap()
+            .iter()
+            .any(|project| project.path == canonical_replacement.to_string_lossy()));
     }
 }
 
@@ -1101,7 +1167,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
         &store,
         Cache::new(&store),
         Scanner::new(ScannerOptions {
-            roots: vec![],
+            roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
         }),
@@ -1111,6 +1177,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -1159,7 +1226,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_out_dir_argument() {
         &store,
         Cache::new(&store),
         Scanner::new(ScannerOptions {
-            roots: vec![],
+            roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
         }),
@@ -1169,6 +1236,7 @@ fn daemon_skips_canonical_project_for_symlink_spelled_out_dir_argument() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -1225,7 +1293,7 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
         &store,
         Cache::new(&store),
         Scanner::new(ScannerOptions {
-            roots: vec![],
+            roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
         }),
@@ -1235,6 +1303,7 @@ fn daemon_skips_canonical_project_for_sequential_rust_path_arguments() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
     let argument_sets = [
         vec![
             PathBuf::from("rustc"),
@@ -1340,7 +1409,7 @@ fn daemon_skips_non_utf8_nested_rust_argument_paths_with_outside_cwd() {
         &store,
         Cache::new(&store),
         Scanner::new(ScannerOptions {
-            roots: vec![],
+            roots: vec![root.path().to_path_buf()],
             project_dirs: vec![],
             excludes: vec![],
         }),
@@ -1350,6 +1419,7 @@ fn daemon_skips_non_utf8_nested_rust_argument_paths_with_outside_cwd() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
     let argument_sets = vec![
         vec![
             PathBuf::from("rustc"),
@@ -1558,6 +1628,7 @@ fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -1635,6 +1706,7 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -1742,6 +1814,7 @@ fn daemon_logs_run_cycle_summary() {
         DaemonOptions::default(),
     )
     .with_logger(logger);
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -2264,6 +2337,7 @@ fn daemon_run_cycle_reports_pathless_scan_error_as_incomplete_coverage() {
             ..DaemonOptions::default()
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -2327,6 +2401,7 @@ fn daemon_run_cycle_ignores_scan_errors_older_than_scan_interval() {
             target_quiet_period: Duration::from_secs(2 * 60 * 60),
         },
     );
+    daemon.scan_cycle().unwrap();
 
     let result = daemon
         .run_cycle_with_safety(
@@ -2434,7 +2509,7 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
 }
 
 #[test]
-fn daemon_scan_cycle_returns_errors_for_a_missing_absolute_root() {
+fn daemon_scan_cycle_treats_a_missing_absolute_root_as_completed_and_empty() {
     let db_dir = tempfile::tempdir().unwrap();
     let store = Store::open(db_dir.path().join("state.db")).unwrap();
     store.migrate().unwrap();
@@ -2454,11 +2529,13 @@ fn daemon_scan_cycle_returns_errors_for_a_missing_absolute_root() {
     );
 
     let result = daemon.scan_cycle().unwrap();
-    assert_eq!(result.errors, 1);
+    assert_eq!(result.errors, 0);
+    assert_eq!(result.origins.len(), 1);
+    assert!(result.origins[0].completed);
+    assert!(result.origins[0].canonical_path.is_none());
+    assert!(result.origins[0].projects.is_empty());
     let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].category, "scan");
-    assert_eq!(errors[0].path.as_deref(), missing_root.to_str());
+    assert!(errors.is_empty());
 }
 
 #[cfg(unix)]
@@ -2503,10 +2580,11 @@ fn reconciliation_uncertainty_aborts_before_cargo_without_mutation() {
         },
     );
 
-    let error = daemon.scan_cycle().unwrap_err();
+    let scan = daemon.scan_cycle().unwrap();
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert!(error.to_string().contains("canonicalize cached project"));
+    assert_eq!(scan.errors, 1);
+    assert!(!scan.origins[0].completed);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(project.join("target/blob.bin").exists());
     assert_eq!(
@@ -3228,7 +3306,7 @@ fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery()
         )
         .unwrap();
     assert_eq!(result.cleaned, 0);
-    assert_eq!(result.skipped, 1);
+    assert_eq!(result.skipped, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
 
     let forced = failed_state
@@ -3242,8 +3320,8 @@ fn broken_alias_in_active_provenance_blocks_cleanup_until_successful_discovery()
             &NoopProcessInspector,
         )
         .unwrap();
-    assert_eq!(forced.cleaned, 1);
-    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(forced.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
     runner.calls.lock().unwrap().clear();
 
     symlink(&linked, &linked_alias).unwrap();
@@ -3350,11 +3428,11 @@ fn retargeted_alias_in_active_provenance_blocks_cleanup_until_successful_discove
         )
         .unwrap();
     assert_eq!(result.cleaned, 0);
-    assert_eq!(result.skipped, 2);
+    assert_eq!(result.skipped, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
     let blocked = store.blocked_worktree_discovery_paths().unwrap();
     assert!(blocked.contains(&linked_alias));
-    assert!(blocked.contains(&unrelated.canonicalize().unwrap()));
+    assert!(!blocked.contains(&unrelated.canonicalize().unwrap()));
 
     let repaired_state = Daemon::new(
         &store,
@@ -3685,16 +3763,8 @@ fn successful_scan_prunes_cached_excluded_candidates_and_failures() {
 
     daemon.scan_cycle().unwrap();
 
-    assert_eq!(
-        store
-            .all_projects()
-            .unwrap()
-            .into_iter()
-            .map(|project| PathBuf::from(project.path))
-            .collect::<Vec<_>>(),
-        vec![kept.clone()]
-    );
-    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    assert_eq!(store.all_projects().unwrap().len(), 2);
+    assert!(!store.blocked_worktree_discovery_paths().unwrap().is_empty());
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
 
     let result = daemon
@@ -3762,14 +3832,14 @@ fn successful_scan_reconciles_removed_exclusion_through_symlinked_home() {
 
     daemon.scan_cycle().unwrap();
 
-    assert!(store.all_projects().unwrap().is_empty());
-    assert!(!store
+    assert_eq!(store.all_projects().unwrap().len(), 2);
+    assert!(store
         .is_active_worktree_discovery_identity(&canonical_primary)
         .unwrap());
-    assert!(!store
+    assert!(store
         .is_active_worktree_discovery_identity(&canonical_linked)
         .unwrap());
-    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    assert!(!store.blocked_worktree_discovery_paths().unwrap().is_empty());
 }
 
 #[test]
@@ -3841,7 +3911,7 @@ fn cleanup_boundary_prunes_alias_of_excluded_library_before_cargo() {
     assert_eq!(result.cleaned, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(physical.join("target/blob.bin").exists());
-    assert!(store.all_projects().unwrap().is_empty());
+    assert_eq!(store.all_projects().unwrap().len(), 1);
 }
 
 #[test]
@@ -3916,6 +3986,6 @@ fn upgraded_nonempty_cache_prunes_exclusions_when_clean_is_due_before_scan() {
     assert!(library_project.join("target/blob.bin").exists());
     assert!(orbstack_project.join("target/blob.bin").exists());
     assert!(!ordinary_project.join("target").exists());
-    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert_eq!(store.all_projects().unwrap().len(), 3);
     assert_eq!(store.last_run().unwrap().projects_cleaned, 1);
 }

@@ -3,9 +3,11 @@ use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
 use crate::daemon::{Daemon, DaemonOptions};
+use crate::identity::SystemIdentityProvider;
 use crate::lockfile;
 use crate::logging::Logger;
 use crate::outcome::CommandOutcome;
+use crate::policy::{ProcessEnvironment, ScopePolicy};
 use crate::safety::{
     review_project_with_discovery_blocks, review_summary, CleanDecision, ProjectClass,
     ProjectReview, SafetyOptions, SkipReason,
@@ -17,9 +19,11 @@ use crate::service::{
 use crate::store::{ErrorRecord, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_PREVIEW_LIMIT: usize = 20;
@@ -204,6 +208,8 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Scan for projects, then run one cleanup review/cycle now.
     Run {
@@ -353,7 +359,11 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             json,
             all,
         } => projects(config, state_dir, risky, active, json, all),
-        Commands::Scan { config, state_dir } => scan(config, state_dir),
+        Commands::Scan {
+            config,
+            state_dir,
+            json,
+        } => scan(config, state_dir, json),
         Commands::Run {
             config,
             state_dir,
@@ -491,18 +501,25 @@ fn status(
     state_dir: Option<PathBuf>,
     refresh: bool,
 ) -> Result<CommandOutcome> {
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     let store = open_store(state_dir.as_deref())?;
     let mut outcome = CommandOutcome::Complete;
     if refresh {
-        reconcile_review_state(&store, &cfg)?;
+        reconcile_review_state(&store, &cfg, &policy)?;
         let safety = SafetyOptions {
             target_quiet_period: cfg.target_quiet_period,
             include_managed_cache: false,
             include_active: false,
             force: false,
         };
-        let batch = project_reviews(&store, &safety, cfg.scan_interval, "status --refresh")?;
+        let batch = project_reviews(
+            &store,
+            &policy,
+            &safety,
+            cfg.scan_interval,
+            "status --refresh",
+        )?;
         if batch.coverage_incomplete {
             outcome = outcome.merge(CommandOutcome::Incomplete);
         }
@@ -558,16 +575,17 @@ fn projects(
     json: bool,
     all: bool,
 ) -> Result<CommandOutcome> {
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     let store = open_store(state_dir.as_deref())?;
-    reconcile_review_state(&store, &cfg)?;
+    reconcile_review_state(&store, &cfg, &policy)?;
     let safety = SafetyOptions {
         target_quiet_period: cfg.target_quiet_period,
         include_managed_cache: risky,
         include_active: active,
         force: false,
     };
-    let batch = project_reviews(&store, &safety, cfg.scan_interval, "projects")?;
+    let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "projects")?;
     let reviews = batch.reviews;
 
     if json {
@@ -601,19 +619,70 @@ fn projects(
     })
 }
 
-fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<CommandOutcome> {
+fn scan(
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    json: bool,
+) -> Result<CommandOutcome> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     let store = open_store_at(&path_set)?;
-    scan_and_report(&store, &cfg)
+    scan_and_report(&store, &cfg, &policy, json)
 }
 
-fn scan_and_report(store: &Store, cfg: &Config) -> Result<CommandOutcome> {
-    let result = daemon_for_scan(store, cfg).scan_cycle()?;
-    println!("Scan complete: errors={}", result.errors);
-    Ok(if result.errors == 0 {
+fn scan_and_report(
+    store: &Store,
+    cfg: &Config,
+    policy: &ScopePolicy,
+    json: bool,
+) -> Result<CommandOutcome> {
+    let result = daemon_for_scan(store, cfg, policy).scan_cycle()?;
+    let projects = result
+        .origins
+        .iter()
+        .flat_map(|origin| origin.projects.iter().map(|project| project.path.clone()))
+        .collect::<BTreeSet<_>>();
+    if json {
+        let origins = result
+            .origins
+            .iter()
+            .map(|origin| {
+                serde_json::json!({
+                    "kind": origin.kind,
+                    "path": origin.configured_path,
+                    "canonical_path": origin.canonical_path,
+                    "completed": origin.completed,
+                    "error": origin.error,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "generation": result.generation,
+                "policy_hash": result.policy_hash,
+                "origins": origins,
+                "projects": projects,
+            }))?
+        );
+    } else {
+        println!("Scan complete: errors={}", result.errors);
+        println!(
+            "Authority: generation={} policy_hash={}",
+            result.generation, result.policy_hash
+        );
+        for origin in result.origins.iter().filter(|origin| !origin.completed) {
+            println!(
+                "Incomplete origin: {} ({})",
+                origin.configured_path.display(),
+                origin.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
+    Ok(if result.origins.iter().all(|origin| origin.completed) {
         CommandOutcome::Complete
     } else {
         CommandOutcome::Incomplete
@@ -634,7 +703,8 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     let safety = SafetyOptions {
         target_quiet_period: cfg.target_quiet_period,
         include_managed_cache,
@@ -645,12 +715,12 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
 
     let mut outcome = CommandOutcome::Complete;
     if !no_scan {
-        outcome = outcome.merge(scan_and_report(&store, &cfg)?);
+        outcome = outcome.merge(scan_and_report(&store, &cfg, &policy, false)?);
     }
 
     if dry_run {
-        reconcile_review_state(&store, &cfg)?;
-        let batch = project_reviews(&store, &safety, cfg.scan_interval, "dry-run")?;
+        reconcile_review_state(&store, &cfg, &policy)?;
+        let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "dry-run")?;
         let reviews = batch.reviews;
         print_review_summary("Dry run", &reviews);
         print_skip_breakdown(&review_summary(&reviews));
@@ -662,7 +732,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
     }
 
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
-    let daemon = daemon_for_clean(&store, &cfg, cargo);
+    let daemon = daemon_for_clean(&store, &cfg, cargo, &policy);
     let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
     println!(
         "Run complete: cleaned={} skipped={} recovered={} errors={}",
@@ -686,12 +756,26 @@ struct ReviewBatch {
 
 fn project_reviews(
     store: &Store,
+    policy: &ScopePolicy,
     safety: &SafetyOptions,
     scan_interval: Duration,
     source: &str,
 ) -> Result<ReviewBatch> {
     let now = SystemTime::now();
-    let projects = store.all_projects()?;
+    let generation = store.current_generation(policy.hash())?;
+    let authorized_paths = match &generation {
+        Some(generation) => store
+            .authorized_observations(generation.id)?
+            .into_iter()
+            .map(|observation| observation.project_path)
+            .collect::<BTreeSet<_>>(),
+        None => BTreeSet::new(),
+    };
+    let projects = store
+        .all_projects()?
+        .into_iter()
+        .filter(|project| authorized_paths.contains(Path::new(&project.path)))
+        .collect::<Vec<_>>();
     let paths: Vec<PathBuf> = projects
         .iter()
         .map(|project| PathBuf::from(&project.path))
@@ -721,7 +805,9 @@ fn project_reviews(
     store.record_review_status(now, source, &review_summary(&reviews))?;
     Ok(ReviewBatch {
         reviews,
-        coverage_incomplete: scan_coverage_incomplete || !discovery_blocks.is_empty(),
+        coverage_incomplete: generation.is_none()
+            || scan_coverage_incomplete
+            || !discovery_blocks.is_empty(),
     })
 }
 
@@ -915,12 +1001,13 @@ fn class_label(class: ProjectClass) -> &'static str {
 fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path).context("daemon already running")?;
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     let logger = Logger::new(&path_set.log_path)?;
     logger.info("daemon starting");
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
     let store = open_store_at(&path_set)?;
-    let daemon = daemon_for_clean(&store, &cfg, cargo).with_logger(logger);
+    let daemon = daemon_for_clean(&store, &cfg, cargo, &policy).with_logger(logger);
     daemon.run_forever()
 }
 
@@ -966,15 +1053,23 @@ fn logs(state_dir: Option<PathBuf>, errors_only: bool, tail: usize) -> Result<()
 }
 
 fn load_config(config_path: Option<PathBuf>) -> Result<Config> {
+    load_config_with_source(config_path).map(|(config, _)| config)
+}
+
+fn load_config_with_source(config_path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     let path = config_path.unwrap_or_else(default_path);
-    let cfg = load(path)?;
+    let cfg = load(&path)?;
     cfg.validate()?;
     if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
         eprintln!(
             "warning: `excludes` is deprecated in v0.4; run `car-go-clean config migrate` to rename it to `override_excludes` before v0.5"
         );
     }
-    Ok(cfg)
+    Ok((cfg, path))
+}
+
+fn build_policy(cfg: &Config, config_source: &Path) -> Result<ScopePolicy> {
+    ScopePolicy::build(cfg, config_source, &ProcessEnvironment)
 }
 
 fn open_store(state_dir: Option<&Path>) -> Result<Store> {
@@ -998,11 +1093,15 @@ fn paths_for(state_dir: Option<&Path>) -> PathSet {
     path_set
 }
 
-fn daemon_for_scan<'a>(store: &'a Store, cfg: &Config) -> Daemon<'a, RealRunner> {
+fn daemon_for_scan<'a>(
+    store: &'a Store,
+    cfg: &Config,
+    policy: &ScopePolicy,
+) -> Daemon<'a, RealRunner> {
     Daemon::new(
         store,
         Cache::new(store),
-        scanner_for(cfg),
+        scanner_for(cfg, policy),
         Cleaner::new("cargo", RealRunner, cfg.clean_interval),
         DaemonOptions {
             clean_interval: cfg.clean_interval,
@@ -1012,8 +1111,8 @@ fn daemon_for_scan<'a>(store: &'a Store, cfg: &Config) -> Daemon<'a, RealRunner>
     )
 }
 
-fn reconcile_review_state(store: &Store, cfg: &Config) -> Result<()> {
-    daemon_for_scan(store, cfg).reconcile_cached_state()?;
+fn reconcile_review_state(store: &Store, cfg: &Config, policy: &ScopePolicy) -> Result<()> {
+    daemon_for_scan(store, cfg, policy).reconcile_cached_state()?;
     Ok(())
 }
 
@@ -1021,11 +1120,12 @@ fn daemon_for_clean<'a>(
     store: &'a Store,
     cfg: &Config,
     cargo_bin: PathBuf,
+    policy: &ScopePolicy,
 ) -> Daemon<'a, RealRunner> {
     Daemon::new(
         store,
         Cache::new(store),
-        scanner_for(cfg),
+        scanner_for(cfg, policy),
         Cleaner::new(cargo_bin, RealRunner, cfg.clean_interval),
         DaemonOptions {
             clean_interval: cfg.clean_interval,
@@ -1035,12 +1135,13 @@ fn daemon_for_clean<'a>(
     )
 }
 
-fn scanner_for(cfg: &Config) -> Scanner {
+fn scanner_for(cfg: &Config, policy: &ScopePolicy) -> Scanner {
     Scanner::new(ScannerOptions {
         roots: cfg.scan_dirs.clone(),
         project_dirs: cfg.project_dirs.clone(),
         excludes: cfg.effective_excludes(),
     })
+    .with_authority(policy.clone(), Arc::new(SystemIdentityProvider))
 }
 
 fn parse_since(value: &str) -> Result<Duration> {

@@ -5,11 +5,18 @@ use crate::logging::Logger;
 use crate::safety::{
     review_project_with_discovery_blocks, review_summary, CleanDecision, SafetyOptions,
 };
-use crate::scanner::{ScanErrorKind, Scanner, WorktreeDiscovery};
-use crate::store::{CleanEvent, ErrorRecord, SchedulerStatus, Store};
+use crate::scanner::{
+    DiscoveryOriginKind as ScannerOriginKind, DiscoveryOriginResult, ScanErrorKind, Scanner,
+    WorktreeDiscovery,
+};
+use crate::store::{
+    CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
+    ObservationReconciliation, OriginReconciliation, Project, SchedulerStatus, Store,
+};
 use anyhow::Result;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -71,9 +78,12 @@ pub struct RunCycleResult {
     pub coverage_incomplete: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanCycleResult {
     pub errors: usize,
+    pub generation: i64,
+    pub policy_hash: String,
+    pub origins: Vec<DiscoveryOriginResult>,
 }
 
 pub struct Daemon<'a, R: CommandRunner> {
@@ -117,7 +127,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let now = SystemTime::now();
         let report = self.scanner.scan_with_errors()?;
         let error_count = report.errors.len();
-        for error in report.errors {
+        for error in &report.errors {
             self.store.record_error(&ErrorRecord {
                 id: 0,
                 ts: now,
@@ -127,11 +137,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 }
                 .to_string(),
                 path: error.path.to_str().map(str::to_owned),
-                message: error.message,
+                message: error.message.clone(),
             })?;
         }
         self.reconcile_cached_state()?;
-        for discovery in report.worktree_discoveries {
+        for discovery in &report.worktree_discoveries {
             match discovery {
                 WorktreeDiscovery::Success {
                     primary,
@@ -140,32 +150,44 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     out_of_scope,
                 } => {
                     self.store.replace_linked_worktrees_with_reconciliation(
-                        &primary,
-                        &linked,
-                        &excluded,
-                        &out_of_scope,
+                        primary,
+                        linked,
+                        excluded,
+                        out_of_scope,
                     )?;
                 }
                 WorktreeDiscovery::Failure { primary, message } => {
                     self.store
-                        .mark_worktree_discovery_failed(&primary, now, &message)?;
+                        .mark_worktree_discovery_failed(primary, now, message)?;
                 }
             }
         }
-        for path in report.projects {
-            if let Err(err) = self.store.upsert_project(&path, now) {
+        let reconciliation = generation_reconciliation(&report, now);
+        let generation = match self.store.reconcile_generation(now, &reconciliation) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let path = report
+                    .origins
+                    .iter()
+                    .flat_map(|origin| &origin.projects)
+                    .next()
+                    .and_then(|project| project.path.to_str())
+                    .map(str::to_owned);
                 let _ = self.store.record_error(&ErrorRecord {
                     id: 0,
                     ts: now,
                     category: "cache".to_string(),
-                    path: path.to_str().map(str::to_owned),
-                    message: err.to_string(),
+                    path,
+                    message: error.to_string(),
                 });
-                return Err(err);
+                return Err(error);
             }
-        }
+        };
         Ok(ScanCycleResult {
             errors: error_count,
+            generation: generation.id,
+            policy_hash: generation.policy_hash,
+            origins: report.origins,
         })
     }
 
@@ -188,7 +210,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self.reconcile_cached_state()?;
         let started = SystemTime::now();
         let run_id = self.store.start_run(started)?;
-        let projects = self.store.all_projects()?;
+        let (projects, generation_missing) = self.authorized_projects()?;
         let project_paths: Vec<PathBuf> = projects
             .iter()
             .map(|project| PathBuf::from(&project.path))
@@ -201,7 +223,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .store
             .scan_coverage_incomplete_since(scan_error_since)?;
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
-        let coverage_incomplete = scan_coverage_incomplete || !discovery_blocks.is_empty();
+        let coverage_incomplete =
+            generation_missing || scan_coverage_incomplete || !discovery_blocks.is_empty();
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -326,6 +349,25 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         Ok(result)
     }
 
+    fn authorized_projects(&self) -> Result<(Vec<Project>, bool)> {
+        let Some(generation) = self.store.current_generation(self.scanner.policy_hash())? else {
+            return Ok((Vec::new(), true));
+        };
+        let authorized_paths = self
+            .store
+            .authorized_observations(generation.id)?
+            .into_iter()
+            .map(|observation| observation.project_path)
+            .collect::<BTreeSet<_>>();
+        let projects = self
+            .store
+            .all_projects()?
+            .into_iter()
+            .filter(|project| authorized_paths.contains(Path::new(&project.path)))
+            .collect();
+        Ok((projects, false))
+    }
+
     fn log_run_cycle(&self, result: &RunCycleResult) {
         let Some(logger) = &self.logger else {
             return;
@@ -354,7 +396,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_until_shutdown(&self, shutdown: &ShutdownFlag) -> Result<()> {
-        let initial_scan_error = if self.store.all_projects()?.is_empty() {
+        let initial_scan_error = if !self
+            .store
+            .has_matching_generation(self.scanner.policy_hash())?
+        {
             self.scan_cycle().err()
         } else {
             None
@@ -451,6 +496,55 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             status.next_scan_at,
         )?;
         Ok(status)
+    }
+}
+
+fn generation_reconciliation(
+    report: &crate::scanner::ScanReport,
+    observed_at: SystemTime,
+) -> GenerationReconciliation {
+    let mut authorized_projects = BTreeSet::new();
+    let origins = report
+        .origins
+        .iter()
+        .map(|origin| {
+            let observations = origin
+                .projects
+                .iter()
+                .map(|project| {
+                    let authorized =
+                        origin.completed && authorized_projects.insert(project.path.clone());
+                    ObservationReconciliation {
+                        project_path: project.path.clone(),
+                        project_identity: project.project_identity.clone(),
+                        target_identity: project.target_identity.clone(),
+                        observed_at,
+                        authorized,
+                        blocked_reason: (!authorized && origin.completed)
+                            .then(|| "duplicate observation from overlapping origin".to_string()),
+                    }
+                })
+                .collect();
+            OriginReconciliation {
+                kind: match origin.kind {
+                    ScannerOriginKind::ScanRoot => DiscoveryOriginKind::ScanRoot,
+                    ScannerOriginKind::ExplicitProject => DiscoveryOriginKind::ExplicitProject,
+                },
+                configured_path: origin.configured_path.clone(),
+                canonical_path: origin.canonical_path.clone(),
+                completed: origin.completed,
+                error: origin.error.clone(),
+                observations,
+            }
+        })
+        .collect();
+    GenerationReconciliation {
+        policy_hash: report.policy_hash.clone(),
+        boot_session_id: report
+            .boot_session_id
+            .as_ref()
+            .map(|boot_session| boot_session.0.clone()),
+        origins,
     }
 }
 
