@@ -477,9 +477,9 @@ git commit -m "feat: add state-preserving v0.4 upgrades"
 - Consumes: exact CLI/service/helper behavior from Tasks 1–5.
 - Produces: human and Agent Quick Start guidance that runs against the real CLI.
 
-- [ ] **Step 1: Add documentation contract tests**
+- [ ] **Step 1: Define the documentation coverage checklist**
 
-Require docs to include:
+The written guidance must cover:
 
 - `run --dry-run` producing a review ID;
 - `run --review <ID>`;
@@ -491,6 +491,10 @@ Require docs to include:
 - `loginctl enable-linger $USER`;
 - v0.2/v0.3 active/stopped/absent upgrades and rollback;
 - legacy `excludes` migration/removal timeline.
+
+Do not add tests that grep for these prose requirements or exact section
+names. Human-facing prose is reviewed as documentation; automated coverage
+belongs to the executable commands and examples in Step 3.
 
 - [ ] **Step 2: Update all command examples**
 
@@ -505,7 +509,10 @@ Explain that bare `run` remains dynamic and is appropriate only when the operato
 
 - [ ] **Step 3: Add executable Agent Quick Start checks**
 
-Extract shell blocks or maintain explicit command fixtures so `tests/packaging.rs` runs `--help` and validates every documented flag/subcommand.
+Maintain explicit command fixtures so `tests/packaging.rs` invokes the real
+binary for every documented flag/subcommand and `tests/upgrade.sh` executes
+the upgrade examples against controlled released-version fixtures. Assert
+exit status and observable output/state, not README source text.
 
 - [ ] **Step 4: Run docs and packaging checks**
 

@@ -526,9 +526,12 @@ git commit -m "test: add fresh release acceptance harness"
 - Consumes: behavior proven by runtime, operator, release, and VM acceptance.
 - Produces: a comprehensive owner-oriented walkthrough linked from the README.
 
-- [ ] **Step 1: Add documentation contract tests**
+- [ ] **Step 1: Define the owner-tour coverage checklist**
 
-Require the tour to include every section below and require every shown CLI flag to exist in `car-go-clean --help`.
+The tour must include every section below. Do not add tests that grep for
+section names or exact prose. Automated coverage belongs to the guided lab:
+execute every shown CLI command against an isolated fixture and require each
+flag to be accepted by the real binary.
 
 - [ ] **Step 2: Write the tour around operator questions**
 
@@ -556,10 +559,10 @@ Include a compact glossary and “If you remember only five things.”
 
 Add a short “Owner’s tour” link near Quick Start; do not copy the full guide into README.
 
-- [ ] **Step 4: Run documentation checks**
+- [ ] **Step 4: Run executable walkthrough checks**
 
 ```bash
-cargo test --locked --test packaging owner_tour
+cargo test --locked --test packaging documented_commands_execute
 make test-release-notes
 ```
 
