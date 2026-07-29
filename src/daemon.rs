@@ -68,6 +68,12 @@ pub struct RunCycleResult {
     pub skipped: i64,
     pub bytes_recovered: i64,
     pub errors: i64,
+    pub coverage_incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCycleResult {
+    pub errors: usize,
 }
 
 pub struct Daemon<'a, R: CommandRunner> {
@@ -107,9 +113,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .reconcile_for_review(|path| self.scanner.is_excluded(path))
     }
 
-    pub fn scan_cycle(&self) -> Result<()> {
+    pub fn scan_cycle(&self) -> Result<ScanCycleResult> {
         let now = SystemTime::now();
         let report = self.scanner.scan_with_errors()?;
+        let error_count = report.errors.len();
         for error in report.errors {
             self.store.record_error(&ErrorRecord {
                 id: 0,
@@ -157,7 +164,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 return Err(err);
             }
         }
-        Ok(())
+        Ok(ScanCycleResult {
+            errors: error_count,
+        })
     }
 
     pub fn run_cycle(&self) -> Result<()> {
@@ -189,6 +198,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
+        let coverage_incomplete = !scan_errors.is_empty() || !discovery_blocks.is_empty();
         let activity = inspector.active_projects(&project_paths)?;
         let mut reviews = Vec::with_capacity(projects.len());
 
@@ -293,6 +303,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             skipped,
             bytes_recovered,
             errors: errors_count,
+            coverage_incomplete,
         };
         self.log_run_cycle(&result);
         Ok(result)
@@ -312,6 +323,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             Value::from(result.bytes_recovered),
         );
         fields.insert("errors".to_string(), Value::from(result.errors));
+        fields.insert(
+            "coverage_incomplete".to_string(),
+            Value::from(result.coverage_incomplete),
+        );
         logger.info_fields("clean cycle complete", fields);
     }
 

@@ -384,7 +384,7 @@ fn first_v4_scan_reconciles_v3_cached_out_of_scope_worktree_without_provenance()
         .args(["--state-dir"])
         .arg(state_dir.path())
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 0"))
         .stdout(contains(canonical_outside.display().to_string()).not());
 }
@@ -2266,6 +2266,34 @@ fn daemon_scan_cycle_records_unreadable_directories_as_scan_errors() {
         Some(blocked.canonicalize().unwrap().to_str().unwrap())
     );
     assert!(errors[0].message.contains("Permission denied"));
+}
+
+#[test]
+fn daemon_scan_cycle_returns_errors_for_a_missing_absolute_root() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let missing_root = db_dir.path().join("missing-root");
+    assert!(missing_root.is_absolute());
+
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: vec![missing_root.clone()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    let result = daemon.scan_cycle().unwrap();
+    assert_eq!(result.errors, 1);
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].category, "scan");
+    assert_eq!(errors[0].path.as_deref(), missing_root.to_str());
 }
 
 #[cfg(unix)]

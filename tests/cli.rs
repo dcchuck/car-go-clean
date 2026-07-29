@@ -7,6 +7,304 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 #[test]
+fn exit_code_zero_for_complete_scan() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .assert()
+        .code(0)
+        .stdout(contains("Scan complete: errors=0"));
+}
+
+#[test]
+fn exit_code_two_for_incomplete_scan() {
+    let work = tempfile::tempdir().unwrap();
+    let missing_root = work.path().join("missing-root");
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("scan_dirs = [\"{}\"]\n", missing_root.display()),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .code(2)
+        .stdout(contains("Scan complete: errors=1"));
+
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_code_two_after_cleaning_with_incomplete_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let missing_root = work.path().join("missing-root");
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\", \"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display(),
+            missing_root.display()
+        ),
+    )
+    .unwrap();
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, "#!/bin/sh\nrm -rf target\n").unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", path)
+        .assert()
+        .code(2)
+        .stdout(contains("Run complete: cleaned=1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_code_one_for_cargo_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, "#!/bin/sh\nprintf failed >&2\nexit 7\n").unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", path)
+        .assert()
+        .code(1)
+        .stdout(contains("Run complete: cleaned=0"))
+        .stdout(contains("errors=1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_code_one_outranks_incomplete_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\", \"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display(),
+            work.path().join("missing-root").display()
+        ),
+    )
+    .unwrap();
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, "#!/bin/sh\nexit 7\n").unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", path)
+        .assert()
+        .code(1)
+        .stdout(contains("Run complete: cleaned=0"));
+}
+
+#[test]
+fn exit_code_two_for_no_scan_with_durable_discovery_block() {
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("tree/project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob"), vec![0; 2048]).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("scan_dirs = [\"{}\"]\n", work.path().join("tree").display()),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let canonical = project.canonicalize().unwrap();
+    store.upsert_project(&canonical, SystemTime::now()).unwrap();
+    store
+        .mark_worktree_discovery_failed(&canonical, SystemTime::now(), "git failed")
+        .unwrap();
+    drop(store);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--no-scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .code(2)
+        .stdout(contains("Dry run"));
+}
+
+#[test]
+fn exit_code_zero_for_safety_only_skip() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(project.join("target/blob"), vec![0; 2048]).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"24h\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .assert()
+        .code(0)
+        .stdout(contains("recent_write=1"));
+}
+
+#[test]
+fn exit_code_one_for_config_and_lock_failures() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = work.path().join("cargo-ran");
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let invalid = work.path().join("invalid.toml");
+    fs::write(&invalid, "unknown_key = true\n").unwrap();
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&invalid)
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", &path)
+        .assert()
+        .code(1);
+
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("scan_dirs = [\"{}\"]\n", work.path().display()),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(state.join("daemon.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", work.path().join("missing-home"))
+        .env("PATH", &path)
+        .assert()
+        .code(1);
+    assert!(!marker.exists());
+}
+
+#[test]
 fn service_help_lists_only_explicit_lifecycle_actions() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
@@ -216,7 +514,7 @@ fn run_dry_run_scans_fresh_state_by_default() {
         .arg(&state)
         .assert()
         .success()
-        .stdout(contains("Scan complete\nDry run"))
+        .stdout(contains("Scan complete: errors=0\nDry run"))
         .stdout(contains("Total projects: 1"))
         .stdout(contains("Cleanable projects: 1"))
         .stdout(contains(project.join("target").display().to_string()));
@@ -368,7 +666,7 @@ fn run_scans_fresh_state_before_real_cleanup() {
         .env("PATH", path)
         .assert()
         .success()
-        .stdout(contains("Scan complete\nRun complete: cleaned=1"));
+        .stdout(contains("Scan complete: errors=0\nRun complete: cleaned=1"));
 
     assert!(!project.join("target").exists());
 }
@@ -594,6 +892,7 @@ fn scan_run_stats_work_with_fake_cargo() {
             .args(["--state-dir"])
             .arg(&state)
             .env("PATH", &path)
+            .env("HOME", work.path().join("missing-home"))
             .assert()
             .success();
     }
@@ -822,7 +1121,7 @@ fn non_forced_cli_reviews_honor_durable_discovery_blocks_and_force_bypasses_them
             .args(["--state-dir"])
             .arg(&state)
             .assert()
-            .success()
+            .code(2)
             .stdout(contains("scan_error"));
     }
 
@@ -834,7 +1133,7 @@ fn non_forced_cli_reviews_honor_durable_discovery_blocks_and_force_bypasses_them
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 1"));
 }
 
@@ -889,7 +1188,7 @@ fn cli_reviews_normalize_alias_only_linked_provenance_without_a_prior_scan() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("skipped:scan_error"))
         .stdout(contains(canonical_child.display().to_string()));
 
@@ -913,7 +1212,7 @@ fn cli_reviews_normalize_alias_only_linked_provenance_without_a_prior_scan() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 0"))
         .stdout(contains("scan_error=1"));
 
@@ -925,7 +1224,7 @@ fn cli_reviews_normalize_alias_only_linked_provenance_without_a_prior_scan() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 1"))
         .stdout(contains(
             canonical_child.join("target").display().to_string(),
@@ -1007,7 +1306,7 @@ fn cli_run_blocks_canonical_child_for_broken_alias_in_active_provenance() {
         .arg(&state)
         .env("PATH", &path)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("cleaned=0"))
         .stdout(contains("skipped=2"));
     assert!(child.join("target/debug/blob.bin").exists());
@@ -1021,7 +1320,7 @@ fn cli_run_blocks_canonical_child_for_broken_alias_in_active_provenance() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Cleanable projects: 1"));
 }
 
@@ -1108,7 +1407,7 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains(format!(
             "skipped:scan_error\tworkspace\t4096\t{}",
             canonical_child.display()
@@ -1127,7 +1426,7 @@ fn cli_run_blocks_canonical_child_for_retargeted_alias_in_active_provenance() {
         .arg(&state)
         .env("PATH", &path)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("cleaned=0"))
         .stdout(contains("skipped=3"));
     assert!(child.join("target/debug/blob.bin").exists());
@@ -1247,7 +1546,7 @@ fn cli_blocks_v4_primary_alias_associations_after_fresh_canonical_failure() {
             .args(["--state-dir"])
             .arg(&state)
             .assert()
-            .success()
+            .code(2)
             .stdout(contains("skipped:scan_error"))
             .stdout(contains(canonical_child.display().to_string()));
 
@@ -1260,7 +1559,7 @@ fn cli_blocks_v4_primary_alias_associations_after_fresh_canonical_failure() {
             .arg(&state)
             .env("PATH", &path)
             .assert()
-            .success()
+            .code(2)
             .stdout(contains("cleaned=0"));
         assert!(!marker.exists());
         assert!(child.join("target/blob.bin").exists());
@@ -1968,7 +2267,7 @@ fn cli_reused_v4_untrusted_primary_does_not_release_historical_child() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("skipped:scan_error"))
         .stdout(contains(canonical_child.display().to_string()));
     Command::cargo_bin("car-go-clean")
@@ -1980,7 +2279,7 @@ fn cli_reused_v4_untrusted_primary_does_not_release_historical_child() {
         .arg(&state)
         .env("PATH", &path)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("cleaned=0"));
 
     assert!(!marker.exists());
@@ -2080,7 +2379,7 @@ fn cli_successful_discovery_resolves_only_its_effective_scan_error() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains(format!(
             "cleanable\tworkspace\t4096\t{}",
             canonical_linked.display()
@@ -2095,7 +2394,7 @@ fn cli_successful_discovery_resolves_only_its_effective_scan_error() {
         .env("HOME", &work_path)
         .env("PATH", &path)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("cleaned=1"));
 
     assert!(marker.exists());

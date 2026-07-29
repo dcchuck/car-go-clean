@@ -5,6 +5,7 @@ use crate::config::{default_path, load, paths, prepare_migration, Config, Config
 use crate::daemon::{Daemon, DaemonOptions};
 use crate::lockfile;
 use crate::logging::Logger;
+use crate::outcome::CommandOutcome;
 use crate::safety::{
     review_project_with_discovery_blocks, review_summary, CleanDecision, ProjectClass,
     ProjectReview, SafetyOptions, SkipReason,
@@ -284,27 +285,33 @@ enum ConfigCommands {
     Migrate,
 }
 
-pub fn run() -> Result<()> {
-    execute(Cli::parse())
+pub fn run() -> std::process::ExitCode {
+    match execute(Cli::parse()) {
+        Ok(outcome) => std::process::ExitCode::from(outcome.code()),
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::from(CommandOutcome::Failed.code())
+        }
+    }
 }
 
-fn execute(cli: Cli) -> Result<()> {
+fn execute(cli: Cli) -> Result<CommandOutcome> {
     match cli.command {
         Commands::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            Ok(CommandOutcome::Complete)
         }
-        Commands::Service { command } => service(command),
+        Commands::Service { command } => service(command).map(|_| CommandOutcome::Complete),
         Commands::Health {
             config,
             state_dir,
             skip_cargo,
-        } => health(config, state_dir, skip_cargo),
+        } => health(config, state_dir, skip_cargo).map(|_| CommandOutcome::Complete),
         Commands::Config { command, config } => match command {
             None => {
                 let cfg = load_config(config)?;
                 print!("{}", cfg.to_toml()?);
-                Ok(())
+                Ok(CommandOutcome::Complete)
             }
             Some(ConfigCommands::Migrate) => {
                 let path = config.unwrap_or_else(default_path);
@@ -316,7 +323,7 @@ fn execute(cli: Cli) -> Result<()> {
                     }
                     None => println!("No migration needed for {}", path.display()),
                 }
-                Ok(())
+                Ok(CommandOutcome::Complete)
             }
         },
         Commands::Status {
@@ -352,18 +359,20 @@ fn execute(cli: Cli) -> Result<()> {
             force,
             all,
         }),
-        Commands::Daemon { config, state_dir } => daemon(config, state_dir),
+        Commands::Daemon { config, state_dir } => {
+            daemon(config, state_dir).map(|_| CommandOutcome::Complete)
+        }
         Commands::Stats {
             since,
             top,
             json,
             state_dir,
-        } => stats(state_dir, since, top, json),
+        } => stats(state_dir, since, top, json).map(|_| CommandOutcome::Complete),
         Commands::Logs {
             errors_only,
             tail,
             state_dir,
-        } => logs(state_dir, errors_only, tail),
+        } => logs(state_dir, errors_only, tail).map(|_| CommandOutcome::Complete),
     }
 }
 
@@ -463,9 +472,14 @@ fn health(
     Ok(())
 }
 
-fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: bool) -> Result<()> {
+fn status(
+    config_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    refresh: bool,
+) -> Result<CommandOutcome> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
+    let mut outcome = CommandOutcome::Complete;
     if refresh {
         reconcile_review_state(&store, &cfg)?;
         let safety = SafetyOptions {
@@ -474,7 +488,10 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: boo
             include_active: false,
             force: false,
         };
-        project_reviews(&store, &safety, cfg.scan_interval, "status --refresh")?;
+        let batch = project_reviews(&store, &safety, cfg.scan_interval, "status --refresh")?;
+        if batch.coverage_incomplete {
+            outcome = outcome.merge(CommandOutcome::Incomplete);
+        }
     }
 
     let cached_projects = store.project_count()?;
@@ -516,7 +533,7 @@ fn status(config_path: Option<PathBuf>, state_dir: Option<PathBuf>, refresh: boo
 
     print_section("Schedule");
     print_scheduler_status(&store, &cfg)?;
-    Ok(())
+    Ok(outcome)
 }
 
 fn projects(
@@ -526,7 +543,7 @@ fn projects(
     active: bool,
     json: bool,
     all: bool,
-) -> Result<()> {
+) -> Result<CommandOutcome> {
     let cfg = load_config(config_path)?;
     let store = open_store(state_dir.as_deref())?;
     reconcile_review_state(&store, &cfg)?;
@@ -536,11 +553,16 @@ fn projects(
         include_active: active,
         force: false,
     };
-    let reviews = project_reviews(&store, &safety, cfg.scan_interval, "projects")?;
+    let batch = project_reviews(&store, &safety, cfg.scan_interval, "projects")?;
+    let reviews = batch.reviews;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&reviews)?);
-        return Ok(());
+        return Ok(if batch.coverage_incomplete {
+            CommandOutcome::Incomplete
+        } else {
+            CommandOutcome::Complete
+        });
     }
 
     if all {
@@ -558,10 +580,14 @@ fn projects(
         print_skip_breakdown(&review_summary(&reviews));
         print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, false);
     }
-    Ok(())
+    Ok(if batch.coverage_incomplete {
+        CommandOutcome::Incomplete
+    } else {
+        CommandOutcome::Complete
+    })
 }
 
-fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<CommandOutcome> {
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
@@ -570,13 +596,17 @@ fn scan(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> 
     scan_and_report(&store, &cfg)
 }
 
-fn scan_and_report(store: &Store, cfg: &Config) -> Result<()> {
-    daemon_for_scan(store, cfg).scan_cycle()?;
-    println!("Scan complete");
-    Ok(())
+fn scan_and_report(store: &Store, cfg: &Config) -> Result<CommandOutcome> {
+    let result = daemon_for_scan(store, cfg).scan_cycle()?;
+    println!("Scan complete: errors={}", result.errors);
+    Ok(if result.errors == 0 {
+        CommandOutcome::Complete
+    } else {
+        CommandOutcome::Incomplete
+    })
 }
 
-fn run_once(options: RunOptions) -> Result<()> {
+fn run_once(options: RunOptions) -> Result<CommandOutcome> {
     let RunOptions {
         config_path,
         state_dir,
@@ -599,17 +629,22 @@ fn run_once(options: RunOptions) -> Result<()> {
     };
     let store = open_store_at(&path_set)?;
 
+    let mut outcome = CommandOutcome::Complete;
     if !no_scan {
-        scan_and_report(&store, &cfg)?;
+        outcome = outcome.merge(scan_and_report(&store, &cfg)?);
     }
 
     if dry_run {
         reconcile_review_state(&store, &cfg)?;
-        let reviews = project_reviews(&store, &safety, cfg.scan_interval, "dry-run")?;
+        let batch = project_reviews(&store, &safety, cfg.scan_interval, "dry-run")?;
+        let reviews = batch.reviews;
         print_review_summary("Dry run", &reviews);
         print_skip_breakdown(&review_summary(&reviews));
         print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, all);
-        return Ok(());
+        if batch.coverage_incomplete {
+            outcome = outcome.merge(CommandOutcome::Incomplete);
+        }
+        return Ok(outcome);
     }
 
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
@@ -619,10 +654,20 @@ fn run_once(options: RunOptions) -> Result<()> {
         "Run complete: cleaned={} skipped={} recovered={} errors={}",
         result.cleaned, result.skipped, result.bytes_recovered, result.errors
     );
-    if result.errors > 0 {
-        bail!("{} cargo clean attempt(s) failed", result.errors);
-    }
-    Ok(())
+    outcome = outcome.merge(if result.errors > 0 {
+        CommandOutcome::Failed
+    } else if result.coverage_incomplete {
+        CommandOutcome::Incomplete
+    } else {
+        CommandOutcome::Complete
+    });
+    Ok(outcome)
+}
+
+#[derive(Debug)]
+struct ReviewBatch {
+    reviews: Vec<ProjectReview>,
+    coverage_incomplete: bool,
 }
 
 fn project_reviews(
@@ -630,7 +675,7 @@ fn project_reviews(
     safety: &SafetyOptions,
     scan_interval: Duration,
     source: &str,
-) -> Result<Vec<ProjectReview>> {
+) -> Result<ReviewBatch> {
     let now = SystemTime::now();
     let projects = store.all_projects()?;
     let paths: Vec<PathBuf> = projects
@@ -659,7 +704,10 @@ fn project_reviews(
         .collect::<Result<Vec<_>>>()?;
     record_review_diagnostics(store, &reviews)?;
     store.record_review_status(now, source, &review_summary(&reviews))?;
-    Ok(reviews)
+    Ok(ReviewBatch {
+        reviews,
+        coverage_incomplete: !scan_errors.is_empty() || !discovery_blocks.is_empty(),
+    })
 }
 
 fn print_review_summary(label: &str, reviews: &[ProjectReview]) {
