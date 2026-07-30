@@ -411,7 +411,7 @@ jobs:
             "$ISOLATED_ROOT/extracted" \
             "$ISOLATED_ROOT/installed/bin" \
             "$ISOLATED_ROOT/server/dcchuck/car-go-clean/releases/download/v$VERSION" \
-            "$ISOLATED_ROOT/formula"
+            "$ISOLATED_ROOT/formula-tap/Formula"
           tar -xJf "$archive" -C "$ISOLATED_ROOT/extracted"
           binary=$(find "$ISOLATED_ROOT/extracted" -type f -name car-go-clean -perm -111)
           test "$(printf '%s\n' "$binary" | awk 'NF {count++} END {print count + 0}')" -eq 1
@@ -442,11 +442,14 @@ jobs:
             --directory "$ISOLATED_ROOT/server" \
             > "$RUNNER_TEMP/rehearsal-http.log" 2>&1 &
           server_pid=$!
+          FORMULA_TAP=car-go-clean/rehearsal-smoke
           cleanup() {
             kill "$server_pid" >/dev/null 2>&1 || true
             if test "$(uname -s)" = Darwin && command -v brew >/dev/null 2>&1
             then
               HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --force car-go-clean \
+                >/dev/null 2>&1 || true
+              HOMEBREW_NO_AUTO_UPDATE=1 brew untap "$FORMULA_TAP" \
                 >/dev/null 2>&1 || true
             fi
           }
@@ -472,23 +475,27 @@ jobs:
           test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
 
-          scripts/render-homebrew-formula.sh \
+          scripts/render-local-homebrew-formula.sh \
             "v$VERSION" \
             "$ARTIFACT_DIR" \
-            "$ISOLATED_ROOT/formula/car-go-clean.release.rb"
-          sed 's#https://github.com/#http://127.0.0.1:8765/#g' \
-            "$ISOLATED_ROOT/formula/car-go-clean.release.rb" \
-            > "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb" \
+            "file://$ARTIFACT_DIR"
           if test "$(uname -s)" = Darwin
           then
             export HOMEBREW_NO_AUTO_UPDATE=1
             export HOMEBREW_NO_INSTALL_CLEANUP=1
-            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
+            git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release rehearsal"
+            git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+            git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
+            git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local rehearsal formula"
+            brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
+            brew install car-go-clean/rehearsal-smoke/car-go-clean
             brew test car-go-clean
             brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
             test "$("$brew_binary" version)" = "$VERSION"
           else
-            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            ruby -c "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
           fi
           test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"

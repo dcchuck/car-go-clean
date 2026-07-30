@@ -1201,8 +1201,9 @@ fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
         ".config/systemd/user/car-go-clean.service",
         "test ! -e \"$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist\"",
         "test ! -e \"$HOME/.config/systemd/user/car-go-clean.service\"",
-        "scripts/render-homebrew-formula.sh",
-        "brew install --formula",
+        "scripts/render-local-homebrew-formula.sh",
+        "brew tap --custom-remote",
+        "brew install car-go-clean/rehearsal-smoke/car-go-clean",
         "brew test car-go-clean",
         "brew_binary=\"$(brew --prefix car-go-clean)/bin/car-go-clean\"",
         "\"$brew_binary\" version",
@@ -1212,6 +1213,10 @@ fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
             "smoke step is missing `{fragment}`"
         );
     }
+    assert!(
+        !smoke_run.contains("brew install --formula"),
+        "pre-tag smoke must install the formula through a local tap"
+    );
 
     for job in ["build", "smoke"] {
         let steps = workflow_steps(&rehearsal, job);
