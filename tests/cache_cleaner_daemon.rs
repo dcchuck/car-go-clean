@@ -19,7 +19,7 @@ use car_go_clean::daemon::{
     RunSource, ShutdownFlag,
 };
 use car_go_clean::identity::{
-    BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
+    BootSessionId, FilesystemIdentity, IdentityProvider, MountIdentity, SystemIdentityProvider,
 };
 use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::policy::{Environment, ScopePolicy};
@@ -102,6 +102,36 @@ fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: 
 
 fn downgrade_runtime_database_to_version_nine(database: &Path) {
     let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute(
+            "DROP INDEX IF EXISTS idx_discovery_generations_single_valid",
+            [],
+        )
+        .unwrap();
+    if sqlite_column_exists(&connection, "project_observations", "project_mount_id") {
+        connection
+            .execute(
+                "ALTER TABLE project_observations DROP COLUMN project_mount_id",
+                [],
+            )
+            .unwrap();
+    }
+    if sqlite_column_exists(&connection, "project_observations", "target_mount_id") {
+        connection
+            .execute(
+                "ALTER TABLE project_observations DROP COLUMN target_mount_id",
+                [],
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "
+            DROP TABLE IF EXISTS review_plan_targets;
+            DROP TABLE IF EXISTS review_plans;
+            ",
+        )
+        .unwrap();
     if sqlite_column_exists(&connection, "scheduler_state", "scan_retry_at") {
         connection
             .execute("ALTER TABLE scheduler_state DROP COLUMN scan_retry_at", [])
@@ -226,6 +256,84 @@ fn failed_origin_preserves_history_but_grants_no_current_authority() {
     assert_eq!(
         store.all_projects().unwrap()[0].path,
         primary.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[test]
+fn daemon_scan_rolls_back_cleared_worktree_failure_when_generation_insert_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let linked = root.path().join("linked");
+    fs::create_dir_all(primary.join(".git")).unwrap();
+    write_file(&primary.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&linked.join("Cargo.toml"), b"[workspace]\n");
+    let scanner_options = ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    };
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let database = db_dir.path().join("state.db");
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    let failed_daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner_with_resolver(
+            scanner_options.clone(),
+            Arc::new(FakeWorktreeResolver::failure("preserved failure")),
+        ),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+    let previous_scan = failed_daemon.scan_cycle().unwrap();
+    let generation_before = store
+        .current_generation(&previous_scan.policy_hash)
+        .unwrap()
+        .unwrap();
+    let blocks_before = store.blocked_worktree_discovery_paths().unwrap();
+    let projects_before = store.all_projects().unwrap();
+    let diagnostics_before = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_generation_insert
+            BEFORE INSERT ON discovery_generations
+            BEGIN
+                SELECT RAISE(ABORT, 'injected generation insertion failure');
+            END;
+            ",
+        )
+        .unwrap();
+    let successful_daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner_with_resolver(
+            scanner_options,
+            Arc::new(FakeWorktreeResolver::paths(vec![linked])),
+        ),
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions::default(),
+    );
+
+    assert!(successful_daemon.scan_cycle().is_err());
+    assert_eq!(
+        store
+            .current_generation(&previous_scan.policy_hash)
+            .unwrap(),
+        Some(generation_before)
+    );
+    assert_eq!(
+        store.blocked_worktree_discovery_paths().unwrap(),
+        blocks_before
+    );
+    assert_eq!(store.all_projects().unwrap(), projects_before);
+    assert_eq!(
+        store.errors_since(SystemTime::UNIX_EPOCH).unwrap(),
+        diagnostics_before
     );
 }
 
@@ -1107,6 +1215,12 @@ struct FakeRunner {
     stderr: String,
 }
 
+#[derive(Clone)]
+struct ObservationBootRunner {
+    database: PathBuf,
+    observed_boots_at_run: Arc<Mutex<Vec<Option<String>>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeCall {
     dir: PathBuf,
@@ -1257,6 +1371,7 @@ struct SwitchableIdentityProvider {
     boot_phase: AtomicUsize,
     target_revision: AtomicUsize,
     cross_device: AtomicUsize,
+    target_mount_revision: AtomicUsize,
 }
 
 impl SwitchableIdentityProvider {
@@ -1271,6 +1386,10 @@ impl SwitchableIdentityProvider {
 
     fn move_target_to_other_device(&self) {
         self.cross_device.store(1, Ordering::SeqCst);
+    }
+
+    fn move_target_to_other_mount(&self) {
+        self.target_mount_revision.store(1, Ordering::SeqCst);
     }
 }
 
@@ -1298,6 +1417,16 @@ impl IdentityProvider for SwitchableIdentityProvider {
             } else {
                 10 + self.boot_phase.load(Ordering::SeqCst) as u64
             },
+            mount: MountIdentity(
+                if path.file_name() == Some(OsStr::new("target"))
+                    && self.target_mount_revision.load(Ordering::SeqCst) != 0
+                {
+                    "test-target-bind-mount"
+                } else {
+                    "test-project-mount"
+                }
+                .to_string(),
+            ),
         })
     }
 }
@@ -1351,6 +1480,7 @@ impl IdentityProvider for UnavailableBootIdentityProvider {
             } else {
                 10
             },
+            mount: MountIdentity("test-project-mount".to_string()),
         })
     }
 }
@@ -1469,6 +1599,33 @@ impl CommandRunner for FakeRunner {
         Ok(CleanOutcome {
             exit_code: self.exit_code,
             stderr: self.stderr.clone(),
+        })
+    }
+}
+
+impl CommandRunner for ObservationBootRunner {
+    fn run(&self, _dir: &Path, _cmd: &mut Command) -> anyhow::Result<CleanOutcome> {
+        let connection = rusqlite::Connection::open(&self.database)?;
+        let boot_session = connection.query_row(
+            "
+            SELECT observations.boot_session_id
+            FROM project_observations AS observations
+            JOIN discovery_generations AS generation
+              ON generation.id = observations.generation_id
+            WHERE observations.authorized = 1
+              AND generation.authority_valid = 1
+            LIMIT 1
+            ",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        self.observed_boots_at_run
+            .lock()
+            .unwrap()
+            .push(boot_session);
+        Ok(CleanOutcome {
+            exit_code: 0,
+            stderr: String::new(),
         })
     }
 }
@@ -1594,6 +1751,45 @@ fn cleaner_reports_only_after_preflight_and_immediately_before_runner() {
             format!("target:{}", project.path().join("target").display()),
             format!("cargo:{}", project.path().display()),
         ]
+    );
+}
+
+#[test]
+fn cleaner_propagates_pre_spawn_validation_failure_without_running_cargo() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&project.path().join("target/blob.bin"), &[0; 4096]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let runner = SequencedRunner {
+        events: events.clone(),
+        exit_code: 0,
+    };
+    let cleaner = Cleaner::new("cargo", runner, Duration::from_secs(60));
+    let report_events = events.clone();
+    let validation_events = events.clone();
+
+    let error = cleaner
+        .clean_with_attempt_reporter_and_pre_spawn_validator(
+            project.path(),
+            move |_, _| {
+                report_events.lock().unwrap().push("report".to_string());
+            },
+            move |_, _| {
+                validation_events
+                    .lock()
+                    .unwrap()
+                    .push("validate".to_string());
+                anyhow::bail!("pre-spawn authority unavailable")
+            },
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("pre-spawn authority unavailable"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["report".to_string(), "validate".to_string()]
     );
 }
 
@@ -2398,6 +2594,7 @@ fn cross_device_target_change_after_review_is_rejected_before_cargo() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
 
     let db_dir = tempfile::tempdir().unwrap();
@@ -2438,6 +2635,249 @@ fn cross_device_target_change_after_review_is_rejected_before_cargo() {
                 force: true,
             },
             &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn same_device_mount_change_after_review_is_rejected_before_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
+    daemon.scan_cycle().unwrap();
+
+    let identity_for_mutation = identity.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        identity_for_mutation.move_target_to_other_mount();
+    });
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn dynamic_execution_revalidates_mount_identity_after_target_reporting() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let identity_for_reporter = identity.clone();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_target_reporter(move |_| {
+        identity_for_reporter.move_target_to_other_mount();
+    });
+    daemon.scan_cycle().unwrap();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn reviewed_execution_revalidates_mount_identity_after_target_reporting() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let identity_for_reporter = identity.clone();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy.clone(), identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_target_reporter(move |_| {
+        identity_for_reporter.move_target_to_other_mount();
+    });
+    let scan = daemon.scan_cycle().unwrap();
+    let safety = SafetyOptions {
+        target_quiet_period: Duration::ZERO,
+        include_managed_cache: false,
+        include_active: false,
+        force: true,
+    };
+    let review = review_project_with_identity_provider(
+        &project.canonicalize().unwrap(),
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &safety,
+        identity.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+    let plan = store
+        .create_review_plan(
+            SystemTime::now(),
+            policy.hash(),
+            scan.generation,
+            false,
+            i64::try_from(review.target_bytes).unwrap(),
+            &[review],
+        )
+        .unwrap();
+    let loaded = store
+        .load_review_plan(plan.id, SystemTime::now(), policy.hash(), scan.generation)
+        .unwrap();
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            loaded
+                .targets
+                .into_iter()
+                .map(|target| target.review)
+                .collect(),
+            false,
+            safety,
+            &NoopProcessInspector,
+            RunSource::Reviewed,
         )
         .unwrap();
 
@@ -2692,6 +3132,7 @@ fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope()
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
 
     let db_dir = tempfile::tempdir().unwrap();
@@ -2736,6 +3177,175 @@ fn different_boot_reauthorizes_current_identity_while_project_remains_in_scope()
 }
 
 #[test]
+fn cross_boot_observation_persistence_occurs_after_the_cargo_spawn_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let database = db_dir.path().join("state.db");
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    let observed_boots_at_run = Arc::new(Mutex::new(Vec::new()));
+    let runner = ObservationBootRunner {
+        database,
+        observed_boots_at_run: observed_boots_at_run.clone(),
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy.clone(), identity.clone()),
+        Cleaner::new("cargo", runner, Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    identity.switch_boot();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(
+        *observed_boots_at_run.lock().unwrap(),
+        vec![Some("boot-a".to_string())]
+    );
+    let generation = store.current_generation(policy.hash()).unwrap().unwrap();
+    let observations = store.authorized_observations(generation.id).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].boot_session_id.as_deref(), Some("boot-b"));
+}
+
+#[test]
+fn observation_refresh_failure_after_cargo_preserves_audit_without_marking_clean() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let database = db_dir.path().join("state.db");
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    identity.switch_boot();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_observation_refresh
+            BEFORE UPDATE OF
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                boot_session_id
+            ON project_observations
+            BEGIN
+                SELECT RAISE(ABORT, 'injected observation refresh failure');
+            END;
+            ",
+        )
+        .unwrap();
+
+    let error = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("injected observation refresh failure"));
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, 0);
+    let persisted_project = store
+        .all_projects()
+        .unwrap()
+        .into_iter()
+        .find(|persisted| persisted.path == project.canonicalize().unwrap().to_string_lossy())
+        .unwrap();
+    assert_eq!(persisted_project.last_cleaned_at, None);
+}
+
+#[test]
 fn cross_boot_reverification_scopes_identity_to_new_boot_for_later_cycles() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
@@ -2756,6 +3366,7 @@ fn cross_boot_reverification_scopes_identity_to_new_boot_for_later_cycles() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
 
     let db_dir = tempfile::tempdir().unwrap();
@@ -2835,6 +3446,7 @@ fn migrated_v9_cross_boot_refresh_requires_fresh_discovery_before_cleanup() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
     let options = ScannerOptions {
         roots: cfg.scan_dirs.clone(),
@@ -5642,7 +6254,10 @@ fn forced_scan_failure_backoff_survives_the_five_minute_guard() {
     };
 
     run_at(started);
-    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+    assert!(store
+        .errors_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
     assert_eq!(store.last_forced_scan_at().unwrap(), Some(started));
     let failure_deadline = started + Duration::from_secs(60 * 60);
     assert_eq!(
@@ -5651,11 +6266,10 @@ fn forced_scan_failure_backoff_survives_the_five_minute_guard() {
     );
 
     run_at(started + Duration::from_secs(5 * 60));
-    assert_eq!(
-        store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(),
-        1,
-        "the five-minute guard must not shorten the one-hour failure backoff"
-    );
+    assert!(store
+        .errors_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
     assert_eq!(store.last_forced_scan_at().unwrap(), Some(started));
     assert_eq!(
         store.scheduler_status().unwrap().unwrap().next_scan_at,
@@ -5663,7 +6277,10 @@ fn forced_scan_failure_backoff_survives_the_five_minute_guard() {
     );
 
     run_at(failure_deadline);
-    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+    assert!(store
+        .errors_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
     assert_eq!(store.last_forced_scan_at().unwrap(), Some(failure_deadline));
     assert_eq!(
         store.scheduler_status().unwrap().unwrap().next_scan_at,
@@ -6018,6 +6635,7 @@ fn cross_boot_ancestor_symlink_retarget_is_never_reauthorized() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path().join("state.db")).unwrap();
@@ -6094,6 +6712,7 @@ fn ancestor_symlink_mutation_after_review_is_rejected_before_cargo() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path().join("state.db")).unwrap();
@@ -6269,6 +6888,7 @@ fn persisted_review_reauthorizes_exact_path_across_boot_with_fresh_identity() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path().join("state.db")).unwrap();
@@ -6383,6 +7003,7 @@ fn persisted_review_rejects_same_boot_identity_replacement_without_cargo() {
         boot_phase: AtomicUsize::new(0),
         target_revision: AtomicUsize::new(0),
         cross_device: AtomicUsize::new(0),
+        target_mount_revision: AtomicUsize::new(0),
     });
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path().join("state.db")).unwrap();

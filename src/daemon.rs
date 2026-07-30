@@ -14,7 +14,8 @@ use crate::scanner::{
 };
 use crate::store::{
     CleanEvent, DiscoveryGeneration, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
-    ObservationReconciliation, OriginReconciliation, ProjectObservation, SchedulerStatus, Store,
+    ObservationReconciliation, OriginReconciliation, ProjectObservation, ScanPublication,
+    SchedulerStatus, Store, WorktreeReconciliation,
 };
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -267,8 +268,10 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let now = self.clock.now();
         let report = snapshot.scanner.scan_with_errors()?;
         let error_count = report.errors.len();
-        for error in &report.errors {
-            self.store.record_error(&ErrorRecord {
+        let diagnostics = report
+            .errors
+            .iter()
+            .map(|error| ErrorRecord {
                 id: 0,
                 ts: now,
                 category: match error.kind {
@@ -278,51 +281,39 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 .to_string(),
                 path: error.path.to_str().map(str::to_owned),
                 message: error.message.clone(),
-            })?;
-        }
-        self.reconcile_cached_state_with(&snapshot.scanner)?;
-        for discovery in &report.worktree_discoveries {
-            match discovery {
+            })
+            .collect();
+        let worktrees = report
+            .worktree_discoveries
+            .iter()
+            .map(|discovery| match discovery {
                 WorktreeDiscovery::Success {
                     primary,
                     linked,
                     excluded,
                     out_of_scope,
-                } => {
-                    self.store.replace_linked_worktrees_with_reconciliation(
-                        primary,
-                        linked,
-                        excluded,
-                        out_of_scope,
-                    )?;
-                }
+                } => WorktreeReconciliation::Success {
+                    primary: primary.clone(),
+                    linked: linked.clone(),
+                    excluded: excluded.clone(),
+                    out_of_scope: out_of_scope.clone(),
+                },
                 WorktreeDiscovery::Failure { primary, message } => {
-                    self.store
-                        .mark_worktree_discovery_failed(primary, now, message)?;
+                    WorktreeReconciliation::Failure {
+                        primary: primary.clone(),
+                        message: message.clone(),
+                    }
                 }
-            }
-        }
-        let reconciliation = generation_reconciliation(&report, now);
-        let generation = match self.store.reconcile_generation(now, &reconciliation) {
-            Ok(generation) => generation,
-            Err(error) => {
-                let path = report
-                    .origins
-                    .iter()
-                    .flat_map(|origin| &origin.projects)
-                    .next()
-                    .and_then(|project| project.path.to_str())
-                    .map(str::to_owned);
-                let _ = self.store.record_error(&ErrorRecord {
-                    id: 0,
-                    ts: now,
-                    category: "cache".to_string(),
-                    path,
-                    message: error.to_string(),
-                });
-                return Err(error);
-            }
-        };
+            })
+            .collect();
+        let generation = self.store.publish_scan(
+            now,
+            &ScanPublication {
+                generation: generation_reconciliation(&report, now),
+                worktrees,
+                diagnostics,
+            },
+        )?;
         Ok(ScanCycleResult {
             errors: error_count,
             generation: generation.id,
@@ -569,10 +560,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             let review = &mut prepared.review;
             let path = review.path.clone();
             if review.decision == CleanDecision::Cleanable {
-                // This is the last validation boundary available before Cleaner
-                // measures the target and spawns Cargo. The filesystem can still
-                // change after this returns, so this narrows but cannot eliminate
-                // the residual TOCTOU window.
+                // Reject stale authority before Cleaner measures or reports the
+                // target. Cleaner invokes the same full validation again at its
+                // final pre-spawn boundary.
                 let revalidation_now = self.clock.now();
                 review.decision = match snapshot.scanner.policy() {
                     Some(policy) => revalidate_before_clean(
@@ -591,14 +581,6 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     None => CleanDecision::Skipped(SkipReason::OutOfScope),
                 };
             }
-            if review.decision == CleanDecision::Cleanable && prepared.reverified_across_boot {
-                if let (Some(generation_id), Some(identity)) =
-                    (generation_id, review.reviewed_identity.as_ref())
-                {
-                    self.store
-                        .mark_observation_reverified(generation_id, &path, identity)?;
-                }
-            }
 
             if review.decision == CleanDecision::Skipped(SkipReason::TargetReadError) {
                 self.store.record_error(&ErrorRecord {
@@ -614,13 +596,54 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 continue;
             }
 
-            match self.cleaner.clean_with_attempt_reporter(&path, |_, _| {
-                if let Some(reporter) = &self.target_reporter {
-                    reporter(review);
-                }
-            }) {
+            let reported_review = review.clone();
+            match self
+                .cleaner
+                .clean_with_attempt_reporter_and_pre_spawn_validator(
+                    &path,
+                    |_, _| {
+                        if let Some(reporter) = &self.target_reporter {
+                            reporter(&reported_review);
+                        }
+                    },
+                    |_, _| {
+                        // This is the last validation boundary before CommandRunner.
+                        // The filesystem can still change after this returns, so it
+                        // narrows but cannot eliminate the residual TOCTOU window.
+                        let revalidation_now = self.clock.now();
+                        review.decision = match snapshot.scanner.policy() {
+                            Some(policy) => revalidate_before_clean(
+                                review,
+                                policy,
+                                snapshot.scanner.identity_provider(),
+                                &activity_signals(
+                                    activity_sampler
+                                        .active_projects_at(&project_paths, revalidation_now)?,
+                                ),
+                                &scan_errors,
+                                &discovery_blocks,
+                                revalidation_now,
+                                &safety,
+                            )?,
+                            None => CleanDecision::Skipped(SkipReason::OutOfScope),
+                        };
+                        Ok(review.decision == CleanDecision::Cleanable)
+                    },
+                ) {
                 Ok(result) if result.skipped => {
-                    cleaner_skipped += 1;
+                    if review.decision == CleanDecision::Skipped(SkipReason::TargetReadError) {
+                        self.store.record_error(&ErrorRecord {
+                            id: 0,
+                            ts: self.clock.now(),
+                            category: "review".to_string(),
+                            path: review.target_path.to_str().map(str::to_owned),
+                            message: "target read error: unable to read direct target directory"
+                                .to_string(),
+                        })?;
+                    }
+                    if review.decision == CleanDecision::Cleanable {
+                        cleaner_skipped += 1;
+                    }
                 }
                 Ok(result) => {
                     let now = self.clock.now();
@@ -635,6 +658,17 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         exit_code: result.exit_code,
                         stderr_excerpt: result.stderr_excerpt.clone(),
                     })?;
+                    if prepared.reverified_across_boot {
+                        if let (Some(generation_id), Some(identity)) =
+                            (generation_id, review.reviewed_identity.as_ref())
+                        {
+                            self.store.mark_observation_reverified(
+                                generation_id,
+                                &path,
+                                identity,
+                            )?;
+                        }
+                    }
                     let measurement_failed =
                         if let Some(measurement_error) = &result.measurement_error {
                             errors_count += 1;

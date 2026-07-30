@@ -42,6 +42,7 @@ pub enum SkipReason {
     ProjectIdentityUnavailable,
     TargetIdentityUnavailable,
     CrossDeviceTarget,
+    CrossMountTarget,
     ProjectIdentityChanged,
     TargetIdentityChanged,
     OutOfScope,
@@ -120,6 +121,7 @@ pub fn review_summary(reviews: &[ProjectReview]) -> ReviewSummary {
                     SkipReason::TargetReadError
                     | SkipReason::TargetIdentityUnavailable
                     | SkipReason::CrossDeviceTarget
+                    | SkipReason::CrossMountTarget
                     | SkipReason::TargetIdentityChanged => summary.target_read_error += 1,
                 }
             }
@@ -276,6 +278,16 @@ pub fn review_project_with_identity_provider(
             0,
             None,
             CleanDecision::Skipped(SkipReason::CrossDeviceTarget),
+        ));
+    }
+    if project_identity.mount != target_identity.mount {
+        return Ok(review(
+            project,
+            class,
+            target_path,
+            0,
+            None,
+            CleanDecision::Skipped(SkipReason::CrossMountTarget),
         ));
     }
 
@@ -539,6 +551,9 @@ pub fn revalidate_before_clean(
     };
     if project_identity.device != target_identity.device {
         return Ok(CleanDecision::Skipped(SkipReason::CrossDeviceTarget));
+    }
+    if project_identity.mount != target_identity.mount {
+        return Ok(CleanDecision::Skipped(SkipReason::CrossMountTarget));
     }
     if project_identity != reviewed_identity.project {
         return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));

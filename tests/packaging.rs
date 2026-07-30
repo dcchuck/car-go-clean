@@ -2196,7 +2196,7 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
     let runner_temp = tempdir().unwrap();
     let runnable = run_command(compose.1).unwrap();
     let output = Command::new("sh")
-        .args(["-eu", "-c", &runnable])
+        .args(["-eu", "-c", runnable])
         .current_dir(root)
         .env("ANNOUNCEMENT_BODY", "generated workflow body")
         .env("TAG", "v0.4.0")

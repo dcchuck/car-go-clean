@@ -106,9 +106,13 @@ records:
 - filesystem identity for the project and direct target;
 - last successful observation time.
 
-On Unix, filesystem identity uses device and inode from `symlink_metadata`.
-Platform-specific identity is isolated behind a small internal interface so a
-future non-Unix implementation can supply an equivalent.
+Filesystem identity includes device, inode, and an authoritative
+platform-specific mount identity. Linux obtains all three from one `statx`
+call and uses `STATX_MNT_ID`; macOS rejects symlinks with
+`symlink_metadata`, then uses the mounted-on path returned by `statfs` as the
+mount identity. If the platform cannot supply mount identity, the path is not
+authorized. The platform-specific implementation remains isolated behind a
+small internal interface so a future implementation can supply an equivalent.
 
 ### Identity Is a Change Detector, Not a Capability Token
 
@@ -122,16 +126,17 @@ Each generation records a boot session ID — `kern.boottime` on macOS,
 `/proc/sys/kernel/random/boot_id` on Linux — resolved behind the same platform
 interface as identity.
 
-- Same boot session: persisted device/inode are authoritative. A mismatch means
-  the path was replaced and blocks cleanup for that project.
+- Same boot session: persisted device/inode/mount identity is authoritative. A
+  mismatch means the path or its mount context was replaced and blocks cleanup
+  for that project.
 - Known different boot session: device numbers are not comparable. The
   observation is stale rather than hostile. The project is re-stat'ed, and it
   may be re-authorized only if it still resolves inside the current
   `ScopePolicy`, is not excluded, and passes every execution-time check. The
   refreshed identity replaces the stored one.
-- Unavailable boot ID: exact device/inode equality may continue, but a mismatch
-  is a replacement and fails closed. Missing boot identity cannot authorize a
-  freshly observed replacement inside the same execution.
+- Unavailable boot ID: exact device/inode/mount equality may continue, but a
+  mismatch is a replacement and fails closed. Missing boot identity cannot
+  authorize a freshly observed replacement inside the same execution.
 - Within a single process, identity captured at review time is always
   authoritative for the pre-Cargo recheck, regardless of boot session. This is
   the check that actually defends against replacement during a run.
@@ -143,10 +148,14 @@ above.
 
 ### Scan Scheduling for Migrated or Repolicied State
 
-A generation authorizes cleanup only when its policy hash equals the current
-one. Migration produces no generation at all, and a config edit invalidates the
-existing one. Without an explicit rule, a daemon holding `next_scan_at` twenty
-hours out would sit inert through every clean deadline in between.
+Only the newest successfully published generation can authorize cleanup, and
+its policy hash must equal the current one. Publishing generation B globally
+invalidates generation A even when their policy hashes differ; returning to
+policy A requires a new scan and never resurrects the older A generation or a
+review plan bound to it. Migration produces no generation at all, and a config
+edit invalidates the existing one. Without an explicit rule, a daemon holding
+`next_scan_at` twenty hours out would sit inert through every clean deadline in
+between.
 
 When no generation matches the current policy hash, the daemon schedules a scan
 at its next cycle rather than waiting for `next_scan_at`. The forced scan is
@@ -154,17 +163,14 @@ rate-limited through `scheduler_state` to at most one per five minutes so a
 restart loop or a config that fails to produce observations cannot become a
 scan loop. Existing scan-failure backoff still applies on top of that limit.
 
-A scan is reconciled transactionally:
-
-1. Insert the generation and origin results.
-2. Mark observations from successfully completed origins current.
-3. Revoke current authority for projects absent from a successfully completed
-   origin.
-4. Revoke authority for projects outside the current policy or matching an
-   exclusion.
-5. Preserve prior rows and diagnostic provenance for origins that failed, but
-   mark their observations blocked rather than authorized.
-6. Upsert newly observed projects and worktree relationships.
+A scan is published transactionally. One commit covers cache-alias
+normalization/removals, linked-worktree success or failure reconciliation,
+failure-block state, global invalidation of prior generations, the new
+generation/origins/observations and historical project upserts, and scan
+diagnostics. Filesystem discovery and input normalization may happen before the
+transaction, but no scan-derived database state is visible until the complete
+publication commits. Any failure restores the previous generation authority,
+worktree blockers, cache state, and diagnostics together.
 
 Historical project rows may remain for stats and diagnostics. Cleanup selects
 only currently authorized observations.
@@ -178,35 +184,49 @@ different outcomes for an operator or an agent.
 
 ## Execution-time Identity Boundary
 
-Immediately before invoking Cargo, revalidate:
+The daemon first rejects stale authority before measuring the target. After
+Cleaner measures the target and emits the target-attempt event, a fallible
+pre-spawn validator repeats the full check immediately before invoking Cargo.
+Both dynamic and persisted-review execution use this same final boundary.
+No SQLite write occurs between the validator's last identity read and the
+runner. A cross-boot observation refresh is persisted only after the runner
+returns.
+Revalidate:
 
 - the project path is a direct directory, not a symlink;
-- its canonical path and device/inode match the identity captured during this
-  process's review pass;
+- its canonical path and device/inode/mount identity match the identity
+  captured during this process's review pass;
 - `Cargo.toml` remains a direct regular file;
 - `target/` is a direct directory, not a symlink;
-- the target device/inode matches the reviewed observation;
+- the target device/inode/mount identity matches the reviewed observation;
 - project and target are on the same device;
+- project and target have the same mount identity;
 - current scope, exclusions, protected-storage classification, process
   activity, scan diagnostics, and quiet period still permit cleanup.
 
-There is no separate mount-table lookup. A mount point differs in `st_dev`
-from its parent by definition, so the project/target same-device comparison
-already detects one, and it does so without parsing a platform-specific table
-or opening a second race window. The stated non-goal of never cleaning a
-target that is a mount point is preserved by the device comparison.
+`st_dev` alone is not mount-safe: on Linux, a bind mount of a directory from
+the same filesystem retains the same device number. The identity provider must
+therefore capture mount identity together with the path identity. Linux uses
+the kernel mount ID returned by the same `statx` operation; macOS uses the
+supported `statfs` mount result. Review requires project and target mount
+identity to match, persists both mount identities in observations and review
+plans, and checks the exact identities again immediately before Cargo. A
+missing mount identity fails closed rather than falling back to `st_dev`.
 
 Any mismatch converts the target to a skipped/blocked result. It is not
 automatically re-authorized under its new identity within this run.
+Because the target-attempt event precedes this final safety check, an event may
+be followed by a typed skip without Cargo being launched; the terminal summary
+is authoritative for the outcome.
 
 ### Residual TOCTOU
 
 These checks narrow the race window; they do not close it. `cargo clean`
-resolves `--target-dir` itself, after the last check this process performs, so
-a sufficiently determined local attacker who can write to a parent directory
-can still swap a component between the final `symlink_metadata` and Cargo's
-own resolution. The design states this rather than implying the identity
-boundary is airtight. What it does guarantee is that ordinary
+resolves `--target-dir` itself after the fallible pre-spawn validator returns,
+so a sufficiently determined local attacker who can write to a parent
+directory can still swap a component between the validator's final identity
+read and Cargo's own resolution. The design states this rather than implying
+the identity boundary is airtight. What it does guarantee is that ordinary
 symlink/mount/replacement mistakes — the failure modes that actually produce
 data loss reports — are caught, and that a stale cached row can never reach
 Cargo on its own.
@@ -373,6 +393,9 @@ policy before install/start guidance declares it usable.
 
 Every Cargo invocation produces an audit event containing exit code, bytes
 before/after, duration, and a character-boundary-safe stderr excerpt.
+Persist that event before attempting any post-run cross-boot observation
+refresh. If the refresh fails, the command fails and the project is not marked
+cleaned, but the already-completed Cargo invocation remains audited.
 
 If Cargo exits nonzero:
 
@@ -422,7 +445,8 @@ CLI-facing half of this contract, including how the upgrade helper reads it.
   exit `2`.
 - Database reconciliation is atomic.
 - A configuration or policy error aborts before review with exit `1`.
-- Identity or device uncertainty skips the affected project before Cargo.
+- Identity, device, or mount uncertainty skips the affected project before
+  Cargo.
 - Missing projects and targets are normal stale-state skips.
 - An absent exclusion path is not an error; an unreadable one blocks the cycle.
 - A stale observation from an earlier boot session is re-verified, not treated
@@ -442,8 +466,9 @@ Behavioral tests cover:
 - migration from realistic v0.2/v0.3 path-only databases;
 - broken and retargeted scan-root aliases;
 - per-cycle exclusion retargeting;
-- reused project path with changed device/inode;
-- target symlink, mount/different-device, and identity replacement;
+- reused project path with changed device/inode/mount identity;
+- target symlink, same-filesystem bind mount, different-device mount, and
+  identity replacement;
 - relocated manager/container roots and required opt-in;
 - activity beginning between two projects in one run;
 - nonzero Cargo exits with no successful-clean accounting;

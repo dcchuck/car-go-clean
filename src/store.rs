@@ -1,4 +1,4 @@
-use crate::identity::{FilesystemIdentity, ReviewedIdentity};
+use crate::identity::{FilesystemIdentity, MountIdentity, ReviewedIdentity};
 use crate::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -149,6 +149,47 @@ pub struct GenerationReconciliation {
     pub policy_hash: String,
     pub boot_session_id: Option<String>,
     pub origins: Vec<OriginReconciliation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeReconciliation {
+    Success {
+        primary: PathBuf,
+        linked: Vec<PathBuf>,
+        excluded: Vec<PathBuf>,
+        out_of_scope: Vec<PathBuf>,
+    },
+    Failure {
+        primary: PathBuf,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPublication {
+    pub generation: GenerationReconciliation,
+    pub worktrees: Vec<WorktreeReconciliation>,
+    pub diagnostics: Vec<ErrorRecord>,
+}
+
+struct PreparedWorktreeSuccess {
+    primary: String,
+    canonical_primary: Option<String>,
+    linked: BTreeSet<String>,
+    excluded: BTreeSet<String>,
+    out_of_scope: BTreeSet<String>,
+}
+
+struct PreparedWorktreeFailure {
+    primary: String,
+    canonical_primary: Option<String>,
+    failed_at: i64,
+    message: String,
+}
+
+enum PreparedWorktreeReconciliation {
+    Success(PreparedWorktreeSuccess),
+    Failure(PreparedWorktreeFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -736,6 +777,74 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        let has_project_mount_identity =
+            connection_column_exists(&self.conn, "project_observations", "project_mount_id")?;
+        let has_target_mount_identity =
+            connection_column_exists(&self.conn, "project_observations", "target_mount_id")?;
+        let has_review_project_mount_identity =
+            connection_column_exists(&self.conn, "review_plan_targets", "project_mount_id")?;
+        let has_review_target_mount_identity =
+            connection_column_exists(&self.conn, "review_plan_targets", "target_mount_id")?;
+        if current < 13
+            || !has_project_mount_identity
+            || !has_target_mount_identity
+            || !has_review_project_mount_identity
+            || !has_review_target_mount_identity
+        {
+            let tx = self.conn.unchecked_transaction()?;
+            if !has_project_mount_identity {
+                tx.execute(
+                    "ALTER TABLE project_observations ADD COLUMN project_mount_id TEXT",
+                    [],
+                )?;
+            }
+            if !has_target_mount_identity {
+                tx.execute(
+                    "ALTER TABLE project_observations ADD COLUMN target_mount_id TEXT",
+                    [],
+                )?;
+            }
+            if !has_review_project_mount_identity {
+                tx.execute(
+                    "ALTER TABLE review_plan_targets ADD COLUMN project_mount_id TEXT",
+                    [],
+                )?;
+            }
+            if !has_review_target_mount_identity {
+                tx.execute(
+                    "ALTER TABLE review_plan_targets ADD COLUMN target_mount_id TEXT",
+                    [],
+                )?;
+            }
+            tx.execute(
+                "
+                UPDATE project_observations
+                SET authorized = 0,
+                    blocked_reason = CASE
+                        WHEN authorized = 1 THEN COALESCE(
+                            blocked_reason,
+                            'migration requires fresh mount identity discovery'
+                        )
+                        ELSE blocked_reason
+                    END
+                ",
+                [],
+            )?;
+            tx.execute("UPDATE discovery_generations SET authority_valid = 0", [])?;
+            tx.execute(
+                "
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_discovery_generations_single_valid
+                ON discovery_generations(authority_valid)
+                WHERE authority_valid = 1
+                ",
+                [],
+            )?;
+            if current < 13 {
+                tx.execute("INSERT INTO schema_version(version) VALUES (13)", [])?;
+            }
+            tx.commit()?;
+        }
         self.prune_review_plans(SystemTime::now(), None)?;
         Ok(())
     }
@@ -1033,6 +1142,20 @@ impl Store {
     }
 
     pub fn normalize_resolvable_project_aliases(&self) -> Result<()> {
+        let replacements = self.resolvable_project_alias_replacements()?;
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (alias, canonical) in replacements {
+            replace_project_path_in_transaction(&tx, &alias, &canonical)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn resolvable_project_alias_replacements(&self) -> Result<Vec<(String, String)>> {
         let frozen_identities = self.frozen_worktree_identities()?;
         let mut stmt = self.conn.prepare(
             "
@@ -1063,16 +1186,7 @@ impl Store {
                 replacements.push((identity, canonical));
             }
         }
-        if replacements.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self.conn.unchecked_transaction()?;
-        for (alias, canonical) in replacements {
-            replace_project_path_in_transaction(&tx, &alias, &canonical)?;
-        }
-        tx.commit()?;
-        Ok(())
+        Ok(replacements)
     }
 
     pub fn is_active_worktree_discovery_identity(&self, path: &Path) -> Result<bool> {
@@ -1100,94 +1214,9 @@ impl Store {
         excluded: &[PathBuf],
         out_of_scope: &[PathBuf],
     ) -> Result<()> {
-        let persisted_primary = path_to_string(primary)?;
-        let canonical_primary = fs::canonicalize(primary)
-            .ok()
-            .map(|canonical| path_to_string(&canonical))
-            .transpose()?;
-        let primary = canonical_primary
-            .as_deref()
-            .unwrap_or(&persisted_primary)
-            .to_owned();
-        let linked: BTreeSet<_> = linked
-            .iter()
-            .map(|path| path_to_string(path))
-            .collect::<Result<_>>()?;
-        let excluded: BTreeSet<_> = excluded
-            .iter()
-            .map(|path| path_to_string(path))
-            .collect::<Result<_>>()?;
-        let out_of_scope: BTreeSet<_> = out_of_scope
-            .iter()
-            .map(|path| path_to_string(path))
-            .collect::<Result<_>>()?;
+        let prepared = prepare_worktree_success(primary, linked, excluded, out_of_scope)?;
         let tx = self.conn.unchecked_transaction()?;
-        if canonical_primary.is_some() {
-            normalize_failed_primary_aliases_for_success(&tx, &primary)?;
-            rekey_trusted_linked_associations_for_success(&tx, &primary)?;
-        }
-        let has_untrusted_failure = tx.query_row(
-            "
-            SELECT EXISTS(
-                SELECT 1
-                FROM worktree_discovery_failures
-                WHERE canonical_primary_path IS NULL
-            )
-            ",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if has_untrusted_failure {
-            tx.commit()?;
-            return Ok(());
-        }
-        let previous_linked = {
-            let mut stmt = tx.prepare(
-                "
-                SELECT linked_path
-                FROM linked_worktrees
-                WHERE canonical_primary_path=?1
-                ",
-            )?;
-            let rows = stmt.query_map([&primary], |row| row.get::<_, String>(0))?;
-            collect_rows(rows)?.into_iter().collect::<BTreeSet<_>>()
-        };
-        tx.execute(
-            "
-            DELETE FROM linked_worktrees
-            WHERE canonical_primary_path=?1
-            ",
-            [&primary],
-        )?;
-        for linked_path in &linked {
-            tx.execute(
-                "
-                INSERT OR IGNORE INTO linked_worktrees (
-                    primary_path,
-                    linked_path,
-                    canonical_primary_path
-                )
-                VALUES (?1, ?2, ?3)
-                ",
-                params![primary, linked_path, canonical_primary.as_deref()],
-            )?;
-        }
-        for stale_path in previous_linked.difference(&linked) {
-            tx.execute("DELETE FROM projects WHERE path=?1", [stale_path])?;
-        }
-        for excluded_path in excluded {
-            tx.execute("DELETE FROM projects WHERE path=?1", [excluded_path])?;
-        }
-        for out_of_scope_path in out_of_scope {
-            tx.execute("DELETE FROM projects WHERE path=?1", [out_of_scope_path])?;
-        }
-        tx.execute(
-            "
-            DELETE FROM worktree_discovery_failures
-            WHERE primary_path=?1 AND canonical_primary_path=?1
-            ",
-            [&primary],
-        )?;
+        replace_linked_worktrees_in_transaction(&tx, &prepared)?;
         tx.commit()?;
         Ok(())
     }
@@ -1198,31 +1227,10 @@ impl Store {
         now: SystemTime,
         message: &str,
     ) -> Result<()> {
-        let primary_path = path_to_string(primary)?;
-        let canonical_primary_path = fs::canonicalize(primary)
-            .ok()
-            .map(|canonical| path_to_string(&canonical))
-            .transpose()?;
-        self.conn.execute(
-            "
-            INSERT INTO worktree_discovery_failures (
-                primary_path,
-                failed_at,
-                message,
-                canonical_primary_path
-            )
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(primary_path) DO UPDATE SET
-                failed_at = excluded.failed_at,
-                message = excluded.message
-            ",
-            params![
-                primary_path,
-                to_epoch(now)?,
-                message,
-                canonical_primary_path
-            ],
-        )?;
+        let prepared = prepare_worktree_failure(primary, now, message)?;
+        let tx = self.conn.unchecked_transaction()?;
+        mark_worktree_discovery_failed_in_transaction(&tx, &prepared)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1394,105 +1402,55 @@ impl Store {
     ) -> Result<DiscoveryGeneration> {
         let created_at_epoch = to_epoch(created_at)?;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "
-            INSERT INTO discovery_generations (
-                created_at, policy_hash, boot_session_id, authority_valid
-            )
-            VALUES (?1, ?2, ?3, 1)
-            ",
-            params![
-                created_at_epoch,
-                reconciliation.policy_hash,
-                reconciliation.boot_session_id
-            ],
-        )?;
-        let generation_id = tx.last_insert_rowid();
+        let generation =
+            reconcile_generation_in_transaction(&tx, created_at_epoch, created_at, reconciliation)?;
+        tx.commit()?;
+        Ok(generation)
+    }
 
-        for origin in &reconciliation.origins {
-            tx.execute(
-                "
-                INSERT INTO discovery_origins (
-                    generation_id, kind, configured_path, canonical_path, completed, error
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params![
-                    generation_id,
-                    origin.kind.as_str(),
-                    path_to_string(&origin.configured_path)?,
-                    origin
-                        .canonical_path
-                        .as_deref()
-                        .map(path_to_string)
-                        .transpose()?,
-                    origin.completed,
-                    origin.error,
-                ],
-            )?;
-            let origin_id = tx.last_insert_rowid();
+    pub fn publish_scan(
+        &self,
+        created_at: SystemTime,
+        publication: &ScanPublication,
+    ) -> Result<DiscoveryGeneration> {
+        let created_at_epoch = to_epoch(created_at)?;
+        let alias_replacements = self.resolvable_project_alias_replacements()?;
+        let prepared_worktrees = publication
+            .worktrees
+            .iter()
+            .map(|worktree| prepare_worktree_reconciliation(worktree, created_at))
+            .collect::<Result<Vec<_>>>()?;
+        let prepared_diagnostics = publication
+            .diagnostics
+            .iter()
+            .map(|diagnostic| Ok((to_epoch(diagnostic.ts)?, diagnostic)))
+            .collect::<Result<Vec<_>>>()?;
 
-            for observation in &origin.observations {
-                let project_path = path_to_string(&observation.project_path)?;
-                let authorized = origin.completed && observation.authorized;
-                let blocked_reason = if authorized {
-                    observation.blocked_reason.clone()
-                } else if !origin.completed && observation.blocked_reason.is_none() {
-                    Some(match origin.error.as_deref() {
-                        Some(error) => format!("origin incomplete: {error}"),
-                        None => "origin incomplete".to_string(),
-                    })
-                } else {
-                    observation.blocked_reason.clone()
-                };
-                tx.execute(
-                    "
-                    INSERT INTO project_observations (
-                        generation_id, origin_id, project_path,
-                        project_device, project_inode, target_device, target_inode,
-                        observed_at, authorized, blocked_reason, boot_session_id
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                    ",
-                    params![
-                        generation_id,
-                        origin_id,
-                        project_path,
-                        observation.project_identity.device,
-                        observation.project_identity.inode,
-                        observation
-                            .target_identity
-                            .as_ref()
-                            .map(|identity| identity.device),
-                        observation
-                            .target_identity
-                            .as_ref()
-                            .map(|identity| identity.inode),
-                        to_epoch(observation.observed_at)?,
-                        authorized,
-                        blocked_reason,
-                        reconciliation.boot_session_id,
-                    ],
-                )?;
-                tx.execute(
-                    "
-                    INSERT INTO projects (path, discovered_at, last_seen_at)
-                    VALUES (?1, ?2, ?2)
-                    ON CONFLICT(path) DO UPDATE SET
-                        last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at)
-                    ",
-                    params![project_path, to_epoch(observation.observed_at)?],
-                )?;
+        let tx = self.conn.unchecked_transaction()?;
+        for (alias, canonical) in alias_replacements {
+            replace_project_path_in_transaction(&tx, &alias, &canonical)?;
+        }
+        for worktree in &prepared_worktrees {
+            match worktree {
+                PreparedWorktreeReconciliation::Success(success) => {
+                    replace_linked_worktrees_in_transaction(&tx, success)?;
+                }
+                PreparedWorktreeReconciliation::Failure(failure) => {
+                    mark_worktree_discovery_failed_in_transaction(&tx, failure)?;
+                }
             }
         }
-
-        tx.commit()?;
-        Ok(DiscoveryGeneration {
-            id: generation_id,
+        let generation = reconcile_generation_in_transaction(
+            &tx,
+            created_at_epoch,
             created_at,
-            policy_hash: reconciliation.policy_hash.clone(),
-            boot_session_id: reconciliation.boot_session_id.clone(),
-        })
+            &publication.generation,
+        )?;
+        for (timestamp, diagnostic) in prepared_diagnostics {
+            record_error_in_transaction(&tx, timestamp, diagnostic)?;
+        }
+        tx.commit()?;
+        Ok(generation)
     }
 
     pub fn current_generation(&self, policy_hash: &str) -> Result<Option<DiscoveryGeneration>> {
@@ -1502,10 +1460,10 @@ impl Store {
                 SELECT id, created_at, policy_hash, boot_session_id
                 FROM discovery_generations
                 WHERE authority_valid = 1
+                  AND policy_hash = ?1
                   AND id = (
                       SELECT id
                       FROM discovery_generations
-                      WHERE policy_hash = ?1
                       ORDER BY id DESC
                       LIMIT 1
                   )
@@ -1545,10 +1503,10 @@ impl Store {
                 SELECT id
                 FROM discovery_generations
                 WHERE authority_valid = 1
+                  AND policy_hash = ?1
                   AND id = (
                       SELECT id
                       FROM discovery_generations
-                      WHERE policy_hash = ?1
                       ORDER BY id DESC
                       LIMIT 1
                   )
@@ -1613,8 +1571,10 @@ impl Store {
                 observations.project_path,
                 observations.project_device,
                 observations.project_inode,
+                observations.project_mount_id,
                 observations.target_device,
                 observations.target_inode,
+                observations.target_mount_id,
                 observations.observed_at,
                 observations.authorized,
                 observations.blocked_reason,
@@ -1623,9 +1583,18 @@ impl Store {
             JOIN discovery_origins AS origins
               ON origins.id = observations.origin_id
              AND origins.generation_id = observations.generation_id
+            JOIN discovery_generations AS generation
+              ON generation.id = observations.generation_id
             WHERE observations.generation_id = ?1
               AND observations.authorized = 1
               AND origins.completed = 1
+              AND generation.authority_valid = 1
+              AND generation.id = (
+                  SELECT id
+                  FROM discovery_generations
+                  ORDER BY id DESC
+                  LIMIT 1
+              )
             ORDER BY observations.project_path, observations.origin_id
             ",
         )?;
@@ -1644,12 +1613,27 @@ impl Store {
             UPDATE project_observations
             SET project_device = ?1,
                 project_inode = ?2,
-                target_device = ?3,
-                target_inode = ?4,
-                boot_session_id = ?5
-            WHERE generation_id = ?6
-              AND project_path = ?7
+                project_mount_id = ?3,
+                target_device = ?4,
+                target_inode = ?5,
+                target_mount_id = ?6,
+                boot_session_id = ?7
+            WHERE generation_id = ?8
+              AND project_path = ?9
               AND authorized = 1
+              AND EXISTS(
+                  SELECT 1
+                  FROM discovery_generations
+                  WHERE discovery_generations.id =
+                        project_observations.generation_id
+                    AND discovery_generations.authority_valid = 1
+                    AND discovery_generations.id = (
+                        SELECT id
+                        FROM discovery_generations
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+              )
               AND EXISTS(
                   SELECT 1
                   FROM discovery_origins
@@ -1662,8 +1646,10 @@ impl Store {
             params![
                 identity.project.device,
                 identity.project.inode,
+                identity.project.mount.0.as_str(),
                 identity.target.device,
                 identity.target.inode,
+                identity.target.mount.0.as_str(),
                 identity
                     .boot_session
                     .as_ref()
@@ -2105,6 +2091,310 @@ impl Store {
     }
 }
 
+fn prepare_worktree_reconciliation(
+    reconciliation: &WorktreeReconciliation,
+    now: SystemTime,
+) -> Result<PreparedWorktreeReconciliation> {
+    match reconciliation {
+        WorktreeReconciliation::Success {
+            primary,
+            linked,
+            excluded,
+            out_of_scope,
+        } => Ok(PreparedWorktreeReconciliation::Success(
+            prepare_worktree_success(primary, linked, excluded, out_of_scope)?,
+        )),
+        WorktreeReconciliation::Failure { primary, message } => {
+            Ok(PreparedWorktreeReconciliation::Failure(
+                prepare_worktree_failure(primary, now, message)?,
+            ))
+        }
+    }
+}
+
+fn prepare_worktree_success(
+    primary: &Path,
+    linked: &[PathBuf],
+    excluded: &[PathBuf],
+    out_of_scope: &[PathBuf],
+) -> Result<PreparedWorktreeSuccess> {
+    let persisted_primary = path_to_string(primary)?;
+    let canonical_primary = fs::canonicalize(primary)
+        .ok()
+        .map(|canonical| path_to_string(&canonical))
+        .transpose()?;
+    let primary = canonical_primary
+        .as_deref()
+        .unwrap_or(&persisted_primary)
+        .to_owned();
+    Ok(PreparedWorktreeSuccess {
+        primary,
+        canonical_primary,
+        linked: linked
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?,
+        excluded: excluded
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?,
+        out_of_scope: out_of_scope
+            .iter()
+            .map(|path| path_to_string(path))
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn prepare_worktree_failure(
+    primary: &Path,
+    now: SystemTime,
+    message: &str,
+) -> Result<PreparedWorktreeFailure> {
+    Ok(PreparedWorktreeFailure {
+        primary: path_to_string(primary)?,
+        canonical_primary: fs::canonicalize(primary)
+            .ok()
+            .map(|canonical| path_to_string(&canonical))
+            .transpose()?,
+        failed_at: to_epoch(now)?,
+        message: message.to_string(),
+    })
+}
+
+fn replace_linked_worktrees_in_transaction(
+    tx: &Transaction<'_>,
+    reconciliation: &PreparedWorktreeSuccess,
+) -> Result<()> {
+    if reconciliation.canonical_primary.is_some() {
+        normalize_failed_primary_aliases_for_success(tx, &reconciliation.primary)?;
+        rekey_trusted_linked_associations_for_success(tx, &reconciliation.primary)?;
+    }
+    let has_untrusted_failure = tx.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM worktree_discovery_failures
+            WHERE canonical_primary_path IS NULL
+        )
+        ",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if has_untrusted_failure {
+        return Ok(());
+    }
+    let previous_linked = {
+        let mut stmt = tx.prepare(
+            "
+            SELECT linked_path
+            FROM linked_worktrees
+            WHERE canonical_primary_path=?1
+            ",
+        )?;
+        let rows = stmt.query_map([&reconciliation.primary], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)?.into_iter().collect::<BTreeSet<_>>()
+    };
+    tx.execute(
+        "
+        DELETE FROM linked_worktrees
+        WHERE canonical_primary_path=?1
+        ",
+        [&reconciliation.primary],
+    )?;
+    for linked_path in &reconciliation.linked {
+        tx.execute(
+            "
+            INSERT OR IGNORE INTO linked_worktrees (
+                primary_path,
+                linked_path,
+                canonical_primary_path
+            )
+            VALUES (?1, ?2, ?3)
+            ",
+            params![
+                reconciliation.primary,
+                linked_path,
+                reconciliation.canonical_primary.as_deref()
+            ],
+        )?;
+    }
+    for stale_path in previous_linked.difference(&reconciliation.linked) {
+        tx.execute("DELETE FROM projects WHERE path=?1", [stale_path])?;
+    }
+    for excluded_path in &reconciliation.excluded {
+        tx.execute("DELETE FROM projects WHERE path=?1", [excluded_path])?;
+    }
+    for out_of_scope_path in &reconciliation.out_of_scope {
+        tx.execute("DELETE FROM projects WHERE path=?1", [out_of_scope_path])?;
+    }
+    tx.execute(
+        "
+        DELETE FROM worktree_discovery_failures
+        WHERE primary_path=?1 AND canonical_primary_path=?1
+        ",
+        [&reconciliation.primary],
+    )?;
+    Ok(())
+}
+
+fn mark_worktree_discovery_failed_in_transaction(
+    tx: &Transaction<'_>,
+    reconciliation: &PreparedWorktreeFailure,
+) -> Result<()> {
+    tx.execute(
+        "
+        INSERT INTO worktree_discovery_failures (
+            primary_path,
+            failed_at,
+            message,
+            canonical_primary_path
+        )
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(primary_path) DO UPDATE SET
+            failed_at = excluded.failed_at,
+            message = excluded.message
+        ",
+        params![
+            reconciliation.primary,
+            reconciliation.failed_at,
+            reconciliation.message,
+            reconciliation.canonical_primary,
+        ],
+    )?;
+    Ok(())
+}
+
+fn reconcile_generation_in_transaction(
+    tx: &Transaction<'_>,
+    created_at_epoch: i64,
+    created_at: SystemTime,
+    reconciliation: &GenerationReconciliation,
+) -> Result<DiscoveryGeneration> {
+    tx.execute(
+        "UPDATE discovery_generations SET authority_valid = 0 WHERE authority_valid = 1",
+        [],
+    )?;
+    tx.execute(
+        "
+        INSERT INTO discovery_generations (
+            created_at, policy_hash, boot_session_id, authority_valid
+        )
+        VALUES (?1, ?2, ?3, 1)
+        ",
+        params![
+            created_at_epoch,
+            reconciliation.policy_hash,
+            reconciliation.boot_session_id
+        ],
+    )?;
+    let generation_id = tx.last_insert_rowid();
+
+    for origin in &reconciliation.origins {
+        tx.execute(
+            "
+            INSERT INTO discovery_origins (
+                generation_id, kind, configured_path, canonical_path, completed, error
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                generation_id,
+                origin.kind.as_str(),
+                path_to_string(&origin.configured_path)?,
+                origin
+                    .canonical_path
+                    .as_deref()
+                    .map(path_to_string)
+                    .transpose()?,
+                origin.completed,
+                origin.error,
+            ],
+        )?;
+        let origin_id = tx.last_insert_rowid();
+
+        for observation in &origin.observations {
+            let project_path = path_to_string(&observation.project_path)?;
+            let authorized = origin.completed && observation.authorized;
+            let blocked_reason = if authorized {
+                observation.blocked_reason.clone()
+            } else if !origin.completed && observation.blocked_reason.is_none() {
+                Some(match origin.error.as_deref() {
+                    Some(error) => format!("origin incomplete: {error}"),
+                    None => "origin incomplete".to_string(),
+                })
+            } else {
+                observation.blocked_reason.clone()
+            };
+            tx.execute(
+                "
+                INSERT INTO project_observations (
+                    generation_id, origin_id, project_path,
+                    project_device, project_inode, project_mount_id,
+                    target_device, target_inode, target_mount_id,
+                    observed_at, authorized, blocked_reason, boot_session_id
+                )
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12, ?13
+                )
+                ",
+                params![
+                    generation_id,
+                    origin_id,
+                    project_path,
+                    observation.project_identity.device,
+                    observation.project_identity.inode,
+                    observation.project_identity.mount.0.as_str(),
+                    observation
+                        .target_identity
+                        .as_ref()
+                        .map(|identity| identity.device),
+                    observation
+                        .target_identity
+                        .as_ref()
+                        .map(|identity| identity.inode),
+                    observation
+                        .target_identity
+                        .as_ref()
+                        .map(|identity| identity.mount.0.as_str()),
+                    to_epoch(observation.observed_at)?,
+                    authorized,
+                    blocked_reason,
+                    reconciliation.boot_session_id,
+                ],
+            )?;
+            tx.execute(
+                "
+                INSERT INTO projects (path, discovered_at, last_seen_at)
+                VALUES (?1, ?2, ?2)
+                ON CONFLICT(path) DO UPDATE SET
+                    last_seen_at = MAX(projects.last_seen_at, excluded.last_seen_at)
+                ",
+                params![project_path, to_epoch(observation.observed_at)?],
+            )?;
+        }
+    }
+
+    Ok(DiscoveryGeneration {
+        id: generation_id,
+        created_at,
+        policy_hash: reconciliation.policy_hash.clone(),
+        boot_session_id: reconciliation.boot_session_id.clone(),
+    })
+}
+
+fn record_error_in_transaction(
+    tx: &Transaction<'_>,
+    timestamp: i64,
+    error: &ErrorRecord,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO errors (ts, category, path, message) VALUES (?1, ?2, ?3, ?4)",
+        params![timestamp, error.category, error.path, error.message],
+    )?;
+    Ok(())
+}
+
 fn replace_project_path_in_transaction(
     tx: &Transaction<'_>,
     old_path: &str,
@@ -2338,15 +2628,20 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
 }
 
 fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectObservation> {
-    let target_device = row.get::<_, Option<u64>>(5)?;
-    let target_inode = row.get::<_, Option<u64>>(6)?;
-    let target_identity = match (target_device, target_inode) {
-        (Some(device), Some(inode)) => Some(FilesystemIdentity { device, inode }),
-        (None, None) => None,
+    let target_device = row.get::<_, Option<u64>>(6)?;
+    let target_inode = row.get::<_, Option<u64>>(7)?;
+    let target_mount = row.get::<_, Option<String>>(8)?;
+    let target_identity = match (target_device, target_inode, target_mount) {
+        (Some(device), Some(inode), Some(mount)) => Some(FilesystemIdentity {
+            device,
+            inode,
+            mount: MountIdentity(mount),
+        }),
+        (None, None, None) => None,
         _ => {
             return Err(rusqlite::Error::InvalidColumnType(
-                5,
-                "target_device/target_inode".to_string(),
+                6,
+                "target_device/target_inode/target_mount_id".to_string(),
                 rusqlite::types::Type::Null,
             ));
         }
@@ -2358,12 +2653,13 @@ fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pro
         project_identity: FilesystemIdentity {
             device: row.get(3)?,
             inode: row.get(4)?,
+            mount: MountIdentity(row.get(5)?),
         },
         target_identity,
-        boot_session_id: row.get(10)?,
-        observed_at: from_epoch(row.get(7)?),
-        authorized: row.get(8)?,
-        blocked_reason: row.get(9)?,
+        boot_session_id: row.get(12)?,
+        observed_at: from_epoch(row.get(9)?),
+        authorized: row.get(10)?,
+        blocked_reason: row.get(11)?,
     })
 }
 
@@ -2399,17 +2695,25 @@ fn generation_is_current(
     let newest = connection
         .query_row(
             "
-            SELECT id, authority_valid
+            SELECT id, policy_hash, authority_valid
             FROM discovery_generations
-            WHERE policy_hash = ?1
             ORDER BY id DESC
             LIMIT 1
             ",
-            [policy_hash],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(matches!(newest, Some((id, true)) if id == generation_id))
+    Ok(matches!(
+        newest,
+        Some((id, policy, true)) if id == generation_id && policy == policy_hash
+    ))
 }
 
 fn insert_review_plan_target(
@@ -2418,20 +2722,29 @@ fn insert_review_plan_target(
     ordinal: usize,
     review: &ProjectReview,
 ) -> Result<()> {
-    let (project_device, project_inode, target_device, target_inode, boot_session_id) =
-        match review.reviewed_identity.as_ref() {
-            Some(identity) => (
-                Some(i64::try_from(identity.project.device)?),
-                Some(i64::try_from(identity.project.inode)?),
-                Some(i64::try_from(identity.target.device)?),
-                Some(i64::try_from(identity.target.inode)?),
-                identity
-                    .boot_session
-                    .as_ref()
-                    .map(|boot_session| boot_session.0.as_str()),
-            ),
-            None => (None, None, None, None, None),
-        };
+    let (
+        project_device,
+        project_inode,
+        project_mount_id,
+        target_device,
+        target_inode,
+        target_mount_id,
+        boot_session_id,
+    ) = match review.reviewed_identity.as_ref() {
+        Some(identity) => (
+            Some(i64::try_from(identity.project.device)?),
+            Some(i64::try_from(identity.project.inode)?),
+            Some(identity.project.mount.0.as_str()),
+            Some(i64::try_from(identity.target.device)?),
+            Some(i64::try_from(identity.target.inode)?),
+            Some(identity.target.mount.0.as_str()),
+            identity
+                .boot_session
+                .as_ref()
+                .map(|boot_session| boot_session.0.as_str()),
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
     let (decision, skip_reason, skip_newest_age_secs) = decision_parts(&review.decision);
     let reviewed_bytes = i64::try_from(review.target_bytes)
         .context("reviewed target bytes exceed SQLite integer range")?;
@@ -2450,8 +2763,10 @@ fn insert_review_plan_target(
             target_path,
             project_device,
             project_inode,
+            project_mount_id,
             target_device,
             target_inode,
+            target_mount_id,
             review_boot_session_id,
             reviewed_bytes,
             decision,
@@ -2459,7 +2774,8 @@ fn insert_review_plan_target(
             skip_newest_age_secs
         )
         VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17
         )
         ",
         params![
@@ -2475,8 +2791,10 @@ fn insert_review_plan_target(
             path_to_string(&review.target_path)?,
             project_device,
             project_inode,
+            project_mount_id,
             target_device,
             target_inode,
+            target_mount_id,
             boot_session_id,
             reviewed_bytes,
             decision,
@@ -2542,8 +2860,10 @@ fn load_review_plan_from_connection(
             target_path,
             project_device,
             project_inode,
+            project_mount_id,
             target_device,
             target_inode,
+            target_mount_id,
             review_boot_session_id,
             reviewed_bytes,
             decision,
@@ -2565,22 +2885,26 @@ fn load_review_plan_from_connection(
         let target_path = PathBuf::from(row.get::<_, String>(4)?);
         let project_device = row.get::<_, Option<i64>>(5)?;
         let project_inode = row.get::<_, Option<i64>>(6)?;
-        let target_device = row.get::<_, Option<i64>>(7)?;
-        let target_inode = row.get::<_, Option<i64>>(8)?;
-        let boot_session_id = row.get::<_, Option<String>>(9)?;
+        let project_mount_id = row.get::<_, Option<String>>(7)?;
+        let target_device = row.get::<_, Option<i64>>(8)?;
+        let target_inode = row.get::<_, Option<i64>>(9)?;
+        let target_mount_id = row.get::<_, Option<String>>(10)?;
+        let boot_session_id = row.get::<_, Option<String>>(11)?;
         let reviewed_identity = parse_reviewed_identity(
             project_device,
             project_inode,
+            project_mount_id,
             target_device,
             target_inode,
+            target_mount_id,
             boot_session_id,
         )?;
-        let reviewed_bytes = u64::try_from(row.get::<_, i64>(10)?)
+        let reviewed_bytes = u64::try_from(row.get::<_, i64>(12)?)
             .context("reviewed target bytes are out of range")?;
         let decision = parse_decision(
-            &row.get::<_, String>(11)?,
-            row.get::<_, Option<String>>(12)?.as_deref(),
-            row.get::<_, Option<i64>>(13)?,
+            &row.get::<_, String>(13)?,
+            row.get::<_, Option<String>>(14)?.as_deref(),
+            row.get::<_, Option<i64>>(15)?,
         )?;
         targets.push(ReviewPlanTarget {
             ordinal,
@@ -2626,7 +2950,6 @@ fn prune_review_plans_in_transaction(
                   AND generation.id = (
                       SELECT newest.id
                       FROM discovery_generations AS newest
-                      WHERE newest.policy_hash = review_plans.policy_hash
                       ORDER BY newest.id DESC
                       LIMIT 1
                   )
@@ -2704,6 +3027,7 @@ fn skip_reason_parts(reason: &SkipReason) -> (&'static str, Option<u64>) {
         SkipReason::ProjectIdentityUnavailable => ("project_identity_unavailable", None),
         SkipReason::TargetIdentityUnavailable => ("target_identity_unavailable", None),
         SkipReason::CrossDeviceTarget => ("cross_device_target", None),
+        SkipReason::CrossMountTarget => ("cross_mount_target", None),
         SkipReason::ProjectIdentityChanged => ("project_identity_changed", None),
         SkipReason::TargetIdentityChanged => ("target_identity_changed", None),
         SkipReason::OutOfScope => ("out_of_scope", None),
@@ -2750,6 +3074,7 @@ fn parse_skip_reason(reason: &str, newest_age_secs: Option<i64>) -> Result<SkipR
         "project_identity_unavailable" => Ok(SkipReason::ProjectIdentityUnavailable),
         "target_identity_unavailable" => Ok(SkipReason::TargetIdentityUnavailable),
         "cross_device_target" => Ok(SkipReason::CrossDeviceTarget),
+        "cross_mount_target" => Ok(SkipReason::CrossMountTarget),
         "project_identity_changed" => Ok(SkipReason::ProjectIdentityChanged),
         "target_identity_changed" => Ok(SkipReason::TargetIdentityChanged),
         "out_of_scope" => Ok(SkipReason::OutOfScope),
@@ -2761,33 +3086,49 @@ fn parse_skip_reason(reason: &str, newest_age_secs: Option<i64>) -> Result<SkipR
 fn parse_reviewed_identity(
     project_device: Option<i64>,
     project_inode: Option<i64>,
+    project_mount_id: Option<String>,
     target_device: Option<i64>,
     target_inode: Option<i64>,
+    target_mount_id: Option<String>,
     boot_session_id: Option<String>,
 ) -> Result<Option<ReviewedIdentity>> {
-    match (project_device, project_inode, target_device, target_inode) {
-        (None, None, None, None) if boot_session_id.is_none() => Ok(None),
-        (Some(project_device), Some(project_inode), Some(target_device), Some(target_inode)) => {
-            Ok(Some(ReviewedIdentity {
-                project: FilesystemIdentity {
-                    device: project_device
-                        .try_into()
-                        .context("project device is out of range")?,
-                    inode: project_inode
-                        .try_into()
-                        .context("project inode is out of range")?,
-                },
-                target: FilesystemIdentity {
-                    device: target_device
-                        .try_into()
-                        .context("target device is out of range")?,
-                    inode: target_inode
-                        .try_into()
-                        .context("target inode is out of range")?,
-                },
-                boot_session: boot_session_id.map(crate::identity::BootSessionId),
-            }))
-        }
+    match (
+        project_device,
+        project_inode,
+        project_mount_id,
+        target_device,
+        target_inode,
+        target_mount_id,
+    ) {
+        (None, None, None, None, None, None) if boot_session_id.is_none() => Ok(None),
+        (
+            Some(project_device),
+            Some(project_inode),
+            Some(project_mount_id),
+            Some(target_device),
+            Some(target_inode),
+            Some(target_mount_id),
+        ) => Ok(Some(ReviewedIdentity {
+            project: FilesystemIdentity {
+                device: project_device
+                    .try_into()
+                    .context("project device is out of range")?,
+                inode: project_inode
+                    .try_into()
+                    .context("project inode is out of range")?,
+                mount: MountIdentity(project_mount_id),
+            },
+            target: FilesystemIdentity {
+                device: target_device
+                    .try_into()
+                    .context("target device is out of range")?,
+                inode: target_inode
+                    .try_into()
+                    .context("target inode is out of range")?,
+                mount: MountIdentity(target_mount_id),
+            },
+            boot_session: boot_session_id.map(crate::identity::BootSessionId),
+        })),
         _ => bail!("persisted review identity is incomplete"),
     }
 }

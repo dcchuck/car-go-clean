@@ -4,7 +4,7 @@
 
 **Goal:** Make current scope, a current discovery generation, and execution-time filesystem identity mandatory authority for every cleanup.
 
-**Architecture:** Build one immutable `ScopePolicy` per command or daemon cycle, persist discovery generations and observations bound to its deterministic hash, and select cleanup candidates only from the current matching generation. Capture project and target filesystem identity during review and revalidate it immediately before Cargo; refresh exclusion/protected-root and activity snapshots at bounded intervals rather than trusting startup state.
+**Architecture:** Build one immutable `ScopePolicy` per command or daemon cycle, persist discovery generations and observations bound to its deterministic hash, and select cleanup candidates only from the globally newest valid generation when its policy matches. Capture project and target device, inode, and platform mount identity during review and revalidate the exact identities immediately before Cargo; refresh exclusion/protected-root and activity snapshots at bounded intervals rather than trusting startup state.
 
 **Tech Stack:** Rust 1.95+, SQLite/rusqlite, serde/serde_json, SHA-256, sysinfo, macOS `sysctl`, Linux `/proc`, existing CLI/daemon/scanner modules.
 
@@ -16,6 +16,12 @@
 - The policy hash is SHA-256 over the exact versioned tuple specified below; `clean_interval` and `log_level` are excluded.
 - Relative component exclusions are lexical-only and never canonicalized or working-directory anchored. An absent speculative absolute exclusion is normal; every non-`NotFound` absolute-exclusion canonicalization failure blocks the cycle.
 - Persisted device numbers are comparable only inside the same boot session.
+- Device equality is not mount equality. Linux must use `statx`
+  `STATX_MNT_ID`, macOS must use the supported `statfs` mount result, and
+  missing mount identity fails closed.
+- Publishing any generation globally invalidates every prior generation,
+  including generations for another policy hash; A→B→A requires a fresh A
+  scan.
 - A migrated path-only database grants no current cleanup authority.
 - Forced discovery for missing/mismatched policy generations is rate-limited to once per five minutes.
 - The final pre-Cargo identity check narrows but does not eliminate TOCTOU.
@@ -246,10 +252,16 @@ fn target_symlink_is_rejected_before_identity_comparison() {}
 fn project_and_target_on_different_devices_are_rejected() {}
 
 #[test]
+fn project_and_target_on_same_device_but_different_mounts_are_rejected() {}
+
+#[test]
 fn unavailable_boot_id_requires_exact_persisted_identity() {}
 ```
 
-Use a fake `IdentityProvider`; never require a mount operation in unit tests.
+Use a fake `IdentityProvider` for the deterministic unit tests. Add a
+Linux-only real bind-mount integration test that explicitly reports a skip
+when the environment lacks mount permission; the injected same-device mount
+test always runs.
 
 - [ ] **Step 2: Verify the identity tests fail**
 
@@ -267,9 +279,13 @@ Add:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountIdentity(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemIdentity {
     pub device: u64,
     pub inode: u64,
+    pub mount: MountIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +297,14 @@ pub trait IdentityProvider {
 }
 ```
 
-On Unix, use `std::os::unix::fs::MetadataExt` over `symlink_metadata`. Reject symlinks before returning identity. Read Linux boot identity from `/proc/sys/kernel/random/boot_id`; read macOS boot time with `sysctlbyname("kern.boottime")` and encode seconds/microseconds as a stable string.
+Reject symlinks before returning identity. On Linux, use the kernel `statx`
+ABI to capture device, inode, and `STATX_MNT_ID` in one operation. On macOS,
+use `symlink_metadata` for device/inode and `statfs` for the mounted-on
+identity. Do not fall back to device-only identity if the mount identity is
+unavailable. Read Linux boot identity from
+`/proc/sys/kernel/random/boot_id`; read macOS boot time with
+`sysctlbyname("kern.boottime")` and encode seconds/microseconds as a stable
+string.
 
 - [ ] **Step 4: Implement explicit persisted-identity semantics**
 
@@ -302,16 +325,20 @@ pub fn compare_persisted(
 ) -> IdentityComparison;
 ```
 
-Same boot requires exact device/inode. A known different boot returns
+Same boot requires exact device/inode/mount identity. A known different boot returns
 `StaleAcrossBoot`; the caller must revalidate scope/exclusions before replacing
-the observation. When either boot ID is unavailable, exact device/inode equality
-may continue but a mismatch returns `Replaced`. Missing boot identity must never
-authorize a freshly observed replacement inside the same execution. An identity
-mismatch captured and checked inside one process always returns `Replaced`.
+the observation. When either boot ID is unavailable, exact
+device/inode/mount equality may continue but a mismatch returns `Replaced`.
+Missing boot identity must never authorize a freshly observed replacement
+inside the same execution. An identity mismatch captured and checked inside
+one process always returns `Replaced`.
 
-- [ ] **Step 5: Add direct-file and same-device validation**
+- [ ] **Step 5: Add direct-file, same-device, and same-mount validation**
 
-Extend the review boundary to require direct `Cargo.toml`, direct target directory, and project/target `device` equality. Return typed skip reasons rather than converting identity uncertainty into a generic I/O error.
+Extend the review boundary to require direct `Cargo.toml`, a direct target
+directory, project/target `device` equality, and project/target `mount`
+equality. Return typed skip reasons rather than converting identity or mount
+uncertainty into a generic I/O error.
 
 - [ ] **Step 6: Run identity and safety tests**
 
@@ -352,7 +379,9 @@ assert_eq!(store.all_projects()?.len(), historical_project_count);
 assert_eq!(store.total_bytes_recovered(UNIX_EPOCH)?, historical_success_bytes);
 ```
 
-Add atomic reconciliation tests for successful origins, failed origins, removed projects, changed policy hash, and transaction rollback after an injected failure.
+Add atomic reconciliation tests for successful origins, failed origins,
+removed projects, A→B→A policy changes, and transaction rollback after
+injected failures at generation, observation, and diagnostic persistence.
 
 - [ ] **Step 2: Run store tests and confirm failure**
 
@@ -410,6 +439,13 @@ INSERT INTO schema_version(version) VALUES (9);
 
 Do not backfill a generation from `projects`; retain those rows only as history.
 
+Task 9A adds schema version 13. It adds `project_mount_id` and
+`target_mount_id` to observations (and to persisted review-plan targets),
+invalidates all pre-migration observation and generation authority, prunes old
+review plans, and creates a partial unique index allowing only one
+`authority_valid = 1` generation. Migration must not manufacture mount
+identity from `st_dev`.
+
 - [ ] **Step 4: Add typed store records**
 
 Implement:
@@ -421,7 +457,11 @@ pub struct ProjectObservation { /* origin, project/target identity, observed_at,
 pub struct GenerationReconciliation { pub policy_hash: String, pub boot_session_id: Option<String>, pub origins: Vec<OriginReconciliation> }
 ```
 
-`Store::reconcile_generation` must insert the generation, origins, and observations and update historical `projects` in one unchecked transaction. Failed origins preserve diagnostic rows but insert no authorized observations.
+`Store::reconcile_generation` must globally invalidate prior authority and
+insert the generation, origins, observations, and historical `projects` in one
+unchecked transaction. Failed origins preserve diagnostic rows but insert no
+authorized observations. Task 9A's scan-facing API expands that transaction to
+all scan-derived cache, worktree, failure-block, and diagnostic mutations.
 
 - [ ] **Step 5: Add authority-selection and scheduler APIs**
 
@@ -436,7 +476,9 @@ pub fn last_forced_scan_at(&self) -> Result<Option<SystemTime>>;
 pub fn record_forced_scan_at(&self, when: SystemTime) -> Result<()>;
 ```
 
-Cleanup queries must never use `projects` as authority.
+Cleanup queries must never use `projects` as authority and must require the
+requested generation to be the globally newest row with
+`authority_valid = 1`. Per-policy fallback to an older generation is forbidden.
 
 - [ ] **Step 6: Run migration and history regressions**
 
@@ -467,7 +509,7 @@ git commit -m "feat: persist discovery authority generations"
 - Test: `tests/cli.rs`
 
 **Interfaces:**
-- Consumes: `ScopePolicy`, `IdentityProvider`, and `Store::reconcile_generation`.
+- Consumes: `ScopePolicy`, `IdentityProvider`, and `Store::publish_scan`.
 - Produces: `ScanReport::origins`, a matching current generation, and incomplete coverage for failed origins.
 
 - [ ] **Step 1: Write failing origin tests**
@@ -517,9 +559,17 @@ pub struct ObservedProject {
 
 An origin error must not abort unrelated origins. An invalid configured root is a policy error before scanning; traversal errors make that origin incomplete.
 
-- [ ] **Step 4: Reconcile one generation after every scan**
+- [ ] **Step 4: Atomically publish one generation after every scan**
 
-Change daemon and one-shot scan paths to call `Store::reconcile_generation` once after all origins finish. Remove cleanup authorization from `Cache::reconcile_for_review`; keep only historical alias normalization that does not grant authority.
+Change daemon and one-shot scan paths to call `Store::publish_scan` once after
+all origins finish. One transaction must include cache alias
+normalization/removals, linked-worktree success/failure reconciliation,
+failure-block state, global prior-generation invalidation, the new
+generation/origins/observations/project history, and scan diagnostics. Remove
+cleanup authorization from `Cache::reconcile_for_review`; keep only historical
+alias normalization that does not grant authority. An injected failure at any
+publication phase must leave the previous authority and every prior blocker
+coherent.
 
 - [ ] **Step 5: Make scan output name generation and incomplete origins**
 
@@ -580,8 +630,9 @@ Add behavioral tests for:
 - project replacement between review and clean;
 - target symlink/replacement between review and clean;
 - cross-device target;
+- same-device target whose mount identity differs;
 - different-boot reauthorization while still in scope;
-- same-generation inode change rejection.
+- same-generation inode or mount change rejection.
 
 Use a hookable fake cleaner to mutate the filesystem between review and execution.
 
@@ -612,7 +663,9 @@ Every review requires an observation from the current generation. A missing or m
 
 - [ ] **Step 4: Add immediate pre-Cargo revalidation**
 
-Before `Cleaner::clean`, call:
+Reject stale authority once before Cleaner performs target measurement. Then
+have Cleaner call a fallible pre-spawn validator after measurement and target
+reporting, immediately before `CommandRunner`. The validator calls:
 
 ```rust
 pub fn revalidate_before_clean(
@@ -624,7 +677,16 @@ pub fn revalidate_before_clean(
 ) -> Result<ExecutionDecision>;
 ```
 
-Re-check direct directory/file types, exact process-local identity, same-device relation, scope, exclusions, protected storage, activity, scan diagnostics, and quiet period. A failure becomes a recorded skip/error and never calls Cargo. Do not reauthorize a new identity inside the same run.
+Re-check direct directory/file types, exact process-local
+device/inode/mount identity, same-device and same-mount relations, scope,
+exclusions, protected storage, activity, scan diagnostics, and quiet period. A
+failure becomes a recorded skip/error and never calls Cargo. Do not
+reauthorize a new identity inside the same run. Cover both dynamic and
+persisted-review execution. The remaining TOCTOU window starts only after this
+final validator returns. Persist any cross-boot observation refresh only after
+the runner returns; no SQLite write belongs between the last identity read and
+the runner. Persist the Cargo audit event before attempting that refresh so a
+refresh failure cannot hide an invocation or mark the project cleaned.
 
 - [ ] **Step 5: Run safety and integration tests**
 

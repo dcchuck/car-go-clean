@@ -4,9 +4,13 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountIdentity(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemIdentity {
     pub device: u64,
     pub inode: u64,
+    pub mount: MountIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,8 +68,56 @@ impl IdentityProvider for SystemIdentityProvider {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn direct_identity(path: &Path) -> Result<FilesystemIdentity> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const STATX_TYPE: u32 = 0x0001;
+    const STATX_INO: u32 = 0x0100;
+    const STATX_BASIC_STATS: u32 = 0x07ff;
+    const STATX_MNT_ID: u32 = 0x1000;
+    const AT_NO_AUTOMOUNT: i32 = 0x800;
+
+    let path_bytes = path.as_os_str().as_bytes();
+    let path_c = CString::new(path_bytes)
+        .with_context(|| format!("path contains a NUL byte: {}", path.display()))?;
+    let mut stat = LinuxStatx::default();
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+            STATX_BASIC_STATS | STATX_MNT_ID,
+            &mut stat as *mut LinuxStatx,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read direct filesystem identity for {}", path.display()));
+    }
+    let required_mask = STATX_TYPE | STATX_INO | STATX_MNT_ID;
+    if stat.mask & required_mask != required_mask {
+        bail!(
+            "authoritative mount identity is unavailable for {}",
+            path.display()
+        );
+    }
+    if stat.mode & libc::S_IFMT as u16 == libc::S_IFLNK as u16 {
+        bail!("{} is a symlink", path.display());
+    }
+    Ok(FilesystemIdentity {
+        device: u64::from(stat.dev_major) << 32 | u64::from(stat.dev_minor),
+        inode: stat.ino,
+        mount: MountIdentity(format!("linux-statx:{}", stat.mount_id)),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn direct_identity(path: &Path) -> Result<FilesystemIdentity> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path)
@@ -73,18 +125,96 @@ fn direct_identity(path: &Path) -> Result<FilesystemIdentity> {
     if metadata.file_type().is_symlink() {
         bail!("{} is a symlink", path.display());
     }
+
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains a NUL byte: {}", path.display()))?;
+    let mut mount = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path_c.as_ptr(), mount.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read mount identity for {}", path.display()));
+    }
+    let mount = unsafe { mount.assume_init() };
+    let mount_path = mount
+        .f_mntonname
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|end| {
+            mount.f_mntonname[..end]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect::<Vec<_>>()
+        })
+        .filter(|bytes| !bytes.is_empty())
+        .with_context(|| {
+            format!(
+                "authoritative mount identity is unavailable for {}",
+                path.display()
+            )
+        })?;
+
     Ok(FilesystemIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        mount: MountIdentity(format!("macos-statfs:{}", encode_mount_path(&mount_path))),
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "macos")]
+fn encode_mount_path(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn direct_identity(path: &Path) -> Result<FilesystemIdentity> {
     Err(anyhow::anyhow!(
         "filesystem identity is not supported for {} on this platform",
         path.display()
     ))
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default)]
+struct LinuxStatxTimestamp {
+    seconds: i64,
+    nanoseconds: u32,
+    reserved: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default)]
+struct LinuxStatx {
+    mask: u32,
+    block_size: u32,
+    attributes: u64,
+    hard_links: u32,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    reserved: u16,
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    attributes_mask: u64,
+    access_time: LinuxStatxTimestamp,
+    birth_time: LinuxStatxTimestamp,
+    change_time: LinuxStatxTimestamp,
+    modification_time: LinuxStatxTimestamp,
+    device_major: u32,
+    device_minor: u32,
+    dev_major: u32,
+    dev_minor: u32,
+    mount_id: u64,
+    direct_io_memory_alignment: u32,
+    direct_io_offset_alignment: u32,
+    reserved_tail: [u64; 12],
 }
 
 #[cfg(target_os = "linux")]
@@ -168,6 +298,12 @@ fn platform_boot_session() -> Result<Option<BootSessionId>> {
 mod tests {
     use super::*;
     use std::io;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_statx_abi_layout_matches_the_kernel_structure() {
+        assert_eq!(std::mem::size_of::<LinuxStatx>(), 256);
+    }
 
     #[test]
     fn linux_boot_session_accepts_only_valid_uuid_text() {

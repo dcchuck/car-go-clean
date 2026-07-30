@@ -1457,7 +1457,7 @@ fn run_aborts_before_cargo_when_scan_persistence_fails() {
 
 #[cfg(unix)]
 #[test]
-fn run_aborts_before_cargo_when_project_upsert_fails() {
+fn run_rolls_back_atomic_scan_when_project_upsert_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let work = tempfile::tempdir().unwrap();
@@ -1480,6 +1480,8 @@ fn run_aborts_before_cargo_when_project_upsert_fails() {
     store
         .upsert_project(project.canonicalize().unwrap(), SystemTime::now())
         .unwrap();
+    let projects_before = store.all_projects().unwrap();
+    let diagnostics_before = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
     drop(store);
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1525,14 +1527,28 @@ fn run_aborts_before_cargo_when_project_upsert_fails() {
     assert!(!marker.exists());
     assert!(project.join("target/blob.bin").exists());
     let store = Store::open(&db_path).unwrap();
-    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
-    assert!(errors.iter().any(|error| {
-        error.category == "cache"
-            && error.path.as_deref() == project.canonicalize().unwrap().to_str()
-            && error
-                .message
-                .contains("injected project persistence failure")
-    }));
+    assert_eq!(store.all_projects().unwrap(), projects_before);
+    assert_eq!(
+        store.errors_since(SystemTime::UNIX_EPOCH).unwrap(),
+        diagnostics_before
+    );
+    let inspection = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM discovery_generations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM project_observations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -3855,6 +3871,150 @@ fn superseded_generation_rejects_entire_review_without_cargo() {
         .code(1)
         .stderr(contains("review plan"));
 
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_change_rejects_old_no_scan_and_review_authority() {
+    let work = tempfile::tempdir().unwrap();
+    let (policy_a, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&policy_a, &state, &home, &path);
+    let policy_b = work.path().join("policy-b.toml");
+    fs::write(
+        &policy_b,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"policy-b-only\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("root").display()
+        ),
+    )
+    .unwrap();
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&policy_b)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&policy_a)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stderr(contains("review plan"));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--no-scan", "--config"])
+        .arg(&policy_a)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(2)
+        .stdout(contains("matching discovery generation"));
+
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_a_b_a_prunes_an_untouched_a1_plan_without_cargo() {
+    let work = tempfile::tempdir().unwrap();
+    let (policy_a, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&policy_a, &state, &home, &path);
+    let policy_b = work.path().join("policy-b.toml");
+    fs::write(
+        &policy_b,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"policy-b-only\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("root").display()
+        ),
+    )
+    .unwrap();
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&policy_b)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+
+    let inspection = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    let plan_generation_valid = inspection
+        .query_row(
+            "
+            SELECT generation.authority_valid
+            FROM review_plans AS plan
+            JOIN discovery_generations AS generation
+              ON generation.id = plan.generation_id
+            WHERE plan.id = ?1
+            ",
+            [review_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap();
+    assert!(!plan_generation_valid);
+    drop(inspection);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&policy_a)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&policy_a)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        terminal_report(&output.stdout, "run")["outcome"]["reasons"],
+        serde_json::json!(["review_plan_missing"])
+    );
     assert!(!marker.exists());
 }
 

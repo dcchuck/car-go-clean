@@ -2077,6 +2077,7 @@ fn decision_label(decision: &CleanDecision) -> &'static str {
             SkipReason::ProjectIdentityUnavailable => "skipped:project_identity_unavailable",
             SkipReason::TargetIdentityUnavailable => "skipped:target_identity_unavailable",
             SkipReason::CrossDeviceTarget => "skipped:cross_device_target",
+            SkipReason::CrossMountTarget => "skipped:cross_mount_target",
             SkipReason::ProjectIdentityChanged => "skipped:project_identity_changed",
             SkipReason::TargetIdentityChanged => "skipped:target_identity_changed",
             SkipReason::OutOfScope => "skipped:out_of_scope",

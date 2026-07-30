@@ -2,12 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use car_go_clean::identity::{BootSessionId, FilesystemIdentity, ReviewedIdentity};
+use car_go_clean::identity::{BootSessionId, FilesystemIdentity, MountIdentity, ReviewedIdentity};
 use car_go_clean::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use car_go_clean::store::{
     CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
-    ObservationReconciliation, OriginReconciliation, PlanLoadError, Store, REVIEW_PLAN_RETENTION,
-    REVIEW_PLAN_TTL,
+    ObservationReconciliation, OriginReconciliation, PlanLoadError, ScanPublication, Store,
+    WorktreeReconciliation, REVIEW_PLAN_RETENTION, REVIEW_PLAN_TTL,
 };
 
 fn test_store(path: &Path) -> Store {
@@ -170,7 +170,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 12);
+    assert_eq!(schema_version, 13);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1715,8 +1715,13 @@ fn observed_project(
         project_identity: FilesystemIdentity {
             device: project_device,
             inode: project_inode,
+            mount: MountIdentity("store-project-mount".to_string()),
         },
-        target_identity: target.map(|(device, inode)| FilesystemIdentity { device, inode }),
+        target_identity: target.map(|(device, inode)| FilesystemIdentity {
+            device,
+            inode,
+            mount: MountIdentity("store-project-mount".to_string()),
+        }),
         observed_at,
         authorized: true,
         blocked_reason: None,
@@ -1769,7 +1774,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 12);
+        assert_eq!(schema_version, 13);
     }
 }
 
@@ -1904,7 +1909,112 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 12);
+    assert_eq!(schema_version, 13);
+}
+
+#[test]
+fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("v12.db");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
+    let (generation_id, plan_id) = {
+        let store = test_store(&database);
+        let generation = store
+            .reconcile_generation(
+                now,
+                &GenerationReconciliation {
+                    policy_hash: "policy-v12".to_string(),
+                    boot_session_id: Some("boot-v12".to_string()),
+                    origins: vec![completed_origin(
+                        "/workspace",
+                        vec![observed_project(
+                            "/workspace/project",
+                            7,
+                            11,
+                            Some((7, 12)),
+                            now,
+                        )],
+                    )],
+                },
+            )
+            .unwrap();
+        let review = persisted_review(
+            "/workspace/project",
+            Some("/workspace/project"),
+            ProjectClass::Workspace,
+            100,
+            Some((7, 11, 7, 12, Some("boot-v12"))),
+            CleanDecision::Cleanable,
+        );
+        let plan = store
+            .create_review_plan(now, "policy-v12", generation.id, false, 100, &[review])
+            .unwrap();
+        (generation.id, plan.id)
+    };
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                DROP INDEX idx_discovery_generations_single_valid;
+                ALTER TABLE project_observations DROP COLUMN project_mount_id;
+                ALTER TABLE project_observations DROP COLUMN target_mount_id;
+                ALTER TABLE review_plan_targets DROP COLUMN project_mount_id;
+                ALTER TABLE review_plan_targets DROP COLUMN target_mount_id;
+                DELETE FROM schema_version WHERE version = 13;
+                ",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(store.current_generation("policy-v12").unwrap(), None);
+    assert!(store
+        .authorized_observations(generation_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.load_review_plan(plan_id, now, "policy-v12", generation_id),
+        Err(PlanLoadError::Missing)
+    );
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        13
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "
+                SELECT authorized, blocked_reason, project_mount_id, target_mount_id
+                FROM project_observations
+                WHERE generation_id = ?1
+                ",
+                [generation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        (
+            false,
+            Some("migration requires fresh mount identity discovery".to_string()),
+            None,
+            None,
+        )
+    );
 }
 
 #[test]
@@ -1964,21 +2074,23 @@ fn discovery_generation_reconciliation_authorizes_only_completed_origins() {
         authorized[0].project_identity,
         FilesystemIdentity {
             device: 7,
-            inode: 11
+            inode: 11,
+            mount: MountIdentity("store-project-mount".to_string()),
         }
     );
     assert_eq!(
         authorized[0].target_identity,
         Some(FilesystemIdentity {
             device: 7,
-            inode: 12
+            inode: 12,
+            mount: MountIdentity("store-project-mount".to_string()),
         })
     );
     assert_eq!(store.all_projects().unwrap().len(), 2);
 }
 
 #[test]
-fn discovery_generation_new_snapshot_revokes_removed_projects_and_separates_policy_hashes() {
+fn discovery_generation_authority_is_global_and_never_resurrects_across_policy_changes() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let second_time = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
@@ -2017,6 +2129,20 @@ fn discovery_generation_new_snapshot_revokes_removed_projects_and_separates_poli
             },
         )
         .unwrap();
+    assert!(store.authorized_observations(first.id).unwrap().is_empty());
+    assert_eq!(
+        store
+            .authorized_observations(second.id)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.project_path.clone())
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("/workspace/kept")]
+    );
+    let plan_preserved_until_policy_returns = store
+        .create_review_plan(second_time, "policy-a", second.id, false, 0, &[])
+        .unwrap();
+
     let other_policy = store
         .reconcile_generation(
             second_time + Duration::from_secs(1),
@@ -2028,31 +2154,48 @@ fn discovery_generation_new_snapshot_revokes_removed_projects_and_separates_poli
         )
         .unwrap();
 
-    assert_eq!(
-        store
-            .authorized_observations(first.id)
-            .unwrap()
-            .iter()
-            .map(|observation| observation.project_path.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            PathBuf::from("/workspace/kept"),
-            PathBuf::from("/workspace/removed")
-        ]
-    );
-    assert_eq!(
-        store
-            .authorized_observations(second.id)
-            .unwrap()
-            .iter()
-            .map(|observation| observation.project_path.clone())
-            .collect::<Vec<_>>(),
-        vec![PathBuf::from("/workspace/kept")]
-    );
-    assert_eq!(store.current_generation("policy-a").unwrap(), Some(second));
+    assert!(store.authorized_observations(second.id).unwrap().is_empty());
+    assert_eq!(store.current_generation("policy-a").unwrap(), None);
     assert_eq!(
         store.current_generation("policy-b").unwrap(),
-        Some(other_policy)
+        Some(other_policy.clone())
+    );
+
+    let returned_policy = store
+        .reconcile_generation(
+            second_time + Duration::from_secs(2),
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/kept",
+                        1,
+                        2,
+                        Some((1, 3)),
+                        second_time,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
+
+    assert!(returned_policy.id > other_policy.id);
+    assert_eq!(
+        store.current_generation("policy-a").unwrap(),
+        Some(returned_policy.clone())
+    );
+    assert_eq!(store.current_generation("policy-b").unwrap(), None);
+    assert!(store.authorized_observations(first.id).unwrap().is_empty());
+    assert_eq!(
+        store.load_review_plan(
+            plan_preserved_until_policy_returns.id,
+            second_time + Duration::from_secs(2),
+            "policy-a",
+            returned_policy.id,
+        ),
+        Err(PlanLoadError::GenerationMismatch)
     );
     assert_eq!(store.all_projects().unwrap().len(), 2);
 }
@@ -2104,11 +2247,30 @@ fn discovery_generation_clock_regression_still_selects_latest_inserted_generatio
 fn discovery_generation_reconciliation_rolls_back_generation_and_history_on_failure() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let previous = store
+        .reconcile_generation(
+            observed_at,
+            &GenerationReconciliation {
+                policy_hash: "policy-before-failure".to_string(),
+                boot_session_id: None,
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/preserved",
+                        1,
+                        20,
+                        Some((1, 21)),
+                        observed_at,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
     let duplicate = observed_project("/workspace/duplicate", 1, 2, Some((1, 3)), observed_at);
     let result = store.reconcile_generation(
-        observed_at,
+        observed_at + Duration::from_secs(1),
         &GenerationReconciliation {
-            policy_hash: "policy-a".to_string(),
+            policy_hash: "policy-failed".to_string(),
             boot_session_id: None,
             origins: vec![completed_origin(
                 "/workspace",
@@ -2118,8 +2280,153 @@ fn discovery_generation_reconciliation_rolls_back_generation_and_history_on_fail
     );
 
     assert!(result.is_err());
-    assert_eq!(store.current_generation("policy-a").unwrap(), None);
-    assert!(store.all_projects().unwrap().is_empty());
+    assert_eq!(
+        store.current_generation("policy-before-failure").unwrap(),
+        Some(previous.clone())
+    );
+    assert_eq!(store.current_generation("policy-failed").unwrap(), None);
+    assert_eq!(
+        store
+            .authorized_observations(previous.id)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.project_path.clone())
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("/workspace/preserved")]
+    );
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_publication_rolls_back_worktrees_cache_generation_and_diagnostics_at_every_failure_point() {
+    use std::os::unix::fs::symlink;
+
+    for (trigger_name, trigger_target) in [
+        ("fail_generation", "discovery_generations"),
+        ("fail_observation", "project_observations"),
+        ("fail_diagnostic", "errors"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let store = test_store(&database);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        let primary = directory.path().join("primary");
+        let old_linked = directory.path().join("old-linked");
+        let new_linked = directory.path().join("new-linked");
+        let canonical_project = directory.path().join("canonical-project");
+        let project_alias = directory.path().join("project-alias");
+        for path in [&primary, &old_linked, &new_linked, &canonical_project] {
+            fs::create_dir_all(path).unwrap();
+        }
+        symlink(&canonical_project, &project_alias).unwrap();
+        let primary = primary.canonicalize().unwrap();
+        let old_linked = old_linked.canonicalize().unwrap();
+        let new_linked = new_linked.canonicalize().unwrap();
+
+        store
+            .replace_linked_worktrees(&primary, std::slice::from_ref(&old_linked))
+            .unwrap();
+        store
+            .mark_worktree_discovery_failed(&primary, now, "preserved failure")
+            .unwrap();
+        store.upsert_project(&project_alias, now).unwrap();
+        store
+            .record_error(&ErrorRecord {
+                id: 0,
+                ts: now,
+                category: "scan".to_string(),
+                path: Some("/preserved".to_string()),
+                message: "preserved diagnostic".to_string(),
+            })
+            .unwrap();
+        let previous = store
+            .reconcile_generation(
+                now,
+                &GenerationReconciliation {
+                    policy_hash: "policy-before-failure".to_string(),
+                    boot_session_id: None,
+                    origins: vec![completed_origin(
+                        "/workspace",
+                        vec![observed_project(
+                            "/workspace/preserved",
+                            1,
+                            2,
+                            Some((1, 3)),
+                            now,
+                        )],
+                    )],
+                },
+            )
+            .unwrap();
+
+        let projects_before = store.all_projects().unwrap();
+        let blocks_before = store.blocked_worktree_discovery_paths().unwrap();
+        let diagnostics_before = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(&format!(
+                "
+                CREATE TRIGGER {trigger_name}
+                BEFORE INSERT ON {trigger_target}
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected publication failure');
+                END;
+                "
+            ))
+            .unwrap();
+        drop(connection);
+
+        let result = store.publish_scan(
+            now + Duration::from_secs(1),
+            &ScanPublication {
+                generation: GenerationReconciliation {
+                    policy_hash: "policy-failed".to_string(),
+                    boot_session_id: None,
+                    origins: vec![completed_origin(
+                        "/workspace",
+                        vec![observed_project(
+                            "/workspace/new",
+                            1,
+                            4,
+                            Some((1, 5)),
+                            now + Duration::from_secs(1),
+                        )],
+                    )],
+                },
+                worktrees: vec![WorktreeReconciliation::Success {
+                    primary: primary.clone(),
+                    linked: vec![new_linked],
+                    excluded: vec![],
+                    out_of_scope: vec![],
+                }],
+                diagnostics: vec![ErrorRecord {
+                    id: 0,
+                    ts: now + Duration::from_secs(1),
+                    category: "scan".to_string(),
+                    path: Some("/new".to_string()),
+                    message: "must roll back".to_string(),
+                }],
+            },
+        );
+
+        assert!(result.is_err(), "{trigger_name} must abort publication");
+        assert_eq!(
+            store.current_generation("policy-before-failure").unwrap(),
+            Some(previous)
+        );
+        assert_eq!(store.current_generation("policy-failed").unwrap(), None);
+        assert_eq!(
+            store.blocked_worktree_discovery_paths().unwrap(),
+            blocks_before
+        );
+        assert_eq!(store.all_projects().unwrap(), projects_before);
+        assert_eq!(
+            store.errors_since(SystemTime::UNIX_EPOCH).unwrap(),
+            diagnostics_before
+        );
+    }
 }
 
 #[test]
@@ -2149,10 +2456,12 @@ fn discovery_generation_reverification_replaces_persisted_identity() {
         project: FilesystemIdentity {
             device: 4,
             inode: 5,
+            mount: MountIdentity("reverified-mount".to_string()),
         },
         target: FilesystemIdentity {
             device: 4,
             inode: 6,
+            mount: MountIdentity("reverified-mount".to_string()),
         },
         boot_session: Some(BootSessionId("boot-b".to_string())),
     };
@@ -2301,10 +2610,12 @@ fn persisted_review(
                     project: FilesystemIdentity {
                         device: project_device,
                         inode: project_inode,
+                        mount: MountIdentity("review-plan-mount".to_string()),
                     },
                     target: FilesystemIdentity {
                         device: target_device,
                         inode: target_inode,
+                        mount: MountIdentity("review-plan-mount".to_string()),
                     },
                     boot_session: boot_session.map(|value| BootSessionId(value.to_string())),
                 }
@@ -2782,9 +3093,12 @@ fn version_eleven_migration_adds_review_plans_without_changing_history() {
         connection
             .execute_batch(
                 "
+                DROP INDEX idx_discovery_generations_single_valid;
+                ALTER TABLE project_observations DROP COLUMN project_mount_id;
+                ALTER TABLE project_observations DROP COLUMN target_mount_id;
                 DROP TABLE review_plan_targets;
                 DROP TABLE review_plans;
-                DELETE FROM schema_version WHERE version = 12;
+                DELETE FROM schema_version WHERE version >= 12;
                 ",
             )
             .unwrap();

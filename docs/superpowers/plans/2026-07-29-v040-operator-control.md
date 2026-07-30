@@ -4,7 +4,7 @@
 
 **Goal:** Let operators execute exactly a persisted review, make output machine-actionable, and make service and upgrade behavior persistently correct on macOS and Linux.
 
-**Architecture:** Persist immutable review plans bound to the Runtime Safety Slice-A policy hash and discovery generation. Route dynamic runs and reviewed runs through one execution engine, with reviewed execution allowed only to remove targets after safety revalidation. Extend the service manager to model definition, enablement, and process state separately, capture protected-root environment into service definitions, and ship a tested upgrade helper that understands exit `0`/`2`/`1`.
+**Architecture:** Persist immutable review plans bound to the Runtime Safety Slice-A policy hash, globally current discovery generation, and exact project/target device, inode, and mount identities. Route dynamic runs and reviewed runs through one execution engine, with reviewed execution allowed only to remove targets after safety revalidation. Extend the service manager to model definition, enablement, and process state separately, capture protected-root environment into service definitions, and ship a tested upgrade helper that understands exit `0`/`2`/`1`.
 
 **Tech Stack:** Rust 1.95+, clap, serde/serde_json, SQLite/rusqlite, launchctl, systemd user services, POSIX shell integration tests.
 
@@ -14,7 +14,9 @@
 - Do not alter the real installed binary, launchd service, config, or state on the development Mac.
 - Every dry run persists a plan; `--all` remains display-only.
 - Plans expire after 30 minutes and at most 20 current plans remain.
-- Plan validity requires both current policy hash and current discovery generation.
+- Plan validity requires both the current policy hash and the globally newest
+  valid discovery generation. A prior generation never becomes current again
+  merely because its policy hash returns.
 - Reviewed execution may remove targets after safety checks and may never add targets.
 - Exit `1` outranks `2`; upgrade preview accepts `0` and `2` and rejects `1`.
 - `service stop` must remain stopped across login/reboot.
@@ -32,7 +34,10 @@
 
 **Interfaces:**
 - Consumes: current `ScopePolicy::hash`, `DiscoveryGeneration::id`, and complete `ProjectReview` records.
-- Produces: schema version 12, `Store::create_review_plan`, `Store::load_review_plan`, and `Store::prune_review_plans`. Runtime Safety Slices A and B already own schema versions 10 and 11, respectively.
+- Produces: schema version 12, followed by Task 9A's mount-identity corrective
+  schema version 13, `Store::create_review_plan`,
+  `Store::load_review_plan`, and `Store::prune_review_plans`. Runtime Safety
+  Slices A and B already own schema versions 10 and 11, respectively.
 
 - [ ] **Step 1: Add failing schema and plan tests**
 
@@ -117,11 +122,30 @@ CREATE INDEX idx_review_plans_expires ON review_plans(expires_at);
 INSERT INTO schema_version(version) VALUES (12);
 ```
 
+Task 9A adds schema version 13 rather than manufacturing mount authority for
+existing plans:
+
+```sql
+ALTER TABLE review_plan_targets ADD COLUMN project_mount_id TEXT;
+ALTER TABLE review_plan_targets ADD COLUMN target_mount_id TEXT;
+ALTER TABLE project_observations ADD COLUMN project_mount_id TEXT;
+ALTER TABLE project_observations ADD COLUMN target_mount_id TEXT;
+UPDATE discovery_generations SET authority_valid = 0;
+CREATE UNIQUE INDEX idx_discovery_generations_single_valid
+    ON discovery_generations(authority_valid)
+    WHERE authority_valid = 1;
+INSERT INTO schema_version(version) VALUES (13);
+```
+
+The migration revokes legacy observation authority and prunes review plans
+whose identities lack mount IDs. It must never infer mount IDs from device
+numbers.
+
 Enable `PRAGMA foreign_keys = ON` on every opened connection so generation and
 plan deletion cascades are behavioral guarantees. The nullable identity group
 preserves complete `ProjectReview` authority: canonical project path, project
-class, exact project/target device and inode, optional boot scope, reviewed
-bytes, and the full typed decision payload.
+class, exact project/target device, inode, and mount identity, optional boot
+scope, reviewed bytes, and the full typed decision payload.
 
 - [ ] **Step 4: Implement typed plan APIs**
 
@@ -146,7 +170,7 @@ pub struct ReviewPlan {
 Creation and target inserts are one transaction. `load_review_plan` returns a
 typed `PlanLoadError::{Missing, Expired, PolicyMismatch, GenerationMismatch}`.
 Store open prunes expired plans and plans whose generation is missing,
-unauthorized, or no longer newest for its policy. Creation and load additionally
+unauthorized, or no longer globally newest. Creation and load additionally
 prune against the supplied current policy/generation authority, then creation
 retains only the newest 20 plans.
 
@@ -193,6 +217,8 @@ fn newly_eligible_target_is_not_added_to_reviewed_run() {}
 fn newly_unsafe_target_is_removed_from_reviewed_run() {}
 #[test]
 fn superseded_generation_rejects_the_entire_plan() {}
+#[test]
+fn policy_a_b_a_never_resurrects_old_review_authority() {}
 #[test]
 fn expired_or_policy_mismatched_plan_exits_one_without_cargo() {}
 #[test]
@@ -264,7 +290,11 @@ Text:
 Cleaning /canonical/project/target (project /canonical/project)
 ```
 
-JSON emits a target event before the summary. Complete independent safe targets even after one Cargo failure; merge outcome severity at the end.
+JSON emits a target-attempt event before the summary. The final safety
+validator runs after that event and immediately before Cargo, so a target event
+may be followed by a typed skip without a Cargo launch. The terminal summary is
+authoritative. Complete independent safe targets even after one Cargo failure;
+merge outcome severity at the end.
 
 - [ ] **Step 7: Run CLI and daemon integration tests**
 

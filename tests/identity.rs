@@ -5,9 +5,11 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use car_go_clean::config;
+#[cfg(target_os = "linux")]
+use car_go_clean::identity::SystemIdentityProvider;
 use car_go_clean::identity::{
     compare_persisted, BootSessionId, FilesystemIdentity, IdentityComparison, IdentityProvider,
-    ReviewedIdentity,
+    MountIdentity, ReviewedIdentity,
 };
 use car_go_clean::policy::{Environment, ScopePolicy};
 use car_go_clean::safety::{
@@ -36,8 +38,26 @@ impl FakeIdentityProvider {
     }
 
     fn with_identity(mut self, path: &Path, device: u64, inode: u64) -> Self {
-        self.identities
-            .insert(path.to_path_buf(), FilesystemIdentity { device, inode });
+        self.identities.insert(
+            path.to_path_buf(),
+            FilesystemIdentity {
+                device,
+                inode,
+                mount: MountIdentity("test-mount-a".to_string()),
+            },
+        );
+        self
+    }
+
+    fn with_mounted_identity(mut self, path: &Path, device: u64, inode: u64, mount: &str) -> Self {
+        self.identities.insert(
+            path.to_path_buf(),
+            FilesystemIdentity {
+                device,
+                inode,
+                mount: MountIdentity(mount.to_string()),
+            },
+        );
         self
     }
 }
@@ -67,7 +87,11 @@ impl Environment for EmptyEnvironment {
 }
 
 fn identity(device: u64, inode: u64) -> FilesystemIdentity {
-    FilesystemIdentity { device, inode }
+    FilesystemIdentity {
+        device,
+        inode,
+        mount: MountIdentity("test-mount-a".to_string()),
+    }
 }
 
 fn options() -> SafetyOptions {
@@ -236,6 +260,32 @@ fn project_and_target_on_different_devices_are_rejected() {
 }
 
 #[test]
+fn project_and_target_on_same_device_but_different_mounts_are_rejected() {
+    let project = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let provider = FakeIdentityProvider::with_boot(Some("boot-a"))
+        .with_mounted_identity(project.path(), 1, 10, "mount-project")
+        .with_mounted_identity(&project.path().join("target"), 1, 11, "mount-bind-target");
+
+    let review = review_project_with_identity_provider(
+        project.path(),
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &options(),
+        &provider,
+    )
+    .unwrap();
+
+    assert_eq!(
+        review.decision,
+        CleanDecision::Skipped(SkipReason::CrossMountTarget)
+    );
+    assert_eq!(review.reviewed_identity, None);
+}
+
+#[test]
 fn cleanable_review_captures_exact_identity_and_boot_session() {
     let project = tempfile::tempdir().unwrap();
     write_project(project.path());
@@ -314,4 +364,69 @@ fn unavailable_boot_id_requires_exact_persisted_identity() {
         compare_persisted(None, current_boot.as_ref(), &identity(8, 20), &current),
         IdentityComparison::Replaced
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn system_identity_distinguishes_a_real_same_filesystem_bind_mount() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    struct BindMountGuard {
+        target: CString,
+        mounted: bool,
+    }
+
+    impl Drop for BindMountGuard {
+        fn drop(&mut self) {
+            if self.mounted {
+                unsafe {
+                    libc::umount(self.target.as_ptr());
+                }
+            }
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let mounted = directory.path().join("mounted");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&mounted).unwrap();
+    let source_c = CString::new(source.as_os_str().as_bytes()).unwrap();
+    let mounted_c = CString::new(mounted.as_os_str().as_bytes()).unwrap();
+    let result = unsafe {
+        libc::mount(
+            source_c.as_ptr(),
+            mounted_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
+        ) {
+            eprintln!(
+                "SKIP: real bind-mount identity integration requires mount permission: {error}"
+            );
+            return;
+        }
+        panic!("create bind mount for identity integration test: {error}");
+    }
+    let mut guard = BindMountGuard {
+        target: mounted_c,
+        mounted: true,
+    };
+
+    let provider = SystemIdentityProvider;
+    let source_identity = provider.identity(&source).unwrap();
+    let mounted_identity = provider.identity(&mounted).unwrap();
+
+    assert_eq!(source_identity.device, mounted_identity.device);
+    assert_ne!(source_identity.mount, mounted_identity.mount);
+    assert_eq!(unsafe { libc::umount(guard.target.as_ptr()) }, 0);
+    guard.mounted = false;
 }

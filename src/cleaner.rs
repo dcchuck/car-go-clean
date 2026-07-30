@@ -66,6 +66,19 @@ impl<R: CommandRunner> Cleaner<R> {
         project_dir: impl AsRef<Path>,
         report_attempt: impl FnOnce(&Path, &Path),
     ) -> Result<CleanResult> {
+        self.clean_with_attempt_reporter_and_pre_spawn_validator(
+            project_dir,
+            report_attempt,
+            |_, _| Ok(true),
+        )
+    }
+
+    pub fn clean_with_attempt_reporter_and_pre_spawn_validator(
+        &self,
+        project_dir: impl AsRef<Path>,
+        report_attempt: impl FnOnce(&Path, &Path),
+        validate_before_spawn: impl FnOnce(&Path, &Path) -> Result<bool>,
+    ) -> Result<CleanResult> {
         let project_dir = project_dir.as_ref();
         let target_dir = project_dir.join("target");
         let mut result = CleanResult {
@@ -93,6 +106,11 @@ impl<R: CommandRunner> Cleaner<R> {
             .env_remove("CARGO_TARGET_DIR")
             .current_dir(project_dir);
         report_attempt(project_dir, &target_dir);
+        if !validate_before_spawn(project_dir, &target_dir)? {
+            result.duration = start.elapsed();
+            result.skipped = true;
+            return Ok(result);
+        }
         let outcome = self.runner.run(project_dir, &mut cmd)?;
         result.duration = start.elapsed();
         result.exit_code = outcome.exit_code;
