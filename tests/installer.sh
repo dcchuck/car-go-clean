@@ -153,6 +153,57 @@ cmp "$fixture_dir/car-go-clean" "$loopback_dir/car-go-clean"
 test "$(cat "$curl_log")" = "http://127.0.0.1:8000/car-go-clean-aarch64-apple-darwin.tar.xz http://127.0.0.1:8000/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
 
 : > "$curl_log"
+localhost_dir="$work_dir/localhost-install"
+CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+    --version 0.2.0 \
+    --download-base-url http://localhost/rehearsal/assets \
+    --install-dir "$localhost_dir"
+cmp "$fixture_dir/car-go-clean" "$localhost_dir/car-go-clean"
+test "$(cat "$curl_log")" = "http://localhost/rehearsal/assets/car-go-clean-aarch64-apple-darwin.tar.xz http://localhost/rehearsal/assets/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+: > "$curl_log"
+ipv6_loopback_dir="$work_dir/ipv6-loopback-install"
+CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+    --version 0.2.0 \
+    --download-base-url 'http://[::1]:8001/rehearsal/assets' \
+    --install-dir "$ipv6_loopback_dir"
+cmp "$fixture_dir/car-go-clean" "$ipv6_loopback_dir/car-go-clean"
+test "$(cat "$curl_log")" = "http://[::1]:8001/rehearsal/assets/car-go-clean-aarch64-apple-darwin.tar.xz http://[::1]:8001/rehearsal/assets/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+for userinfo_url in \
+    http://127.0.0.1:80@attacker.example.invalid/assets \
+    http://localhost:80@attacker.example.invalid/assets
+do
+    : > "$curl_log"
+    if CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+        --version 0.2.0 \
+        --download-base-url "$userinfo_url" \
+        --install-dir "$work_dir/userinfo-install"
+    then
+        echo "userinfo download URL accepted as loopback: $userinfo_url" >&2
+        exit 1
+    fi
+    test ! -s "$curl_log"
+done
+
+for malformed_loopback_url in \
+    http://127.0.0.1:not-a-port/assets \
+    http://localhost:80:90/assets \
+    'http://[::1]:not-a-port/assets'
+do
+    : > "$curl_log"
+    if CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+        --version 0.2.0 \
+        --download-base-url "$malformed_loopback_url" \
+        --install-dir "$work_dir/malformed-loopback-install"
+    then
+        echo "malformed loopback URL accepted: $malformed_loopback_url" >&2
+        exit 1
+    fi
+    test ! -s "$curl_log"
+done
+
+: > "$curl_log"
 if CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
     --version 0.2.0 \
     --download-base-url http://artifacts.example.invalid/releases/v0.2.0 \

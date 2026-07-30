@@ -71,6 +71,15 @@ printf '%s\n' "$validation_output" | grep -qx "RELEASE_SHA=$release_sha"
 printf '%s\n' "$validation_output" | grep -qx 'VERSION=0.4.0'
 printf '%s\n' "$validation_output" | grep -qx 'TAG=v0.4.0'
 
+ancestor_release_sha=$release_sha
+printf '%s\n' 'second same-version commit' > "$validation_repo/second-commit"
+git -C "$validation_repo" add second-commit
+git -C "$validation_repo" commit -qm "second same-version fixture"
+git -C "$validation_repo" push -qu origin main
+release_sha=$(git -C "$validation_repo" rev-parse HEAD)
+expect_failure "requested ancestor differs from checkout HEAD" \
+    run_validator "$validation_repo" "$ancestor_release_sha" 0.4.0
+
 expect_failure "short commit SHA" \
     run_validator "$validation_repo" 01234567 0.4.0
 expect_failure "unreachable commit SHA" \

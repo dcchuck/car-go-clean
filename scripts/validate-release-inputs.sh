@@ -50,6 +50,16 @@ then
     exit 1
 fi
 
+head_sha=$(git rev-parse 'HEAD^{commit}') || {
+    echo "could not resolve checkout HEAD" >&2
+    exit 1
+}
+if test "$head_sha" != "$release_sha"
+then
+    echo "release checkout HEAD $head_sha does not match requested commit $release_sha" >&2
+    exit 1
+fi
+
 if ! git merge-base --is-ancestor "$release_sha" origin/main
 then
     echo "release commit is not contained by origin/main: $release_sha" >&2

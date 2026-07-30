@@ -1,6 +1,24 @@
 #!/bin/sh
 set -eu
 
+is_loopback_http_url() {
+    test_url_rest=${1#http://}
+    test_url_authority=${test_url_rest%%/*}
+
+    case "$test_url_authority" in
+        *@*) return 1 ;;
+        127.0.0.1|localhost|'[::1]') return 0 ;;
+        127.0.0.1:*|localhost:*) test_url_port=${test_url_authority#*:} ;;
+        '[::1]':*) test_url_port=${test_url_authority#"[::1]:"} ;;
+        *) return 1 ;;
+    esac
+
+    case "$test_url_port" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 version=latest
 version_requested=false
 install_dir="$HOME/.local/bin"
@@ -56,9 +74,12 @@ if [ -n "$download_base_url" ]; then
                 exit 2
             fi
             case "$download_base_url" in
-                http://127.0.0.1|http://127.0.0.1:*|http://127.0.0.1/*|\
-                http://localhost|http://localhost:*|http://localhost/*|\
-                "http://[::1]"|"http://[::1]":*|"http://[::1]"/*|\
+                http://*)
+                    if ! is_loopback_http_url "$download_base_url"; then
+                        echo "insecure test download URL must use loopback HTTP or an absolute file URL" >&2
+                        exit 2
+                    fi
+                    ;;
                 file:///*) ;;
                 *)
                     echo "insecure test download URL must use loopback HTTP or an absolute file URL" >&2
