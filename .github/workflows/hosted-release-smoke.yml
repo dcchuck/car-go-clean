@@ -41,6 +41,9 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           persist-credentials: false
+      - name: Set up Homebrew on Linux
+        if: ${{ runner.os == 'Linux' }}
+        uses: Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168
       - name: Verify public install paths
         shell: bash
         env:
@@ -148,30 +151,29 @@ jobs:
             "$TAG" \
             "$ASSET_DIR" \
             "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
-          if test "$(uname -s)" = Darwin
-          then
-            export HOMEBREW_NO_AUTO_UPDATE=1
-            export HOMEBREW_NO_INSTALL_CLEANUP=1
-            FORMULA_TAP=car-go-clean/release-smoke
-            git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
-            git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release smoke"
-            git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
-            git -C "$ISOLATED_ROOT/formula-tap" config commit.gpgsign false
-            git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
-            git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local release formula"
-            cleanup() {
-              brew uninstall --force car-go-clean >/dev/null 2>&1 || true
-              brew untap "$FORMULA_TAP" >/dev/null 2>&1 || true
-            }
-            trap cleanup EXIT HUP INT TERM
-            brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
-            brew install car-go-clean/release-smoke/car-go-clean
-            brew test car-go-clean
-            brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
-            test "$("$brew_binary" version)" = "$VERSION"
-          else
-            ruby -c "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
-          fi
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          FORMULA_TAP=car-go-clean/release-smoke
+          git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
+          git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release smoke"
+          git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+          git -C "$ISOLATED_ROOT/formula-tap" config commit.gpgsign false
+          git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
+          git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local release formula"
+          cleanup() {
+            brew uninstall --force car-go-clean >/dev/null 2>&1 || true
+            brew untap "$FORMULA_TAP" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT HUP INT TERM
+          brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
+          brew install car-go-clean/release-smoke/car-go-clean
+          brew test car-go-clean
+          brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
+          brew_link="$(brew --prefix)/bin/car-go-clean"
+          test -x "$brew_binary"
+          test "$(command -v car-go-clean)" = "$brew_link"
+          test "$(realpath "$brew_link")" = "$(realpath "$brew_binary")"
+          test "$("$brew_binary" version)" = "$VERSION"
           test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
           test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"

@@ -1108,6 +1108,10 @@ fn rehearse_release_dispatch_is_exact_sha_bound_and_uses_only_pinned_actions() {
             "dtolnay/rust-toolchain",
             "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c",
         ),
+        (
+            "Homebrew/actions/setup-homebrew",
+            "Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168",
+        ),
     ];
     let mut seen = BTreeSet::new();
     for (_, job) in rehearsal["jobs"].as_hash().unwrap() {
@@ -1950,6 +1954,112 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
 }
 
 #[test]
+fn every_release_gate_installs_and_tests_homebrew_on_both_linux_architectures() {
+    let gates = [
+        (
+            ".github/workflows/rehearse-release.yml",
+            "Smoke actual installer and formula",
+        ),
+        (
+            ".github/workflows/release-verify.yml",
+            "Verify authenticated draft install paths",
+        ),
+        (
+            ".github/workflows/hosted-release-smoke.yml",
+            "Verify public install paths",
+        ),
+    ];
+
+    for (workflow_path, verification_step) in gates {
+        let document = workflow(workflow_path);
+        let smoke = &document["jobs"]["smoke"];
+        let linux_targets = smoke["strategy"]["matrix"]["include"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["target"]
+                    .as_str()
+                    .is_some_and(|target| target.contains("unknown-linux"))
+            })
+            .map(|entry| {
+                (
+                    entry["target"].as_str().unwrap(),
+                    entry["runner"].as_str().unwrap(),
+                    entry["expected_uname"].as_str().unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            linux_targets,
+            BTreeSet::from([
+                ("aarch64-unknown-linux-musl", "ubuntu-24.04-arm", "aarch64"),
+                ("x86_64-unknown-linux-musl", "ubuntu-24.04", "x86_64"),
+            ]),
+            "{workflow_path} must retain native arm64 and x86_64 Linuxbrew coverage"
+        );
+
+        let steps = workflow_steps(&document, "smoke");
+        let setup = uses_action(
+            steps,
+            "Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168",
+        );
+        assert_eq!(
+            setup.len(),
+            1,
+            "{workflow_path} must use exactly one immutable Linuxbrew setup action"
+        );
+        assert_eq!(
+            setup[0]["if"].as_str(),
+            Some("${{ runner.os == 'Linux' }}"),
+            "{workflow_path} must not replace the preinstalled Homebrew on macOS"
+        );
+
+        let verification = named_step(steps, verification_step);
+        let setup_index = steps
+            .iter()
+            .position(|step| std::ptr::eq(step, setup[0]))
+            .unwrap();
+        let verification_index = steps
+            .iter()
+            .position(|step| std::ptr::eq(step, verification))
+            .unwrap();
+        assert!(
+            setup_index < verification_index,
+            "{workflow_path} must set up Linuxbrew before exercising the formula"
+        );
+        assert!(setup[0]["continue-on-error"].is_badvalue());
+        assert!(verification["continue-on-error"].is_badvalue());
+
+        let run = run_command(verification).unwrap();
+        for fragment in [
+            "brew tap --custom-remote",
+            "brew install car-go-clean/",
+            "brew test car-go-clean",
+            "brew_binary=\"$(brew --prefix car-go-clean)/bin/car-go-clean\"",
+            "brew_link=\"$(brew --prefix)/bin/car-go-clean\"",
+            "test -x \"$brew_binary\"",
+            "test \"$(command -v car-go-clean)\" = \"$brew_link\"",
+            "test \"$(realpath \"$brew_link\")\" = \"$(realpath \"$brew_binary\")\"",
+            "test \"$(\"$brew_binary\" version)\" = \"$VERSION\"",
+        ] {
+            assert!(
+                run.contains(fragment),
+                "{workflow_path} Homebrew smoke is missing `{fragment}`"
+            );
+        }
+        assert!(
+            !run.contains("ruby -c"),
+            "{workflow_path} must run the real formula install and test on Linux"
+        );
+        assert!(
+            !run.contains("if test \"$(uname -s)\" = Darwin"),
+            "{workflow_path} must not restrict the formula exercise to macOS"
+        );
+    }
+}
+
+#[test]
 fn authenticated_draft_verification_requires_all_fifteen_assets() {
     let verify = workflow(".github/workflows/release-verify.yml");
     assert_eq!(verify["permissions"]["contents"].as_str(), Some("write"));
@@ -2066,6 +2176,28 @@ fn release_documentation_names_safe_targeted_retry_modes() {
         assert!(
             docs.contains(fragment),
             "release retry docs omit `{fragment}`"
+        );
+    }
+}
+
+#[test]
+fn release_documentation_discloses_public_tap_rehearsal_residue_and_targeted_cleanup() {
+    let docs = repo_file("docs/releasing.md");
+    for fragment in [
+        "temporarily pushes a public branch",
+        "opens a draft pull request",
+        "rehearsal/car-go-clean-${run_id}-${run_attempt}",
+        "cancellation or a GitHub API failure can leave",
+        "git/matching-refs/heads/$branch",
+        "head=dcchuck:$branch",
+        "pulls/$pr_number",
+        "-f state=closed",
+        "git/refs/heads/$branch",
+        "--method DELETE",
+    ] {
+        assert!(
+            docs.contains(fragment),
+            "release docs omit tap-rehearsal disclosure or targeted cleanup `{fragment}`"
         );
     }
 }
@@ -2261,6 +2393,7 @@ fn release_publication_workflows_pin_actions_and_use_verified_dist() {
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
         "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c",
+        "Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168",
     ]);
 
     for path in [

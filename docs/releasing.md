@@ -82,6 +82,113 @@ test -n "$run_id"
 gh run watch "$run_id" --exit-status
 ```
 
+The tap-capability job temporarily pushes a public branch named
+`rehearsal/car-go-clean-${run_id}-${run_attempt}` and opens a draft pull request
+in `dcchuck/homebrew-tap`. Its guarded trap and the workflow's always-on
+cleanup step normally close that exact pull request and delete that exact
+branch. However, cancellation or a GitHub API failure can leave either public
+object behind. The job log ends with `Temporary draft PR: NUMBER` and
+`Temporary branch: NAME` when both writes were verified.
+
+For residue, take `run_id` and `run_attempt` from the affected workflow run.
+First inspect the deterministic branch, its single marker commit, and any pull
+request with that exact head and the tap's current default base. These commands
+do not mutate the tap:
+
+```sh
+tap_repository=dcchuck/homebrew-tap
+run_id=RUN_ID
+run_attempt=RUN_ATTEMPT
+branch="rehearsal/car-go-clean-${run_id}-${run_attempt}"
+marker=".release-rehearsal/${run_id}.txt"
+default_branch=$(gh api --method GET "repos/$tap_repository" --jq .default_branch)
+
+branch_record=$(mktemp)
+gh api --method GET \
+  "repos/$tap_repository/git/matching-refs/heads/$branch" > "$branch_record"
+expected_head_sha=$(
+  jq -er --arg expected_ref "refs/heads/$branch" '
+    [.[] | select(.ref == $expected_ref)] |
+    select(length == 1) | .[0].object.sha
+  ' "$branch_record"
+)
+
+commit_record=$(mktemp)
+gh api --method GET \
+  "repos/$tap_repository/commits/$expected_head_sha" > "$commit_record"
+jq -e \
+  --arg expected_sha "$expected_head_sha" \
+  --arg expected_message \
+    "chore: rehearse car-go-clean release ${run_id}-${run_attempt}" \
+  --arg marker "$marker" '
+    .sha == $expected_sha and
+    .commit.message == $expected_message and
+    (.parents | length) == 1 and
+    (.files | length) == 1 and
+    .files[0].filename == $marker and
+    .files[0].status == "added"
+  ' "$commit_record"
+
+pr_inventory=$(mktemp)
+gh api --method GET "repos/$tap_repository/pulls" \
+  -f state=all \
+  -f "head=dcchuck:$branch" \
+  -f "base=$default_branch" > "$pr_inventory"
+jq -e \
+  --arg branch "$branch" \
+  --arg expected_head_sha "$expected_head_sha" \
+  --arg default_branch "$default_branch" \
+  --arg repository "$tap_repository" '
+    length <= 1 and
+    all(.[];
+      .draft == true and
+      (.state == "open" or .state == "closed") and
+      .head.ref == $branch and
+      .head.sha == $expected_head_sha and
+      .head.repo.full_name == $repository and
+      .base.ref == $default_branch and
+      .base.repo.full_name == $repository
+    )
+  ' "$pr_inventory"
+```
+
+Stop if any identity check fails; do not close or delete a similarly named
+object. If the inventory contains the verified draft PR, close that exact
+number. A cancellation between branch push and PR creation legitimately
+returns an empty inventory, in which case there is no PR to close.
+
+```sh
+if test "$(jq 'length' "$pr_inventory")" -eq 1
+then
+  pr_number=$(jq -er '.[0].number' "$pr_inventory")
+  pr_state=$(
+    gh api --method GET "repos/$tap_repository/pulls/$pr_number" \
+      --jq .state
+  )
+  if test "$pr_state" = open
+  then
+    gh api --method PATCH "repos/$tap_repository/pulls/$pr_number" \
+      -f state=closed
+  else
+    test "$pr_state" = closed
+  fi
+fi
+```
+
+Immediately re-read the exact ref and require that its SHA is unchanged before
+deleting only that rehearsal branch, matching the cleanup script's fail-closed
+procedure:
+
+```sh
+current_head_sha=$(
+  gh api --method GET "repos/$tap_repository/git/ref/heads/$branch" \
+    --jq .object.sha
+)
+test "$current_head_sha" = "$expected_head_sha"
+gh api --method DELETE \
+  "repos/$tap_repository/git/refs/heads/$branch"
+```
+
 The successful aggregate creates
 `release-authorization-$release_sha-v$version`. Download and independently
 verify the record before tagging:
@@ -166,7 +273,14 @@ token is read-only and covers source checkout plus public attestation API
 verification. Each native target verifies the exact 15-file inventory,
 checksums, version and health, runs the real public installer, proves no
 service was installed, and renders the Homebrew formula locally from the
-public assets. macOS installs and tests that local formula. The tap still
+public assets. Both macOS architectures and both Linux architectures install
+the formula through an isolated local tap, verify that the linked
+`car-go-clean` resolves to the formula's executable with the exact release
+version, and run `brew test`. The rehearsal does the same against artifacts
+staged from the exact requested commit, and authenticated draft verification
+does it against the checked and attested draft assets before prerelease
+approval. Thus release authorization, prerelease publication, and stable
+promotion each fail if real Linuxbrew installation fails. The tap still
 serves the previous stable version throughout this gate; no release formula
 branch or pull request exists yet.
 
