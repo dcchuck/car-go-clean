@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 installer="$root/packaging/release/car-go-clean-installer.sh"
 upgrade="$root/packaging/release/car-go-clean-upgrade.sh"
 work_dir=$(mktemp -d)
@@ -164,7 +164,7 @@ test "$(cat "$failed_dir/car-go-clean")" = "old binary"
 
 : > "$curl_log"
 linux_dir="$work_dir/linux-install"
-CHECKSUM_MODE= TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 run_installer --install-dir "$linux_dir"
+CHECKSUM_MODE='' TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 run_installer --install-dir "$linux_dir"
 cmp "$fixture_dir/car-go-clean" "$linux_dir/car-go-clean"
 test "$(cat "$curl_log")" = "latest-meta https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256"
 

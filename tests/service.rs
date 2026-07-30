@@ -1193,6 +1193,405 @@ fn start_and_stop_are_idempotent_for_current_state() {
     assert_eq!(inactive.into_runner().calls.len(), 2);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatrixState {
+    Absent,
+    EnabledActive,
+    EnabledInactive,
+    DisabledActive,
+    DisabledInactive,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MatrixAction {
+    Status,
+    Install,
+    Start,
+    Stop,
+    Restart,
+    Uninstall,
+}
+
+fn matrix_definition(platform: ServicePlatform, home: &Path) -> PathBuf {
+    match platform {
+        ServicePlatform::MacOs => home
+            .join("Library/LaunchAgents")
+            .join("com.dcchuck.car-go-clean.plist"),
+        ServicePlatform::Linux => home.join(".config/systemd/user/car-go-clean.service"),
+    }
+}
+
+fn matrix_status(state: MatrixState) -> ServiceStatus {
+    match state {
+        MatrixState::Absent => ServiceStatus {
+            installed: false,
+            enabled: false,
+            active: false,
+        },
+        MatrixState::EnabledActive => ServiceStatus {
+            installed: true,
+            enabled: true,
+            active: true,
+        },
+        MatrixState::EnabledInactive => ServiceStatus {
+            installed: true,
+            enabled: true,
+            active: false,
+        },
+        MatrixState::DisabledActive => ServiceStatus {
+            installed: true,
+            enabled: false,
+            active: true,
+        },
+        MatrixState::DisabledInactive => ServiceStatus {
+            installed: true,
+            enabled: false,
+            active: false,
+        },
+    }
+}
+
+fn matrix_runner(platform: ServicePlatform, state: MatrixState) -> FakeRunner {
+    if state == MatrixState::Absent {
+        return FakeRunner::default();
+    }
+    let enabled = matches!(
+        state,
+        MatrixState::EnabledActive | MatrixState::EnabledInactive
+    );
+    let active = matches!(
+        state,
+        MatrixState::EnabledActive | MatrixState::DisabledActive
+    );
+    match platform {
+        ServicePlatform::MacOs => FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                if enabled {
+                    "disabled services = {\n}\n".to_string()
+                } else {
+                    "disabled services = {\n  \"com.dcchuck.car-go-clean\" => true\n}\n".to_string()
+                },
+                String::new(),
+            ),
+            if active {
+                CommandOutput::new(true, String::new(), String::new())
+            } else {
+                CommandOutput::new(
+                    false,
+                    String::new(),
+                    "Could not find specified service".to_string(),
+                )
+            },
+        ]),
+        ServicePlatform::Linux => FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(
+                enabled,
+                if enabled {
+                    "enabled\n".to_string()
+                } else {
+                    "disabled\n".to_string()
+                },
+                String::new(),
+            ),
+            CommandOutput::new(
+                active,
+                if active {
+                    "active\n".to_string()
+                } else {
+                    "inactive\n".to_string()
+                },
+                String::new(),
+            ),
+        ]),
+    }
+}
+
+fn matrix_status_calls(platform: ServicePlatform, state: MatrixState) -> Vec<Vec<String>> {
+    if state == MatrixState::Absent {
+        return Vec::new();
+    }
+    match platform {
+        ServicePlatform::MacOs => vec![
+            vec![
+                "print-disabled".to_string(),
+                format!("gui/{}", unsafe { libc::geteuid() }),
+            ],
+            vec![
+                "print".to_string(),
+                format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                    libc::geteuid()
+                }),
+            ],
+        ],
+        ServicePlatform::Linux => vec![
+            vec!["--user".to_string(), "show-environment".to_string()],
+            vec![
+                "--user".to_string(),
+                "is-enabled".to_string(),
+                "car-go-clean.service".to_string(),
+            ],
+            vec![
+                "--user".to_string(),
+                "is-active".to_string(),
+                "car-go-clean.service".to_string(),
+            ],
+        ],
+    }
+}
+
+fn matrix_action_calls(
+    platform: ServicePlatform,
+    state: MatrixState,
+    action: MatrixAction,
+    definition: &Path,
+) -> Vec<Vec<String>> {
+    let enabled = matches!(
+        state,
+        MatrixState::EnabledActive | MatrixState::EnabledInactive
+    );
+    let active = matches!(
+        state,
+        MatrixState::EnabledActive | MatrixState::DisabledActive
+    );
+    let installed = state != MatrixState::Absent;
+    let mut calls = if installed {
+        matrix_status_calls(platform, state)
+    } else {
+        Vec::new()
+    };
+    let uid = unsafe { libc::geteuid() };
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/com.dcchuck.car-go-clean");
+    let enable = || vec!["enable".to_string(), target.clone()];
+    let disable = || vec!["disable".to_string(), target.clone()];
+    let bootstrap = || {
+        vec![
+            "bootstrap".to_string(),
+            domain.clone(),
+            definition.display().to_string(),
+        ]
+    };
+    let bootout = || {
+        vec![
+            "bootout".to_string(),
+            domain.clone(),
+            definition.display().to_string(),
+        ]
+    };
+    let kickstart = || vec!["kickstart".to_string(), "-k".to_string(), target.clone()];
+    let show_environment = || vec!["--user".to_string(), "show-environment".to_string()];
+    let daemon_reload = || vec!["--user".to_string(), "daemon-reload".to_string()];
+    let enable_now = || {
+        vec![
+            "--user".to_string(),
+            "enable".to_string(),
+            "--now".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    };
+    let disable_now = || {
+        vec![
+            "--user".to_string(),
+            "disable".to_string(),
+            "--now".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    };
+    let restart = || {
+        vec![
+            "--user".to_string(),
+            "restart".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    };
+    let stop = || {
+        vec![
+            "--user".to_string(),
+            "stop".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    };
+
+    match (platform, action) {
+        (_, MatrixAction::Status) => {}
+        (ServicePlatform::MacOs, MatrixAction::Install) => {
+            if active {
+                calls.push(bootout());
+            }
+            calls.extend([enable(), bootstrap(), kickstart()]);
+        }
+        (ServicePlatform::Linux, MatrixAction::Install) => {
+            if active {
+                calls.push(stop());
+            }
+            calls.extend([show_environment(), daemon_reload(), enable_now()]);
+        }
+        (ServicePlatform::MacOs, MatrixAction::Start) if installed => {
+            if !enabled {
+                calls.push(enable());
+            }
+            if !active {
+                calls.extend([bootstrap(), kickstart()]);
+            }
+        }
+        (ServicePlatform::Linux, MatrixAction::Start) if installed && !(enabled && active) => {
+            calls.extend([daemon_reload(), enable_now()]);
+        }
+        (ServicePlatform::MacOs, MatrixAction::Stop) if installed => {
+            if enabled {
+                calls.push(disable());
+            }
+            if active {
+                calls.push(bootout());
+            }
+        }
+        (ServicePlatform::Linux, MatrixAction::Stop) if installed && (enabled || active) => {
+            calls.push(disable_now());
+        }
+        (ServicePlatform::MacOs, MatrixAction::Restart) if installed && enabled => {
+            if !active {
+                calls.push(bootstrap());
+            }
+            calls.push(kickstart());
+        }
+        (ServicePlatform::Linux, MatrixAction::Restart) if installed && enabled => {
+            calls.push(restart());
+        }
+        (ServicePlatform::MacOs, MatrixAction::Uninstall) if installed => {
+            if enabled {
+                calls.push(disable());
+            }
+            if active {
+                calls.push(bootout());
+            }
+        }
+        (ServicePlatform::Linux, MatrixAction::Uninstall) if installed => {
+            calls.extend([disable_now(), daemon_reload()]);
+        }
+        _ => {}
+    }
+    calls
+}
+
+#[test]
+fn lifecycle_matrix_covers_every_definition_enablement_and_activity_state() {
+    let states = [
+        MatrixState::Absent,
+        MatrixState::EnabledActive,
+        MatrixState::EnabledInactive,
+        MatrixState::DisabledActive,
+        MatrixState::DisabledInactive,
+    ];
+    let actions = [
+        MatrixAction::Status,
+        MatrixAction::Install,
+        MatrixAction::Start,
+        MatrixAction::Stop,
+        MatrixAction::Restart,
+        MatrixAction::Uninstall,
+    ];
+    let mut cells = 0;
+
+    for platform in [ServicePlatform::MacOs, ServicePlatform::Linux] {
+        for state in states {
+            for action in actions {
+                let work = tempfile::tempdir().unwrap();
+                let definition = matrix_definition(platform, work.path());
+                if state != MatrixState::Absent {
+                    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+                    fs::write(&definition, "definition").unwrap();
+                }
+                let mut manager = ServiceManager::new(
+                    platform,
+                    work.path().to_path_buf(),
+                    work.path().join("bin/car-go-clean"),
+                    matrix_runner(platform, state),
+                );
+
+                let result = match action {
+                    MatrixAction::Status => manager.status(),
+                    MatrixAction::Install => manager.install(),
+                    MatrixAction::Start => manager.start(),
+                    MatrixAction::Stop => manager.stop(),
+                    MatrixAction::Restart => manager.restart(),
+                    MatrixAction::Uninstall => manager.uninstall(),
+                };
+                let initial = matrix_status(state);
+                let expected = match action {
+                    MatrixAction::Status => Ok(initial.clone()),
+                    MatrixAction::Install => Ok(ServiceStatus {
+                        installed: true,
+                        enabled: true,
+                        active: true,
+                    }),
+                    MatrixAction::Start if !initial.installed => {
+                        Err("car-go-clean service is not installed")
+                    }
+                    MatrixAction::Start => Ok(ServiceStatus {
+                        installed: true,
+                        enabled: true,
+                        active: true,
+                    }),
+                    MatrixAction::Stop if !initial.installed => Ok(initial.clone()),
+                    MatrixAction::Stop => Ok(ServiceStatus {
+                        installed: true,
+                        enabled: false,
+                        active: false,
+                    }),
+                    MatrixAction::Restart if !initial.installed => {
+                        Err("car-go-clean service is not installed")
+                    }
+                    MatrixAction::Restart if !initial.enabled => {
+                        Err("car-go-clean service is not enabled")
+                    }
+                    MatrixAction::Restart => Ok(ServiceStatus {
+                        installed: true,
+                        enabled: true,
+                        active: true,
+                    }),
+                    MatrixAction::Uninstall => Ok(ServiceStatus {
+                        installed: false,
+                        enabled: false,
+                        active: false,
+                    }),
+                };
+                match expected {
+                    Ok(expected) => assert_eq!(
+                        result.unwrap(),
+                        expected,
+                        "{platform:?} {state:?} {action:?}"
+                    ),
+                    Err(message) => assert!(
+                        result.unwrap_err().to_string().contains(message),
+                        "{platform:?} {state:?} {action:?}"
+                    ),
+                }
+
+                assert_eq!(
+                    call_arguments(&manager.into_runner()),
+                    matrix_action_calls(platform, state, action, &definition),
+                    "{platform:?} {state:?} {action:?}"
+                );
+                let definition_should_exist = match action {
+                    MatrixAction::Install => true,
+                    MatrixAction::Uninstall => false,
+                    _ => initial.installed,
+                };
+                assert_eq!(
+                    definition.exists(),
+                    definition_should_exist,
+                    "{platform:?} {state:?} {action:?}"
+                );
+                cells += 1;
+            }
+        }
+    }
+
+    assert_eq!(cells, 60);
+}
+
 #[test]
 fn lifecycle_reports_unexpected_status_probe_failure() {
     let work = tempfile::tempdir().unwrap();

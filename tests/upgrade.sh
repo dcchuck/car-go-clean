@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 upgrade="$root/packaging/release/car-go-clean-upgrade.sh"
 work_dir=$(mktemp -d)
 fake_bin="$work_dir/bin"
@@ -513,6 +513,134 @@ complete_upgrade() {
     test ! -e "$state_dir/upgrade-session"
 }
 
+assert_matrix_service_stopped() {
+    case "$old_state" in
+        running)
+            test "$(cat "$service_state")" = stopped
+            if [ "$TEST_PLATFORM" = Darwin ]; then
+                assert_calls_have "launchctl bootout"
+            else
+                assert_calls_have "systemctl --user stop car-go-clean.service"
+            fi
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$old_state"
+            assert_calls_lack "launchctl bootout"
+            assert_calls_lack "systemctl --user stop car-go-clean.service"
+            ;;
+    esac
+}
+
+assert_matrix_service_retained() {
+    case "$old_state" in
+        running)
+            test "$(cat "$service_state")" = stopped
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$old_state"
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+}
+
+assert_matrix_service_restored() {
+    case "$old_state" in
+        running)
+            test "$(cat "$service_state")" = running
+            if [ "$TEST_PLATFORM" = Darwin ]; then
+                assert_calls_have "launchctl bootstrap"
+            else
+                assert_calls_have "systemctl --user start car-go-clean.service"
+            fi
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$old_state"
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+}
+
+run_upgrade_outcome_matrix_cell() {
+    platform=$1
+    old_version=$2
+    old_state=$3
+    preview_outcome=$4
+    execute_outcome=$5
+    case "$platform" in
+        Darwin) method=homebrew ;;
+        Linux) method=shell ;;
+    esac
+    new_case "matrix-${platform}-${old_version}-${old_state}-${preview_outcome}-${execute_outcome}" \
+        "$platform" "$old_version" "$old_state" "$method"
+    PREVIEW_EXIT=$preview_outcome
+    EXECUTE_EXIT=$execute_outcome
+    export PREVIEW_EXIT EXECUTE_EXIT
+
+    run_upgrade --version 0.4.0 --method "$method"
+    case "$preview_outcome" in
+        0|2)
+            assert_status 0
+            test "$(session_value phase)" = review_pending
+            test "$(session_value review_id)" = 42
+            assert_matrix_service_stopped
+            : > "$call_log"
+            run_upgrade --version 0.4.0 --method "$method" --execute-review 42
+            case "$execute_outcome" in
+                0|2)
+                    assert_status 0
+                    test ! -e "$state_dir/upgrade-session"
+                    assert_matrix_service_restored
+                    ;;
+                1)
+                    test "$run_status" -ne 0
+                    test "$(session_value phase)" = executing
+                    test "$(session_value review_id)" = 42
+                    assert_matrix_service_retained
+                    assert_calls_have "car-go-clean run --review 42"
+                    ;;
+            esac
+            ;;
+        1)
+            test "$run_status" -ne 0
+            test "$(session_value phase)" = preview_pending
+            test "$(session_value review_id)" = none
+            assert_matrix_service_stopped
+            assert_calls_lack "car-go-clean run --review"
+            ;;
+    esac
+}
+
+# Every supported platform/version/original-service-state combination exercises
+# preview success, reviewed/no-work, and preview failure against each execute
+# result. Failure preview cells deliberately prove phase two does not run.
+matrix_cells=0
+for matrix_platform in Darwin Linux
+do
+    for matrix_version in 0.2.0 0.3.0
+    do
+        for matrix_state in running stopped 'not installed'
+        do
+            for matrix_preview in 0 2 1
+            do
+                for matrix_execute in 0 2 1
+                do
+                    run_upgrade_outcome_matrix_cell "$matrix_platform" "$matrix_version" \
+                        "$matrix_state" "$matrix_preview" "$matrix_execute"
+                    matrix_cells=$((matrix_cells + 1))
+                done
+            done
+        done
+    done
+done
+
+# Coverage gate: 2 platforms × 2 versions × 3 service states ×
+# 3 preview outcomes × 3 execute outcomes.
+test "$matrix_cells" -eq 108
+
 # v0.2/v0.3 and active/stopped/absent states stay exact across both platforms.
 for fixture in \
     mac-v02-active:Darwin:0.2.0:running:homebrew \
@@ -524,6 +652,7 @@ for fixture in \
 do
     old_ifs=$IFS
     IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
     set -- $fixture
     IFS=$old_ifs
     new_case "$1" "$2" "$3" "$4" "$5"
@@ -678,6 +807,7 @@ for fixture in \
 do
     old_ifs=$IFS
     IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
     set -- $fixture
     IFS=$old_ifs
     new_case "$1" Darwin "$2" "$3" homebrew
@@ -791,7 +921,7 @@ LEGACY_EXCLUDES=1
 export LEGACY_EXCLUDES
 run_upgrade --version 0.4.0 --method homebrew
 assert_status 0
-assert_output_has 'legacy `excludes`'
+assert_output_has "legacy \`excludes\`"
 assert_output_has "car-go-clean config migrate"
 
 # Execution is resumable, exact-ID bound, and never repeats replacement/preview.
@@ -982,6 +1112,7 @@ for invocation in \
 do
     old_ifs=$IFS
     IFS=' '
+    # shellcheck disable=SC2086 # Intentional splitting of whitespace-delimited argv fixture.
     set -- $invocation
     IFS=$old_ifs
     run_upgrade "$@"
