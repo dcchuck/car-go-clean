@@ -124,6 +124,12 @@ case "$1" in
         ;;
     enable)
         : > "$SERVICE_ENABLED"
+        if [ "${DEFINITION_ENABLE_SWAP-0}" = 1 ] &&
+            [ ! -e "$DEFINITION_ENABLE_SWAP_MARKER" ]; then
+            : > "$DEFINITION_ENABLE_SWAP_MARKER"
+            rm -f "$VISIBLE_CGC_PATH"
+            ln -s "$NEW_FORMULA_BINARY" "$VISIBLE_CGC_PATH"
+        fi
         ;;
     bootout)
         printf 'stopped\n' > "$SERVICE_STATE"
@@ -144,9 +150,19 @@ case "$1" in
         fi
         ;;
     print)
+        if [ "${DEFINITION_PREFLIGHT_SWAP-0}" = 1 ] &&
+            [ ! -e "$DEFINITION_PREFLIGHT_SWAP_MARKER" ]; then
+            : > "$DEFINITION_PREFLIGHT_SWAP_MARKER"
+            rm -f "$VISIBLE_CGC_PATH"
+            ln -s "$NEW_FORMULA_BINARY" "$VISIBLE_CGC_PATH"
+        fi
         if [ "${MANAGER_ACTIVITY_QUERY_ERROR-0}" = 1 ]; then
             echo "launchctl query transport failed" >&2
             exit 71
+        fi
+        if [ -n "${MANAGER_ACTIVITY_STATUS-}" ]; then
+            printf '%s\n' "$MANAGER_ACTIVITY_OUTPUT" >&2
+            exit "$MANAGER_ACTIVITY_STATUS"
         fi
         if [ "$(cat "$SERVICE_STATE")" = running ]; then
             exit 0
@@ -185,6 +201,12 @@ case "$*" in
     "--user enable car-go-clean.service")
         test "${RESTORE_FAIL-0}" != 1
         : > "$SERVICE_ENABLED"
+        if [ "${DEFINITION_ENABLE_SWAP-0}" = 1 ] &&
+            [ ! -e "$DEFINITION_ENABLE_SWAP_MARKER" ]; then
+            : > "$DEFINITION_ENABLE_SWAP_MARKER"
+            rm -f "$VISIBLE_CGC_PATH"
+            ln -s "$NEW_FORMULA_BINARY" "$VISIBLE_CGC_PATH"
+        fi
         ;;
     "--user disable car-go-clean.service")
         rm -f "$SERVICE_ENABLED"
@@ -207,9 +229,22 @@ case "$*" in
     "--user daemon-reload")
         ;;
     "--user is-active car-go-clean.service"|"--user is-active --quiet car-go-clean.service")
+        if [ "${DEFINITION_PREFLIGHT_SWAP-0}" = 1 ] &&
+            [ ! -e "$DEFINITION_PREFLIGHT_SWAP_MARKER" ]; then
+            : > "$DEFINITION_PREFLIGHT_SWAP_MARKER"
+            rm -f "$VISIBLE_CGC_PATH"
+            ln -s "$NEW_FORMULA_BINARY" "$VISIBLE_CGC_PATH"
+        fi
         if [ "${MANAGER_ACTIVITY_QUERY_ERROR-0}" = 1 ]; then
             echo "systemctl query transport failed" >&2
             exit 71
+        fi
+        if [ -n "${MANAGER_ACTIVITY_STATUS-}" ]; then
+            case "$*" in
+                *" --quiet "*) ;;
+                *) printf '%s\n' "$MANAGER_ACTIVITY_OUTPUT" ;;
+            esac
+            exit "$MANAGER_ACTIVITY_STATUS"
         fi
         if [ "$(cat "$SERVICE_STATE")" = running ]; then
             case "$*" in
@@ -631,6 +666,8 @@ new_case() {
     execute_marker="$current_case/execute-marker"
     restore_signal_marker="$current_case/restore-signal-marker"
     definition_auth_race_marker="$current_case/definition-auth-race-marker"
+    definition_preflight_swap_marker="$current_case/definition-preflight-swap-marker"
+    definition_enable_swap_marker="$current_case/definition-enable-swap-marker"
     brew_taps_file="$current_case/brew-taps"
     brew_linked_formula="$current_case/brew-linked-formula"
     brew_linked_version_file="$current_case/brew-linked-version"
@@ -778,8 +815,14 @@ EOF
     RESTORE_SIGNAL=0
     RESTORE_SIGNAL_MARKER=$restore_signal_marker
     MANAGER_ACTIVITY_QUERY_ERROR=0
+    MANAGER_ACTIVITY_OUTPUT=
+    MANAGER_ACTIVITY_STATUS=
     DEFINITION_AUTH_RACE=0
     DEFINITION_AUTH_RACE_MARKER=$definition_auth_race_marker
+    DEFINITION_PREFLIGHT_SWAP=0
+    DEFINITION_PREFLIGHT_SWAP_MARKER=$definition_preflight_swap_marker
+    DEFINITION_ENABLE_SWAP=0
+    DEFINITION_ENABLE_SWAP_MARKER=$definition_enable_swap_marker
     BACKUP_RACE=0
     SERVICE_DEFINITION_BACKUP=$service_definition_backup
     NEW_FORMULA_BINARY=$new_formula_binary
@@ -801,7 +844,10 @@ EOF
     export ROLLBACK_EXPECTED_VERSION
     export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
     export MANAGER_ACTIVITY_QUERY_ERROR
+    export MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
     export DEFINITION_AUTH_RACE DEFINITION_AUTH_RACE_MARKER
+    export DEFINITION_PREFLIGHT_SWAP DEFINITION_PREFLIGHT_SWAP_MARKER
+    export DEFINITION_ENABLE_SWAP DEFINITION_ENABLE_SWAP_MARKER
     export BACKUP_RACE SERVICE_DEFINITION_BACKUP
     export BREW_UPDATE_FAIL BREW_REPLACE_FAIL SHELL_DOWNLOAD_FAIL
     export BREW_PARTIAL_REPLACE_FAIL BREW_RECOVERY_DEFINITION_FAILURE
@@ -1399,6 +1445,149 @@ do
             assert_calls_lack "launchctl kickstart"
             ;;
         Linux)
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+done
+
+# launchctl's documented not-found diagnostics are inactive only with exit 113.
+# Unknown diagnostics and a not-found message paired with another exit are errors.
+for fixture in \
+    recovery-launchd-unknown:75 \
+    recovery-launchd-not-found-wrong-exit:71
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" Darwin 0.3.0 running homebrew
+    BREW_REPLACE_FAIL=1
+    MANAGER_ACTIVITY_STATUS=$2
+    case "$1" in
+        recovery-launchd-unknown)
+            MANAGER_ACTIVITY_OUTPUT='launchctl activity state unknown'
+            ;;
+        recovery-launchd-not-found-wrong-exit)
+            MANAGER_ACTIVITY_OUTPUT='Could not find specified service'
+            ;;
+    esac
+    export BREW_REPLACE_FAIL MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    assert_calls_lack "launchctl enable"
+    assert_calls_lack "launchctl bootstrap"
+    assert_calls_lack "launchctl kickstart"
+done
+
+# systemctl reports several nonterminal or indeterminate states with statuses
+# that are easy to confuse with the terminal active/inactive pair. None may
+# authorize recovery, and exit/output mismatches must fail closed as well.
+nonterminal_activity_fixtures='activating:activating:3
+deactivating:deactivating:3
+reloading:reloading:0
+refreshing:refreshing:0
+maintenance:maintenance:3
+failed:failed:3
+unknown:unknown:4
+active-wrong-exit:active:3
+inactive-wrong-exit:inactive:0'
+
+for fixture in $nonterminal_activity_fixtures
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "recovery-activity-$1" Linux 0.3.0 running homebrew
+    BREW_REPLACE_FAIL=1
+    MANAGER_ACTIVITY_OUTPUT=$2
+    MANAGER_ACTIVITY_STATUS=$3
+    export BREW_REPLACE_FAIL MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+    assert_calls_lack "systemctl --user enable car-go-clean.service"
+    assert_calls_lack "systemctl --user start car-go-clean.service"
+done
+
+# The manager preflight is an attacker-controlled scheduling boundary. If the
+# definition's visible executable is swapped after an earlier authentication,
+# exact-old recovery must authenticate again immediately before any start.
+for fixture in \
+    recovery-post-auth-swap-macos:Darwin:0.2.0 \
+    recovery-post-auth-swap-linux:Linux:0.3.0
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" "$3" running homebrew
+    BREW_REPLACE_FAIL=1
+    DEFINITION_PREFLIGHT_SWAP=1
+    export BREW_REPLACE_FAIL DEFINITION_PREFLIGHT_SWAP
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    test -e "$definition_preflight_swap_marker"
+    test "$(readlink "$fake_bin/car-go-clean")" = "$new_formula_binary"
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    case "$2" in
+        Darwin)
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "launchctl kickstart"
+            ;;
+        Linux)
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+done
+
+# Enabling is another manager-controlled boundary. Recovery must authenticate
+# the definition once more after enable and before bootstrap/start.
+for fixture in \
+    recovery-enable-swap-macos:Darwin:0.3.0 \
+    recovery-enable-swap-linux:Linux:0.2.0
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" "$3" running homebrew
+    BREW_REPLACE_FAIL=1
+    DEFINITION_ENABLE_SWAP=1
+    export BREW_REPLACE_FAIL DEFINITION_ENABLE_SWAP
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    test -e "$definition_enable_swap_marker"
+    test "$(readlink "$fake_bin/car-go-clean")" = "$new_formula_binary"
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    case "$2" in
+        Darwin)
+            assert_calls_have "launchctl enable"
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "launchctl kickstart"
+            ;;
+        Linux)
+            assert_calls_have "systemctl --user enable car-go-clean.service"
             assert_calls_lack "systemctl --user enable --now car-go-clean.service"
             assert_calls_lack "systemctl --user start car-go-clean.service"
             ;;
@@ -2105,6 +2294,96 @@ do
             esac
             ;;
     esac
+done
+
+# An unrecognized launchctl diagnostic is likewise neither active nor inactive
+# during finalization, regardless of the originally desired service state.
+for original_fixture_state in active stopped
+do
+    case "$original_fixture_state" in
+        active) fixture_service_state=running ;;
+        stopped) fixture_service_state=stopped ;;
+    esac
+    new_case "finalize-launchd-unknown-$original_fixture_state" \
+        Darwin 0.3.0 "$fixture_service_state" homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    MANAGER_ACTIVITY_OUTPUT='launchctl activity state unknown'
+    MANAGER_ACTIVITY_STATUS=75
+    export MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
+    : > "$call_log"
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+    test "$run_status" -ne 0
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    test "$(session_value phase)" = executed
+    assert_output_has "service remains stopped"
+    assert_calls_lack "launchctl enable"
+    assert_calls_lack "launchctl bootstrap"
+    assert_calls_lack "launchctl kickstart"
+done
+
+# Finalization also requires a terminal manager state. A transient, failed,
+# unknown, or status/output-mismatched report must preserve evidence and leave
+# either original state disabled and stopped without attempting a start.
+for original_fixture_state in active stopped
+do
+    case "$original_fixture_state" in
+        active) fixture_service_state=running ;;
+        stopped) fixture_service_state=stopped ;;
+    esac
+    for fixture in $nonterminal_activity_fixtures
+    do
+        old_ifs=$IFS
+        IFS=:
+        # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+        set -- $fixture
+        IFS=$old_ifs
+        new_case "finalize-$original_fixture_state-activity-$1" \
+            Linux 0.3.0 "$fixture_service_state" homebrew
+        run_upgrade --version 0.4.0 --method homebrew
+        assert_status 0
+        MANAGER_ACTIVITY_OUTPUT=$2
+        MANAGER_ACTIVITY_STATUS=$3
+        export MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
+        : > "$call_log"
+        run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+        test "$run_status" -ne 0
+        test "$(cat "$service_state")" = stopped
+        test ! -e "$service_enabled"
+        test -f "$state_dir/upgrade-session"
+        test -f "$service_definition_backup"
+        test "$(session_value phase)" = executed
+        assert_output_has "service remains stopped"
+        assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+        assert_calls_lack "systemctl --user enable car-go-clean.service"
+        assert_calls_lack "systemctl --user start car-go-clean.service"
+
+        # Once a later query proves terminal inactivity, retry may converge and
+        # only then remove the retained recovery evidence.
+        if [ "$1" = maintenance ]; then
+            MANAGER_ACTIVITY_OUTPUT=
+            MANAGER_ACTIVITY_STATUS=
+            export MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
+            : > "$call_log"
+            run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+            assert_status 0
+            case "$original_fixture_state" in
+                active)
+                    test "$(cat "$service_state")" = running
+                    test -e "$service_enabled"
+                    ;;
+                stopped)
+                    test "$(cat "$service_state")" = stopped
+                    test ! -e "$service_enabled"
+                    ;;
+            esac
+            test ! -e "$state_dir/upgrade-session"
+            test ! -e "$service_definition_backup"
+        fi
+    done
 done
 
 # A signal after reviewed execution leaves `executing`; resume never reruns it.

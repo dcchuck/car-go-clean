@@ -560,11 +560,10 @@ service_activity_state() {
                 activity_status=$?
             fi
             case "$activity_status:$activity_output" in
-                0:active|0:reloading|0:refreshing)
+                0:active)
                     printf 'active\n'
                     ;;
-                3:inactive|3:failed|3:activating|3:deactivating|3:maintenance|\
-                4:unknown)
+                3:inactive)
                     printf 'inactive\n'
                     ;;
                 *)
@@ -715,6 +714,13 @@ recover_exact_old_active_service() {
     resolved_old_binary=$(canonical_existing_binary "$session_old_binary_path") ||
         return 1
     [ "$resolved_old_binary" = "$session_old_binary_path" ] || return 1
+    recovered_old_version=$("$resolved_old_binary" version 2>&1) || return 1
+    [ "$recovered_old_version" = "$session_old_version" ] || return 1
+
+    recovery_enabled_state=$(service_enabled_state) || return 1
+    recovery_activity_state=$(service_activity_state)
+    [ "$recovery_activity_state" != error ] || return 1
+
     definition_path=$(installed_service_definition) || return 1
     recovered_definition_binary=$(
         authenticate_service_definition \
@@ -723,12 +729,21 @@ recover_exact_old_active_service() {
     [ "$recovered_definition_binary" = "$session_definition_binary_path" ] ||
         return 1
     [ "$recovered_definition_binary" = "$session_old_binary_path" ] || return 1
-    recovered_old_version=$("$resolved_old_binary" version 2>&1) || return 1
-    [ "$recovered_old_version" = "$session_old_version" ] || return 1
-    service_enabled_state >/dev/null || return 1
-    recovery_activity_state=$(service_activity_state)
-    [ "$recovery_activity_state" != error ] || return 1
-    restore_active_service || return 1
+
+    if [ "$recovery_enabled_state" = disabled ]; then
+        enable_service_only || return 1
+        recovered_definition_binary=$(
+            authenticate_service_definition \
+                "$definition_path" "$session_definition_backup_sha256"
+        ) || return 1
+        [ "$recovered_definition_binary" = "$session_definition_binary_path" ] ||
+            return 1
+        [ "$recovered_definition_binary" = "$session_old_binary_path" ] ||
+            return 1
+    fi
+    if [ "$recovery_activity_state" = inactive ]; then
+        start_service_only || return 1
+    fi
     [ "$(service_enabled_state)" = enabled ] || return 1
     recovered_activity_state=$(service_activity_state)
     [ "$recovered_activity_state" = active ]
