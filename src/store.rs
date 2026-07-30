@@ -2497,6 +2497,15 @@ struct LegacyCleanEvent {
     outcome: LegacyCleanAttemptOutcome,
 }
 
+#[derive(Debug)]
+struct LegacyCombinedCleanFailure {
+    run_id: i64,
+    timestamp: i64,
+    path: String,
+    exit_code: i32,
+    stderr_excerpt: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LegacyCleanAttemptOutcome {
     Success,
@@ -3089,6 +3098,77 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
 }
 
 fn migrate_independent_clean_attempt_results(tx: &Transaction<'_>) -> Result<()> {
+    let combined_failures = {
+        let mut statement = tx.prepare(
+            "
+            SELECT run_id, ts, path, exit_code, stderr_excerpt
+            FROM clean_events
+            WHERE attempt_outcome = 'measurement_failure'
+              AND exit_code <> 0
+            ORDER BY id
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyCombinedCleanFailure {
+                run_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                path: row.get(2)?,
+                exit_code: row.get(3)?,
+                stderr_excerpt: row.get(4)?,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+
+    for failure in combined_failures {
+        let message = if failure.stderr_excerpt.is_empty() {
+            format!("cargo clean exited {}", failure.exit_code)
+        } else {
+            format!(
+                "cargo clean exited {}: {}",
+                failure.exit_code, failure.stderr_excerpt
+            )
+        };
+        let cargo_audit_exists = tx.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM errors
+                WHERE ts = ?1
+                  AND category = 'clean'
+                  AND path = ?2
+                  AND message = ?3
+            )
+            ",
+            params![failure.timestamp, &failure.path, &message],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if cargo_audit_exists {
+            continue;
+        }
+        tx.execute(
+            "
+            INSERT INTO errors (ts, category, path, message)
+            VALUES (?1, 'clean', ?2, ?3)
+            ",
+            params![failure.timestamp, failure.path, message],
+        )?;
+        let updated = tx.execute(
+            "
+            UPDATE runs
+            SET errors_count = errors_count + 1
+            WHERE id = ?1
+            ",
+            [failure.run_id],
+        )?;
+        if updated != 1 {
+            bail!(
+                "cannot repair combined clean failure for missing run {}",
+                failure.run_id
+            );
+        }
+    }
+
     tx.execute_batch(
         "
         CREATE TABLE clean_events_v15 (

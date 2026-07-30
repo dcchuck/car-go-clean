@@ -3528,13 +3528,10 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
     );
 }
 
-#[test]
-fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("state.db");
+fn create_authentic_v14_combined_failure(database: &Path) -> (i64, SystemTime) {
     let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(650);
-    {
-        let store = test_store(&database);
+    let run_id = {
+        let store = test_store(database);
         let run_id = store.start_run(timestamp).unwrap();
         store
             .record_clean_event(&CleanEvent {
@@ -3551,9 +3548,22 @@ fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome(
                 measurement_failed: true,
             })
             .unwrap();
-    }
+        store
+            .record_error(&ErrorRecord {
+                id: 0,
+                ts: timestamp,
+                category: "clean".to_string(),
+                path: Some("/combined-failure".to_string()),
+                message: "measure target after cargo clean: injected read failure".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(run_id, timestamp + Duration::from_secs(1), 0, 0, 1)
+            .unwrap();
+        run_id
+    };
     {
-        let connection = rusqlite::Connection::open(&database).unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
         connection
             .execute_batch(
                 "
@@ -3568,6 +3578,20 @@ fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome(
                     exit_code INTEGER,
                     stderr_excerpt TEXT NOT NULL DEFAULT '',
                     attempt_outcome TEXT NOT NULL
+                        CHECK(attempt_outcome IN (
+                            'success',
+                            'cargo_nonzero',
+                            'runner_failure',
+                            'measurement_failure'
+                        )),
+                    CHECK(
+                        (attempt_outcome = 'success' AND exit_code = 0)
+                        OR (attempt_outcome = 'cargo_nonzero'
+                            AND exit_code IS NOT NULL AND exit_code <> 0)
+                        OR (attempt_outcome = 'runner_failure' AND exit_code IS NULL)
+                        OR (attempt_outcome = 'measurement_failure'
+                            AND exit_code IS NOT NULL)
+                    )
                 );
                 INSERT INTO clean_events_v14_legacy (
                     id,
@@ -3601,6 +3625,57 @@ fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome(
             )
             .unwrap();
     }
+    (run_id, timestamp)
+}
+
+#[test]
+fn version_fourteen_combined_failure_repairs_the_missing_cargo_audit_and_run_count_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_id, timestamp) = create_authentic_v14_combined_failure(&database);
+    {
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            inspection
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            14
+        );
+        assert_eq!(
+            inspection
+                .query_row(
+                    "
+                    SELECT attempt_outcome, exit_code
+                    FROM clean_events
+                    WHERE run_id = ?1
+                    ",
+                    [run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+                )
+                .unwrap(),
+            ("measurement_failure".to_string(), 7)
+        );
+        assert_eq!(
+            inspection
+                .query_row(
+                    "SELECT errors_count FROM runs WHERE id = ?1",
+                    [run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            inspection
+                .query_row("SELECT COUNT(*) FROM errors", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
 
     let store = Store::open(&database).unwrap();
     store.migrate().unwrap();
@@ -3617,6 +3692,196 @@ fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome(
     );
     assert_eq!(
         store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let run = store.last_run().unwrap();
+    assert_eq!(run.id, run_id);
+    assert_eq!(run.errors_count, 2);
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| {
+                error.ts == timestamp
+                    && error.category == "clean"
+                    && error.path.as_deref() == Some("/combined-failure")
+                    && error.message == "cargo clean exited 7: cargo failed"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| {
+                error.ts == timestamp
+                    && error.category == "clean"
+                    && error.path.as_deref() == Some("/combined-failure")
+                    && error
+                        .message
+                        .starts_with("measure target after cargo clean:")
+            })
+            .count(),
+        1
+    );
+
+    store.migrate().unwrap();
+    assert_eq!(store.last_run().unwrap().errors_count, 2);
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+}
+
+#[test]
+fn version_fourteen_combined_failure_preserves_existing_cargo_audit_and_run_count() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_id, _) = create_authentic_v14_combined_failure(&database);
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "
+                INSERT INTO errors (ts, category, path, message)
+                VALUES (?1, 'clean', '/combined-failure',
+                        'cargo clean exited 7: cargo failed')
+                ",
+                [650_i64],
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE runs SET errors_count = 2 WHERE id = ?1", [run_id])
+            .unwrap();
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(store.last_run().unwrap().errors_count, 2);
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.message == "cargo clean exited 7: cargo failed")
+            .count(),
+        1
+    );
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::CargoNonzero);
+    assert!(events[0].measurement_failed);
+}
+
+#[test]
+fn version_fourteen_combined_failure_repair_rolls_back_as_one_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_id, _) = create_authentic_v14_combined_failure(&database);
+    let clean_events_schema = {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TRIGGER reject_run_count_repair
+                BEFORE UPDATE OF errors_count ON runs
+                WHEN NEW.errors_count = 2
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected run count repair failure');
+                END;
+                ",
+            )
+            .unwrap();
+        connection
+            .query_row(
+                "
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'clean_events'
+                ",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    let store = Store::open(&database).unwrap();
+    let first_error = store.migrate().unwrap_err().to_string();
+    assert!(
+        first_error.contains("injected run count repair failure"),
+        "{first_error}"
+    );
+    let second_error = store.migrate().unwrap_err().to_string();
+    assert_eq!(second_error, first_error);
+    drop(store);
+
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        14
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'clean_events'
+                ",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        clean_events_schema
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "
+                SELECT attempt_outcome, exit_code
+                FROM clean_events
+                WHERE run_id = ?1
+                ",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+            )
+            .unwrap(),
+        ("measurement_failure".to_string(), 7)
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "SELECT errors_count FROM runs WHERE id = ?1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM errors", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'clean_events_v15'
+                ",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
         0
     );
 }
