@@ -155,6 +155,10 @@ jobs:
             --pattern 'car-go-clean-installer.sh' \
             --pattern 'car-go-clean-upgrade.sh' \
             --pattern 'car-go-clean-shell-assets.sha256' \
+            --pattern 'car-go-clean.rb' \
+            --pattern 'sha256.sum' \
+            --pattern 'source.tar.gz' \
+            --pattern 'source.tar.gz.sha256' \
             --dir "$ASSET_DIR"
       - name: Verify authenticated draft install paths
         shell: bash

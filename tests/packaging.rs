@@ -1971,16 +1971,61 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
         );
     }
 
+    let smoke_steps = workflow_steps(&verify, "smoke");
+    let download = named_step(smoke_steps, "Download authenticated draft assets");
+    let verify_paths = named_step(smoke_steps, "Verify authenticated draft install paths");
+    let download_index = smoke_steps
+        .iter()
+        .position(|step| std::ptr::eq(step, download))
+        .unwrap();
+    let verify_index = smoke_steps
+        .iter()
+        .position(|step| std::ptr::eq(step, verify_paths))
+        .unwrap();
+    assert!(
+        download_index < verify_index,
+        "authenticated verification must consume the preceding download"
+    );
+    let download_run = run_command(download).unwrap();
+    let selected_patterns = download_run
+        .lines()
+        .filter_map(|line| {
+            line.split_once("--pattern '")
+                .and_then(|(_, rest)| rest.split_once('\''))
+                .map(|(pattern, _)| pattern)
+        })
+        .collect::<BTreeSet<_>>();
+    let smoke_run = run_command(verify_paths).unwrap();
+    let attested_assets = smoke_run
+        .split("for attested_asset in \\")
+        .nth(1)
+        .expect("authenticated verification lacks an attestation loop")
+        .split("\ndo\n")
+        .next()
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().trim_end_matches('\\').trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value == "\"$archive\"" {
+                "car-go-clean-*.tar.xz"
+            } else {
+                value.trim_matches('"')
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    for asset in attested_assets {
+        assert!(
+            selected_patterns.contains(asset),
+            "authenticated verification consumes `{asset}` without selecting it in the preceding download"
+        );
+    }
+
     let source = repo_file(".github/workflows/release-verify.yml");
     assert!(source.contains("gh release download"));
     assert!(source.contains("gh attestation verify"));
     assert!(source.contains("scripts/verify-shell-release-assets.sh"));
     assert!(source.contains("scripts/render-local-homebrew-formula.sh"));
-    let smoke_run = run_command(named_step(
-        workflow_steps(&verify, "smoke"),
-        "Verify authenticated draft install paths",
-    ))
-    .unwrap();
     assert!(
         smoke_run
             .find("scripts/verify-shell-release-assets.sh")
