@@ -862,6 +862,75 @@ session_mode() {
     return 1
 }
 
+migrate_format6_session() {
+    migrated_binary_sha256=$(sha256_file "$session_binary_path") || {
+        echo "car-go-clean upgrade: could not fingerprint the format-6 replacement binary" >&2
+        return 1
+    }
+    authenticate_replacement_binary \
+        "$session_binary_path" "$migrated_binary_sha256" || {
+        echo "car-go-clean upgrade: could not authenticate the format-6 replacement binary" >&2
+        return 1
+    }
+
+    if [ "$session_state" != absent ]; then
+        migrated_backup_binary=$(
+            authenticate_service_definition \
+                "$service_definition_backup" \
+                "$session_definition_backup_sha256"
+        ) || {
+            echo "car-go-clean upgrade: could not authenticate the format-6 service-definition backup" >&2
+            return 1
+        }
+        [ "$migrated_backup_binary" = "$session_definition_binary_path" ] || {
+            echo "car-go-clean upgrade: format-6 service-definition backup no longer resolves to its recorded binary" >&2
+            return 1
+        }
+    fi
+
+    case "$session_phase:$session_state" in
+        replacement_pending:*|definition_pending:*)
+            migrated_definition_sha256=none
+            migrated_definition_binary=none
+            ;;
+        preview_pending:absent|review_pending:absent|executing:absent|executed:absent)
+            migrated_definition_sha256=none
+            migrated_definition_binary=none
+            ;;
+        preview_pending:*|review_pending:*|executing:*|executed:*)
+            migrated_definition_path=$(installed_service_definition) || return 1
+            migrated_definition_sha256=$(
+                sha256_file "$migrated_definition_path"
+            ) || {
+                echo "car-go-clean upgrade: could not fingerprint the format-6 refreshed service definition" >&2
+                return 1
+            }
+            migrated_definition_binary=$(
+                authenticate_service_definition \
+                    "$migrated_definition_path" \
+                    "$migrated_definition_sha256"
+            ) || {
+                echo "car-go-clean upgrade: could not authenticate the format-6 refreshed service definition" >&2
+                return 1
+            }
+            [ "$migrated_definition_binary" = "$session_binary_path" ] || {
+                echo "car-go-clean upgrade: format-6 refreshed service definition does not resolve to the replacement binary" >&2
+                return 1
+            }
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    session_binary_sha256=$migrated_binary_sha256
+    session_refreshed_definition_sha256=$migrated_definition_sha256
+    session_refreshed_definition_binary_path=$migrated_definition_binary
+    write_session "$session_phase" "$session_review"
+    session_format=7
+    echo "Authenticated and migrated the resumable upgrade session from format 6 to format 7." >&2
+}
+
 load_session() {
     [ ! -L "$session_file" ] ||
         die "upgrade session must not be a symlink: $session_file"
@@ -1089,6 +1158,15 @@ load_session() {
         [ "$resolved_session_binary" = "$session_binary_path" ] ||
             die "upgrade session binary path is no longer exact"
     fi
+    if [ "$session_format" = 6 ] &&
+        [ "$session_phase" != replacement_attempt ]; then
+        if ! migrate_format6_session; then
+            if [ "$session_state" != absent ]; then
+                keep_service_disabled_and_stopped >/dev/null 2>&1 || :
+            fi
+            die "format-6 session artifacts could not be authenticated; the session remains unchanged for manual recovery"
+        fi
+    fi
     if [ "$session_format" = 7 ]; then
         case "$session_phase:$session_state" in
             replacement_pending:*|definition_pending:*)
@@ -1114,10 +1192,6 @@ load_session() {
             replacement_attempt:*)
                 ;;
         esac
-    fi
-    if [ "$session_format" = 6 ] &&
-        [ "$session_phase" != replacement_attempt ]; then
-        die "upgrade session predates authenticated v0.4 recovery state; retain it for manual recovery and create a new preview"
     fi
 }
 
@@ -1500,85 +1574,29 @@ pre_execution_rejection_guidance() {
         "$0" "$session_method" >&2
 }
 
-classify_pre_execution_rejection() {
-    rejection_output=$1
-    rejection_review=$2
-    validate_line_value "$rejection_output" || return 1
-    for rejection_kind in missing expired policy_mismatch
-    do
-        case "$rejection_kind" in
-            missing) rejection_reason=review_plan_missing ;;
-            expired) rejection_reason=review_plan_expired ;;
-            policy_mismatch) rejection_reason=review_policy_mismatch ;;
-        esac
-        expected_rejection=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["%s"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"%s"}}}' \
-            "$rejection_reason" "$rejection_review" "$rejection_kind")
-        if [ "$rejection_output" = "$expected_rejection" ]; then
-            return 0
-        fi
-    done
-
-    expected_rejection=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_generation_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"generation_mismatch"}}}' \
-        "$rejection_review")
-    [ "$rejection_output" != "$expected_rejection" ] || return 0
-
-    generation_prefix=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_generation_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"generation_mismatch","replacing_generation":' \
-        "$rejection_review")
-    generation_suffix='}}}'
-    case "$rejection_output" in
-        "$generation_prefix"*"$generation_suffix")
-            replacing_generation=${rejection_output#"$generation_prefix"}
-            replacing_generation=${replacing_generation%"$generation_suffix"}
-            case "$replacing_generation" in
-                ''|*[!0-9]*) return 1 ;;
-                *) [ "$replacing_generation" -gt 0 ] ;;
-            esac
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-validate_completed_review_output() {
-    completed_output=$1
-    completed_status=$2
-    completed_review=$3
-    [ -n "$completed_output" ] || return 1
-    completed_terminal=$(printf '%s\n' "$completed_output" | tail -n 1)
-    validate_line_value "$completed_terminal" || return 1
-    case "$completed_status" in
-        0)
-            completed_prefix='{"format_version":1,"command":"run","outcome":{"code":0,"kind":"complete","reasons":['
-            ;;
-        2)
-            completed_prefix='{"format_version":1,"command":"run","outcome":{"code":2,"kind":"incomplete","reasons":['
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-    case "$completed_terminal" in
-        "$completed_prefix"*',"review_id":'"$completed_review"',"scan_errors":['*'],"data":{"run_id":'*',"cleaned":'*',"skipped":'*',"bytes_recovered":'*',"errors":'*',"cargo_failures":'*',"measurement_failures":'*',"cleanup_failures":'*',"coverage_incomplete":'*'}}')
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    completed_events=$(printf '%s\n' "$completed_output" | sed '$d')
-    if [ -n "$completed_events" ]; then
-        printf '%s\n' "$completed_events" |
-            while IFS= read -r completed_event; do
-                case "$completed_event" in
-                    '{"format_version":1,"event":"target","data":{"project":'*',"target":'*'}}')
-                        ;;
-                    *)
-                        exit 1
-                        ;;
-                esac
-            done
+validate_review_output() {
+    validation_input=$1
+    validation_status=$2
+    validation_review=$3
+    validate_resumed_binary || return 1
+    if validation_result=$(
+        printf '%s' "$validation_input" |
+            "$cgc_binary" __validate-upgrade-review-output \
+                --review-id "$validation_review" \
+                --exit-code "$validation_status"
+    ); then
+        :
+    else
+        return 1
     fi
+    case "$validation_status:$validation_result" in
+        0:completed|2:completed|1:pre_execution_rejection)
+            printf '%s\n' "$validation_result"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 restoration_recovery_guidance() {
@@ -1731,27 +1749,33 @@ execute_review_session() {
                 printf '%s\n' "$review_output"
             fi
             case "$review_status" in
-                0|2)
-                    if validate_completed_review_output \
-                        "$review_output" "$review_status" "$session_review"; then
-                        write_session executed "$session_review"
+                0|1|2)
+                    if review_validation=$(
+                        validate_review_output \
+                            "$review_output" "$review_status" "$session_review"
+                    ); then
+                        :
                     else
                         ambiguous_execution_guidance
                         return 1
                     fi
-                    ;;
-                1)
-                    if classify_pre_execution_rejection \
-                        "$review_output" "$session_review"; then
-                        rejected_review=$session_review
-                        write_session preview_pending none
-                        session_review=$rejected_review
-                        pre_execution_rejection_guidance
-                        session_review=none
-                        return 1
-                    fi
-                    ambiguous_execution_guidance
-                    return 1
+                    case "$review_validation" in
+                        completed)
+                            write_session executed "$session_review"
+                            ;;
+                        pre_execution_rejection)
+                            rejected_review=$session_review
+                            write_session preview_pending none
+                            session_review=$rejected_review
+                            pre_execution_rejection_guidance
+                            session_review=none
+                            return 1
+                            ;;
+                        *)
+                            ambiguous_execution_guidance
+                            return 1
+                            ;;
+                    esac
                     ;;
                 *)
                     ambiguous_execution_guidance

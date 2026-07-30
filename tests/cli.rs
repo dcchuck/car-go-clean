@@ -36,6 +36,118 @@ fn terminal_report(output: &[u8], command: &str) -> serde_json::Value {
     report.clone()
 }
 
+fn validate_upgrade_review_output(
+    review_id: i64,
+    exit_code: u8,
+    output: &str,
+) -> assert_cmd::assert::Assert {
+    let mut command = Command::cargo_bin("car-go-clean").unwrap();
+    command
+        .args([
+            "__validate-upgrade-review-output",
+            "--review-id",
+            &review_id.to_string(),
+            "--exit-code",
+            &exit_code.to_string(),
+        ])
+        .write_stdin(output)
+        .assert()
+}
+
+#[test]
+fn hidden_upgrade_validator_classifies_exact_completion_and_rejection_streams() {
+    let completed = concat!(
+        "{\"format_version\":1,\"event\":\"target\",\"data\":",
+        "{\"project\":\"/tmp/project\",\"target\":\"/tmp/project/target\"}}\n",
+        "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+        "{\"code\":0,\"kind\":\"complete\",\"reasons\":[]},",
+        "\"policy_hash\":\"fixture\",\"generation\":1,\"review_id\":42,",
+        "\"scan_errors\":[],\"data\":{\"run_id\":1,\"cleaned\":1,",
+        "\"skipped\":0,\"bytes_recovered\":1,\"errors\":0,",
+        "\"cargo_failures\":0,\"measurement_failures\":0,",
+        "\"cleanup_failures\":0,\"coverage_incomplete\":false}}\n"
+    );
+    validate_upgrade_review_output(42, 0, completed)
+        .success()
+        .stdout("completed\n");
+
+    let rejection = concat!(
+        "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+        "{\"code\":1,\"kind\":\"failed\",",
+        "\"reasons\":[\"review_generation_mismatch\"]},",
+        "\"policy_hash\":null,\"generation\":null,\"review_id\":42,",
+        "\"scan_errors\":[],\"data\":{\"review_plan_rejection\":",
+        "{\"kind\":\"generation_mismatch\",\"replacing_generation\":43}}}\n"
+    );
+    validate_upgrade_review_output(42, 1, rejection)
+        .success()
+        .stdout("pre_execution_rejection\n");
+}
+
+#[test]
+fn hidden_upgrade_validator_rejects_malformed_extra_and_inconsistent_streams() {
+    let invalid_streams = [
+        (
+            0,
+            concat!(
+                "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+                "{\"code\":0,\"kind\":\"complete\",\"reasons\":[]},",
+                "\"policy_hash\":\"fixture\",\"generation\":1,\"review_id\":42,",
+                "\"scan_errors\":[],\"data\":{\"run_id\":1,\"cleaned\":0,",
+                "\"skipped\":0,\"bytes_recovered\":0,\"errors\":0,",
+                "\"cargo_failures\":0,\"measurement_failures\":0,",
+                "\"cleanup_failures\":0,\"coverage_incomplete\":false},",
+                "\"extra\":true}\n"
+            ),
+        ),
+        (
+            0,
+            concat!(
+                "{\"format_version\":1,\"command\":\"run\"\n",
+                "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+                "{\"code\":0,\"kind\":\"complete\",\"reasons\":[]},",
+                "\"policy_hash\":\"fixture\",\"generation\":1,\"review_id\":42,",
+                "\"scan_errors\":[],\"data\":{\"run_id\":1,\"cleaned\":0,",
+                "\"skipped\":0,\"bytes_recovered\":0,\"errors\":0,",
+                "\"cargo_failures\":0,\"measurement_failures\":0,",
+                "\"cleanup_failures\":0,\"coverage_incomplete\":false}}\n"
+            ),
+        ),
+        (
+            2,
+            concat!(
+                "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+                "{\"code\":0,\"kind\":\"complete\",\"reasons\":[]},",
+                "\"policy_hash\":\"fixture\",\"generation\":1,\"review_id\":42,",
+                "\"scan_errors\":[],\"data\":{\"run_id\":1,\"cleaned\":0,",
+                "\"skipped\":0,\"bytes_recovered\":0,\"errors\":0,",
+                "\"cargo_failures\":0,\"measurement_failures\":0,",
+                "\"cleanup_failures\":0,\"coverage_incomplete\":false}}\n"
+            ),
+        ),
+        (
+            1,
+            concat!(
+                "{\"format_version\":1,\"event\":\"target\",\"data\":",
+                "{\"project\":\"/tmp/project\",\"target\":\"/tmp/project/target\"}}\n",
+                "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+                "{\"code\":1,\"kind\":\"failed\",",
+                "\"reasons\":[\"review_plan_expired\"]},",
+                "\"policy_hash\":null,\"generation\":null,\"review_id\":42,",
+                "\"scan_errors\":[],\"data\":{\"review_plan_rejection\":",
+                "{\"kind\":\"expired\"}}}\n"
+            ),
+        ),
+    ];
+
+    for (exit_code, stream) in invalid_streams {
+        validate_upgrade_review_output(42, exit_code, stream)
+            .failure()
+            .stdout(predicate::str::is_empty())
+            .stderr(contains("invalid reviewed execution output"));
+    }
+}
+
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;

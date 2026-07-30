@@ -119,6 +119,21 @@ case "$*" in
         fi
         exit "${PREVIEW_EXIT-0}"
         ;;
+    "__validate-upgrade-review-output --review-id 42 --exit-code "*)
+        cat >/dev/null
+        case "${EXECUTE_OUTPUT_MODE-}:${EXECUTE_REJECTION-}:${EXECUTE_TARGET_EVENT-}:${5-}" in
+            :missing:0:1|:expired:0:1|:policy:0:1|:generation:0:1)
+                printf '%s\n' pre_execution_rejection
+                ;;
+            ::0:0|::0:2)
+                printf '%s\n' completed
+                ;;
+            *)
+                echo "invalid reviewed execution output" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     run\ --review\ *)
         review=${3-}
         printf '%s\n' "$review" > "$EXECUTED_REVIEW"
@@ -146,6 +161,16 @@ case "$*" in
                 printf '%s\n' \
                     '{"format_version":1,"event":"target","data":{"project":"/tmp/project","target":"/tmp/project/target"}}'
             fi
+            case "${EXECUTE_OUTPUT_MODE-}" in
+                malformed)
+                    printf '%s\n' \
+                        '{"format_version":1,"event":"target","data":{"project":7,"target":false}}'
+                    ;;
+                extra)
+                    printf '%s\n' \
+                        '{"format_version":1,"event":"target","data":{"project":"/tmp/project","target":"/tmp/project/target","extra":true}}'
+                    ;;
+            esac
             case "${EXECUTE_REJECTION-}" in
                 missing)
                     printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_plan_missing"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"missing"}}}\n' "$review"
@@ -177,10 +202,10 @@ case "$*" in
             esac
             case "${EXECUTE_EXIT-0}" in
                 0)
-                    printf '{"format_version":1,"command":"run","outcome":{"code":0,"kind":"complete","reasons":[]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":1,"skipped":0,"bytes_recovered":1,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":false}}\n' "$review"
+                    printf '{"format_version":1,"command":"run","outcome":{"code":0,"kind":"complete","reasons":[]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":0,"skipped":0,"bytes_recovered":0,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":false}}\n' "$review"
                     ;;
                 2)
-                    printf '{"format_version":1,"command":"run","outcome":{"code":2,"kind":"incomplete","reasons":["scan_incomplete"]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":1,"skipped":0,"bytes_recovered":1,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":true}}\n' "$review"
+                    printf '{"format_version":1,"command":"run","outcome":{"code":2,"kind":"incomplete","reasons":["scan_incomplete"]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":0,"skipped":0,"bytes_recovered":0,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":true}}\n' "$review"
                     ;;
             esac
         fi
@@ -863,6 +888,7 @@ EOF
     EXECUTE_SIGNAL=0
     EXECUTE_REJECTION=
     EXECUTE_TARGET_EVENT=0
+    EXECUTE_OUTPUT_MODE=
     EXECUTE_MUTATE_BINARY=0
     EXECUTE_MUTATE_DEFINITION=0
     BREW_ROLLBACK_FIXTURE=0
@@ -917,7 +943,7 @@ EOF
     export SERVICE_ENABLED SERVICE_DEFINITION CARGO_HOME COLIMA_HOME
     export CAR_GO_CLEAN_UPGRADE_STATE_DIR REVIEW_ID PREVIEW_EXIT PREVIEW_TEXT
     export CONFIG_EXIT EXECUTE_EXIT LEGACY_EXCLUDES BREW_INSTALLED
-    export EXECUTE_ERROR RESTORE_FAIL
+    export EXECUTE_ERROR EXECUTE_OUTPUT_MODE RESTORE_FAIL
     export EXECUTE_FIFO EXECUTE_MARKER EXECUTE_SIGNAL
     export EXECUTE_REJECTION EXECUTE_TARGET_EVENT
     export EXECUTE_MUTATE_BINARY EXECUTE_MUTATE_DEFINITION
@@ -948,6 +974,23 @@ session_value() {
     field=$1
     awk -F= -v field="$field" '$1 == field { print substr($0, length(field) + 2) }' \
         "$state_dir/upgrade-session"
+}
+
+downgrade_session_to_format6() {
+    format6_phase=$1
+    format6_review=$2
+    format6_temp=$state_dir/upgrade-session.format6
+    awk -v phase="$format6_phase" -v review="$format6_review" '
+        /^format=/ { print "format=6"; next }
+        /^phase=/ { print "phase=" phase; next }
+        /^review_id=/ { print "review_id=" review; next }
+        /^binary_sha256=/ { next }
+        /^refreshed_definition_sha256=/ { next }
+        /^refreshed_definition_binary_path=/ { next }
+        { print }
+    ' "$state_dir/upgrade-session" > "$format6_temp"
+    chmod 600 "$format6_temp"
+    mv "$format6_temp" "$state_dir/upgrade-session"
 }
 
 canonical_fixture_path() {
@@ -1476,7 +1519,16 @@ do
     run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 
     test "$run_status" -ne 0
-    test "$(session_value phase)" = executed
+    case "$1" in
+        *binary*)
+            test "$(session_value phase)" = executing
+            assert_calls_lack "__validate-upgrade-review-output"
+            ;;
+        *definition*)
+            test "$(session_value phase)" = executed
+            assert_calls_have "__validate-upgrade-review-output"
+            ;;
+    esac
     test -f "$state_dir/upgrade-session"
     test -f "$service_definition_backup"
     test ! -e "$service_enabled"
@@ -2373,6 +2425,44 @@ do
     assert_calls_lack "systemctl --user start"
 done
 
+# Malformed target values and otherwise valid target events with extra keys
+# used to satisfy the helper's shell wildcards. Both exit-0 and exit-2 streams
+# must remain ambiguous when the authenticated Rust validator rejects them.
+for fixture in \
+    malformed-complete:0:malformed \
+    extra-complete:0:extra \
+    malformed-incomplete:2:malformed \
+    extra-incomplete:2:extra
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" Linux 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    EXECUTE_EXIT=$2
+    EXECUTE_OUTPUT_MODE=$3
+    export EXECUTE_EXIT EXECUTE_OUTPUT_MODE
+    : > "$call_log"
+
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+
+    test "$run_status" -ne 0
+    assert_review_call_count 1
+    test "$(session_value phase)" = executing
+    test "$(session_value review_id)" = 42
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    assert_output_has "will not run review 42 again"
+    assert_calls_have "car-go-clean __validate-upgrade-review-output --review-id 42 --exit-code $2"
+    assert_calls_lack "systemctl --user enable"
+    assert_calls_lack "systemctl --user start"
+done
+
 # Execution is resumable, exact-ID bound, and never repeats replacement/preview.
 new_case execute-failure Linux 0.2.0 running homebrew
 run_upgrade --version 0.4.0 --method homebrew
@@ -2731,6 +2821,52 @@ test "$second_resume_status" -ne 0
 assert_output_has "already in progress"
 test "$(grep -c '^car-go-clean run --review 42 --json$' "$call_log")" -eq 1
 test ! -e "$state_dir/upgrade-session"
+
+# Canonical unreleased format-6 sessions can be rebound to authenticated
+# format-7 artifacts. A pending review remains pending, an ambiguous execution
+# remains fail-closed, and an already executed review only finalizes.
+new_case format6-review-pending Darwin 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+downgrade_session_to_format6 review_pending 42
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+test "$(session_value format)" = 7
+test "$(session_value phase)" = review_pending
+test "$(session_value review_id)" = 42
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+assert_calls_lack "run --review"
+
+new_case format6-executing Linux 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+downgrade_session_to_format6 executing 42
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+test "$(session_value format)" = 7
+test "$(session_value phase)" = executing
+test "$(session_value review_id)" = 42
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+assert_output_has "will not run review 42 again"
+assert_calls_lack "run --review"
+
+new_case format6-executed Darwin 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+downgrade_session_to_format6 executed 42
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+assert_calls_lack "run --review"
+assert_calls_have "launchctl bootstrap"
 
 # Missing, malformed, symlinked, and broadly readable sessions fail closed.
 new_case missing-session Darwin 0.4.0 stopped homebrew

@@ -24,10 +24,10 @@ use crate::service::{
 use crate::store::{DiscoveryOriginKind, ErrorRecord, PlanLoadError, ReviewPlan, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -168,6 +168,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Version,
+    #[command(name = "__validate-upgrade-review-output", hide = true)]
+    ValidateUpgradeReviewOutput {
+        #[arg(long)]
+        review_id: i64,
+        #[arg(long)]
+        exit_code: u8,
+    },
     Service {
         #[command(subcommand)]
         command: ServiceCommands,
@@ -468,12 +475,338 @@ fn print_stream_event(event: &'static str, data: serde_json::Value) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct RequiredNullable<T>(Option<T>);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeTargetData {
+    project: String,
+    target: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeTargetEvent {
+    format_version: u32,
+    event: String,
+    data: UpgradeTargetData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeOutcome {
+    code: u8,
+    kind: String,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeScanError {
+    kind: String,
+    path: RequiredNullable<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeRunData {
+    run_id: i64,
+    cleaned: i64,
+    skipped: i64,
+    bytes_recovered: i64,
+    errors: i64,
+    cargo_failures: i64,
+    measurement_failures: i64,
+    cleanup_failures: i64,
+    coverage_incomplete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeCompletionTerminal {
+    format_version: u32,
+    command: String,
+    outcome: UpgradeOutcome,
+    policy_hash: RequiredNullable<String>,
+    generation: RequiredNullable<i64>,
+    review_id: i64,
+    scan_errors: Vec<UpgradeScanError>,
+    data: UpgradeRunData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeReviewPlanRejection {
+    kind: String,
+    replacing_generation: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeRejectionData {
+    review_plan_rejection: UpgradeReviewPlanRejection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeRejectionTerminal {
+    format_version: u32,
+    command: String,
+    outcome: UpgradeOutcome,
+    policy_hash: RequiredNullable<String>,
+    generation: RequiredNullable<i64>,
+    review_id: i64,
+    scan_errors: Vec<UpgradeScanError>,
+    data: UpgradeRejectionData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeReviewValidation {
+    Completed,
+    PreExecutionRejection,
+}
+
+fn validate_upgrade_target(event: &UpgradeTargetEvent) -> Result<()> {
+    if event.format_version != 1 || event.event != "target" {
+        bail!("invalid target event version or kind");
+    }
+    if event.data.project.is_empty()
+        || event.data.target.is_empty()
+        || !Path::new(&event.data.project).is_absolute()
+        || !Path::new(&event.data.target).is_absolute()
+    {
+        bail!("invalid target event paths");
+    }
+    Ok(())
+}
+
+fn validate_upgrade_scan_errors(errors: &[UpgradeScanError]) -> Result<()> {
+    for error in errors {
+        if error.kind.is_empty() || error.message.is_empty() {
+            bail!("invalid scan error");
+        }
+        if let Some(path) = &error.path.0 {
+            if path.is_empty() || !Path::new(path).is_absolute() {
+                bail!("invalid scan error path");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_upgrade_completion(
+    terminal: &UpgradeCompletionTerminal,
+    expected_review_id: i64,
+    exit_code: u8,
+    target_count: usize,
+) -> Result<()> {
+    if terminal.format_version != 1
+        || terminal.command != "run"
+        || terminal.review_id != expected_review_id
+        || terminal.policy_hash.0.as_deref().is_none_or(str::is_empty)
+        || terminal
+            .generation
+            .0
+            .is_none_or(|generation| generation <= 0)
+    {
+        bail!("invalid completion authority");
+    }
+    validate_upgrade_scan_errors(&terminal.scan_errors)?;
+
+    let expected_reasons: &[&str] = match exit_code {
+        0 => {
+            if terminal.outcome.kind != "complete" || terminal.data.coverage_incomplete {
+                bail!("exit zero has inconsistent outcome");
+            }
+            &[]
+        }
+        2 => {
+            if terminal.outcome.kind != "incomplete" || !terminal.data.coverage_incomplete {
+                bail!("exit two has inconsistent outcome");
+            }
+            match terminal
+                .outcome
+                .reasons
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["scan_incomplete"] => &["scan_incomplete"],
+                ["origin_incomplete", "scan_incomplete"] => {
+                    &["origin_incomplete", "scan_incomplete"]
+                }
+                _ => bail!("exit two has unknown reasons"),
+            }
+        }
+        _ => bail!("unsupported completion exit code"),
+    };
+    if terminal.outcome.code != exit_code
+        || terminal
+            .outcome
+            .reasons
+            .iter()
+            .map(String::as_str)
+            .ne(expected_reasons.iter().copied())
+    {
+        bail!("completion outcome does not match process exit");
+    }
+
+    let data = &terminal.data;
+    if data.run_id <= 0
+        || data.cleaned < 0
+        || data.skipped < 0
+        || data.bytes_recovered < 0
+        || data.errors < 0
+        || data.cargo_failures < 0
+        || data.measurement_failures < 0
+        || data.cleanup_failures < 0
+    {
+        bail!("completion counters are out of range");
+    }
+    let failure_sum = data
+        .cargo_failures
+        .checked_add(data.measurement_failures)
+        .and_then(|sum| sum.checked_add(data.cleanup_failures))
+        .context("completion counters overflow")?;
+    if data.errors != failure_sum
+        || data.errors != 0
+        || target_count != usize::try_from(data.cleaned).context("cleaned count is too large")?
+    {
+        bail!("completion counters are inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_upgrade_rejection(
+    terminal: &UpgradeRejectionTerminal,
+    expected_review_id: i64,
+) -> Result<()> {
+    if terminal.format_version != 1
+        || terminal.command != "run"
+        || terminal.review_id != expected_review_id
+        || terminal.outcome.code != 1
+        || terminal.outcome.kind != "failed"
+        || terminal.policy_hash.0.is_some()
+        || terminal.generation.0.is_some()
+        || !terminal.scan_errors.is_empty()
+    {
+        bail!("invalid rejection envelope");
+    }
+    let rejection = &terminal.data.review_plan_rejection;
+    let expected_reason = match rejection.kind.as_str() {
+        "missing" if rejection.replacing_generation.is_none() => reason::REVIEW_PLAN_MISSING,
+        "expired" if rejection.replacing_generation.is_none() => reason::REVIEW_PLAN_EXPIRED,
+        "policy_mismatch" if rejection.replacing_generation.is_none() => {
+            reason::REVIEW_POLICY_MISMATCH
+        }
+        "generation_mismatch"
+            if rejection
+                .replacing_generation
+                .is_none_or(|generation| generation > 0) =>
+        {
+            reason::REVIEW_GENERATION_MISMATCH
+        }
+        _ => bail!("unknown review rejection"),
+    };
+    if terminal.outcome.reasons != [expected_reason] {
+        bail!("review rejection reason does not match its kind");
+    }
+    Ok(())
+}
+
+fn validate_upgrade_review_output(
+    input: &str,
+    expected_review_id: i64,
+    exit_code: u8,
+) -> Result<UpgradeReviewValidation> {
+    if expected_review_id <= 0 || input.is_empty() || input.contains('\r') {
+        bail!("invalid validator inputs");
+    }
+    let input = input.strip_suffix('\n').unwrap_or(input);
+    if input.is_empty() {
+        bail!("review output has no terminal envelope");
+    }
+
+    let mut terminal_seen = false;
+    let mut targets = BTreeSet::new();
+    for line in input.split('\n') {
+        if line.is_empty() || terminal_seen {
+            bail!("invalid line after terminal envelope");
+        }
+        if let Ok(event) = serde_json::from_str::<UpgradeTargetEvent>(line) {
+            validate_upgrade_target(&event)?;
+            if !targets.insert((event.data.project, event.data.target)) {
+                bail!("duplicate target event");
+            }
+            continue;
+        }
+
+        match exit_code {
+            0 | 2 => {
+                let terminal: UpgradeCompletionTerminal =
+                    serde_json::from_str(line).context("invalid completion terminal envelope")?;
+                validate_upgrade_completion(
+                    &terminal,
+                    expected_review_id,
+                    exit_code,
+                    targets.len(),
+                )?;
+            }
+            1 => {
+                if !targets.is_empty() {
+                    bail!("pre-execution rejection followed target events");
+                }
+                let terminal: UpgradeRejectionTerminal =
+                    serde_json::from_str(line).context("invalid rejection terminal envelope")?;
+                validate_upgrade_rejection(&terminal, expected_review_id)?;
+            }
+            _ => bail!("unsupported reviewed execution exit code"),
+        }
+        terminal_seen = true;
+    }
+    if !terminal_seen {
+        bail!("review output has no terminal envelope");
+    }
+    Ok(if exit_code == 1 {
+        UpgradeReviewValidation::PreExecutionRejection
+    } else {
+        UpgradeReviewValidation::Completed
+    })
+}
+
+fn validate_upgrade_review_output_command(
+    expected_review_id: i64,
+    exit_code: u8,
+) -> Result<CommandOutcome> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("read reviewed execution output")?;
+    let classification = validate_upgrade_review_output(&input, expected_review_id, exit_code)
+        .context("invalid reviewed execution output")?;
+    match classification {
+        UpgradeReviewValidation::Completed => println!("completed"),
+        UpgradeReviewValidation::PreExecutionRejection => {
+            println!("pre_execution_rejection");
+        }
+    }
+    Ok(CommandOutcome::Complete)
+}
+
 fn execute(cli: Cli) -> Result<CommandOutcome> {
     match cli.command {
         Commands::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(CommandOutcome::Complete)
         }
+        Commands::ValidateUpgradeReviewOutput {
+            review_id,
+            exit_code,
+        } => validate_upgrade_review_output_command(review_id, exit_code),
         Commands::Service { command } => service(command).map(|_| CommandOutcome::Complete),
         Commands::Health {
             config,
@@ -2448,6 +2781,71 @@ fn tail_file_lines(path: &Path, n: usize) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    const COMPLETE_REVIEW_STREAM: &str = concat!(
+        "{\"format_version\":1,\"event\":\"target\",\"data\":",
+        "{\"project\":\"/tmp/project\",\"target\":\"/tmp/project/target\"}}\n",
+        "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+        "{\"code\":0,\"kind\":\"complete\",\"reasons\":[]},",
+        "\"policy_hash\":\"fixture\",\"generation\":1,\"review_id\":42,",
+        "\"scan_errors\":[],\"data\":{\"run_id\":1,\"cleaned\":1,",
+        "\"skipped\":0,\"bytes_recovered\":1,\"errors\":0,",
+        "\"cargo_failures\":0,\"measurement_failures\":0,",
+        "\"cleanup_failures\":0,\"coverage_incomplete\":false}}\n"
+    );
+
+    #[test]
+    fn upgrade_review_parser_accepts_exact_completion_and_pre_execution_rejection() {
+        assert_eq!(
+            validate_upgrade_review_output(COMPLETE_REVIEW_STREAM, 42, 0).unwrap(),
+            UpgradeReviewValidation::Completed
+        );
+        let rejection = concat!(
+            "{\"format_version\":1,\"command\":\"run\",\"outcome\":",
+            "{\"code\":1,\"kind\":\"failed\",",
+            "\"reasons\":[\"review_plan_expired\"]},",
+            "\"policy_hash\":null,\"generation\":null,\"review_id\":42,",
+            "\"scan_errors\":[],\"data\":{\"review_plan_rejection\":",
+            "{\"kind\":\"expired\"}}}\n"
+        );
+        assert_eq!(
+            validate_upgrade_review_output(rejection, 42, 1).unwrap(),
+            UpgradeReviewValidation::PreExecutionRejection
+        );
+    }
+
+    #[test]
+    fn upgrade_review_parser_rejects_schema_order_and_cardinality_violations() {
+        let terminal = COMPLETE_REVIEW_STREAM.lines().last().unwrap();
+        let zero_target_terminal = terminal
+            .replace("\"cleaned\":1", "\"cleaned\":0")
+            .replace("\"bytes_recovered\":1", "\"bytes_recovered\":0");
+        let invalid_streams = [
+            COMPLETE_REVIEW_STREAM.replace(
+                "\"target\":\"/tmp/project/target\"",
+                "\"target\":\"/tmp/project/target\",\"extra\":true",
+            ),
+            COMPLETE_REVIEW_STREAM.replace(
+                "\"coverage_incomplete\":false}",
+                "\"coverage_incomplete\":false,\"extra\":true}",
+            ),
+            format!("{zero_target_terminal}\n{zero_target_terminal}\n"),
+            format!(
+                "{zero_target_terminal}\n{}",
+                COMPLETE_REVIEW_STREAM.lines().next().unwrap()
+            ),
+            COMPLETE_REVIEW_STREAM.replace("\"event\":\"target\"", "\"event\":\"unknown\""),
+            COMPLETE_REVIEW_STREAM.replace("\"cleaned\":1", "\"cleaned\":2"),
+        ];
+
+        for stream in invalid_streams {
+            assert!(
+                validate_upgrade_review_output(&stream, 42, 0).is_err(),
+                "accepted invalid stream: {stream}"
+            );
+        }
+        assert!(validate_upgrade_review_output(COMPLETE_REVIEW_STREAM, 42, 2).is_err());
+    }
 
     #[test]
     fn broken_bound_root_maps_to_the_public_incomplete_exit_code() {
