@@ -6,7 +6,9 @@ use crate::daemon::{Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptio
 use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
 use crate::logging::Logger;
-use crate::outcome::CommandOutcome;
+use crate::outcome::{
+    reason, CommandOutcome, CommandReport, CommandStatus, ScanErrorReport, StreamEvent,
+};
 use crate::policy::{ProcessEnvironment, ProtectedRootKind, RootProvenance, ScopePolicy};
 use crate::safety::{
     bind_review_to_observation, review_project_with_identity_provider, review_summary,
@@ -16,7 +18,7 @@ use crate::scanner::{Scanner, ScannerOptions};
 use crate::service::{
     resolve_service_binary, ServiceAction, ServiceManager, ServicePlatform, SystemCommandRunner,
 };
-use crate::store::{DiscoveryOriginKind, ErrorRecord, ReviewPlan, Store};
+use crate::store::{DiscoveryOriginKind, ErrorRecord, PlanLoadError, ReviewPlan, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -282,6 +284,8 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         tail: usize,
         #[arg(long)]
+        json: bool,
+        #[arg(long)]
         state_dir: Option<PathBuf>,
     },
 }
@@ -316,6 +320,50 @@ enum ConfigCommands {
     Migrate,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct JsonFailureContext {
+    command: &'static str,
+    review_id: Option<i64>,
+}
+
+impl Cli {
+    fn json_failure_context(&self) -> Option<JsonFailureContext> {
+        match &self.command {
+            Commands::Health { json: true, .. } => Some(JsonFailureContext {
+                command: "health",
+                review_id: None,
+            }),
+            Commands::Status { json: true, .. } => Some(JsonFailureContext {
+                command: "status",
+                review_id: None,
+            }),
+            Commands::Projects { json: true, .. } => Some(JsonFailureContext {
+                command: "projects",
+                review_id: None,
+            }),
+            Commands::Scan { json: true, .. } => Some(JsonFailureContext {
+                command: "scan",
+                review_id: None,
+            }),
+            Commands::Run {
+                json: true, review, ..
+            } => Some(JsonFailureContext {
+                command: "run",
+                review_id: *review,
+            }),
+            Commands::Stats { json: true, .. } => Some(JsonFailureContext {
+                command: "stats",
+                review_id: None,
+            }),
+            Commands::Logs { json: true, .. } => Some(JsonFailureContext {
+                command: "logs",
+                review_id: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
 pub fn run() -> std::process::ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -330,12 +378,61 @@ pub fn run() -> std::process::ExitCode {
             return std::process::ExitCode::from(code);
         }
     };
+    let json_failure_context = cli.json_failure_context();
     match execute(cli) {
         Ok(outcome) => std::process::ExitCode::from(outcome.code()),
         Err(error) => {
+            if let Some(context) = json_failure_context {
+                let status = CommandStatus::failed(failure_reason(&error));
+                let report = CommandReport::new(
+                    context.command,
+                    &status,
+                    None,
+                    None,
+                    context.review_id,
+                    Vec::new(),
+                    serde_json::Value::Null,
+                );
+                if let Err(serialization_error) = print_json(&report) {
+                    eprintln!("Error: could not serialize failure report: {serialization_error:#}");
+                }
+            }
             eprintln!("Error: {error:#}");
             std::process::ExitCode::from(CommandOutcome::Failed.code())
         }
+    }
+}
+
+fn failure_reason(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(plan_error) = cause.downcast_ref::<PlanLoadError>() {
+            return match plan_error {
+                PlanLoadError::Missing => reason::REVIEW_PLAN_MISSING,
+                PlanLoadError::Expired => reason::REVIEW_PLAN_EXPIRED,
+                PlanLoadError::PolicyMismatch => reason::REVIEW_POLICY_MISMATCH,
+                PlanLoadError::GenerationMismatch => reason::REVIEW_GENERATION_MISMATCH,
+                PlanLoadError::Storage(_) => reason::COMMAND_FAILED,
+            };
+        }
+        let message = cause.to_string();
+        if message.starts_with("another car-go-clean process is running")
+            || message.starts_with("acquire lock ")
+        {
+            return reason::LOCK_UNAVAILABLE;
+        }
+    }
+    reason::COMMAND_FAILED
+}
+
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+fn print_stream_event(event: &'static str, data: serde_json::Value) {
+    match serde_json::to_string(&StreamEvent::new(event, data)) {
+        Ok(serialized) => println!("{serialized}"),
+        Err(_) => println!("{{\"format_version\":1,\"event\":\"{event}\",\"data\":null}}"),
     }
 }
 
@@ -351,7 +448,7 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             state_dir,
             skip_cargo,
             json,
-        } => health(config, state_dir, skip_cargo, json).map(|_| CommandOutcome::Complete),
+        } => health(config, state_dir, skip_cargo, json),
         Commands::Config { command, config } => match command {
             None => {
                 let cfg = load_config(config)?;
@@ -421,12 +518,13 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             top,
             json,
             state_dir,
-        } => stats(state_dir, since, top, json).map(|_| CommandOutcome::Complete),
+        } => stats(state_dir, since, top, json),
         Commands::Logs {
             errors_only,
             tail,
+            json,
             state_dir,
-        } => logs(state_dir, errors_only, tail).map(|_| CommandOutcome::Complete),
+        } => logs(state_dir, errors_only, tail, json),
     }
 }
 
@@ -498,7 +596,7 @@ fn health(
     state_dir: Option<PathBuf>,
     skip_cargo: bool,
     json: bool,
-) -> Result<()> {
+) -> Result<CommandOutcome> {
     let (cfg, config_source) = load_config_with_source(config_path)?;
     let policy = build_policy(&cfg, &config_source)?;
     for dir in &cfg.scan_dirs {
@@ -519,8 +617,21 @@ fn health(
     let since = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let errors = store.errors_since(since)?;
     let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let status = CommandStatus::complete();
+    let report = CommandReport::new(
+        "health",
+        &status,
+        Some(diagnostics.policy_hash.clone()),
+        diagnostics
+            .current_generation
+            .as_ref()
+            .map(|generation| generation.id),
+        None,
+        diagnostics_scan_errors(&diagnostics),
+        diagnostics,
+    );
     if json {
-        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        print_json(&report)?;
     } else {
         println!("OK");
         if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
@@ -529,9 +640,10 @@ fn health(
         if !errors.is_empty() {
             println!("WARN: {} errors in last 24h", errors.len());
         }
-        print_cleanup_authority_diagnostics(&diagnostics);
+        print_cleanup_authority_diagnostics(&report.data);
+        print_text_outcome(&report);
     }
-    Ok(())
+    Ok(status.outcome())
 }
 
 fn status(
@@ -543,7 +655,7 @@ fn status(
     let (cfg, config_source) = load_config_with_source(config_path)?;
     let policy = build_policy(&cfg, &config_source)?;
     let store = open_store(state_dir.as_deref())?;
-    let mut outcome = CommandOutcome::Complete;
+    let mut status = CommandStatus::complete();
     if refresh {
         reconcile_review_state(&store, &cfg, &policy)?;
         let safety = SafetyOptions {
@@ -560,21 +672,33 @@ fn status(
             "status --refresh",
         )?;
         if batch.coverage_incomplete {
-            outcome = outcome.merge(CommandOutcome::Incomplete);
+            status = status.merge(review_batch_incomplete_status(&batch));
         }
     }
 
     let cached_projects = store.project_count()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
     let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let report = CommandReport::new(
+        "status",
+        &status,
+        Some(diagnostics.policy_hash.clone()),
+        diagnostics
+            .current_generation
+            .as_ref()
+            .map(|generation| generation.id),
+        None,
+        diagnostics_scan_errors(&diagnostics),
+        diagnostics,
+    );
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
-        return Ok(outcome);
+        print_json(&report)?;
+        return Ok(status.outcome());
     }
 
     print_heading("Status");
-    print_cleanup_authority_diagnostics(&diagnostics);
+    print_cleanup_authority_diagnostics(&report.data);
     print_section("Cache");
     print_row("Cached projects", format_count(cached_projects));
 
@@ -610,7 +734,8 @@ fn status(
 
     print_section("Schedule");
     print_scheduler_status(&store, &cfg)?;
-    Ok(outcome)
+    print_text_outcome(&report);
+    Ok(status.outcome())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -650,6 +775,24 @@ struct IncompleteOriginDiagnostics {
     configured_path: PathBuf,
     canonical_path: Option<PathBuf>,
     error: Option<String>,
+}
+
+fn diagnostics_scan_errors(diagnostics: &CleanupAuthorityDiagnostics) -> Vec<ScanErrorReport> {
+    diagnostics
+        .incomplete_origins
+        .iter()
+        .map(|origin| ScanErrorReport {
+            kind: origin.kind.to_string(),
+            path: origin
+                .canonical_path
+                .clone()
+                .or_else(|| Some(origin.configured_path.clone())),
+            message: origin
+                .error
+                .clone()
+                .unwrap_or_else(|| "origin incomplete".to_string()),
+        })
+        .collect()
 }
 
 fn cleanup_authority_diagnostics(
@@ -831,15 +974,28 @@ fn projects(
         force: false,
     };
     let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "projects")?;
+    let status = review_batch_incomplete_status(&batch);
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let scan_errors = review_batch_scan_errors(&batch, &diagnostics);
+    let generation = batch.generation;
     let reviews = batch.reviews;
+    #[derive(Serialize)]
+    struct ProjectsData<'a> {
+        reviews: &'a [ProjectReview],
+    }
+    let report = CommandReport::new(
+        "projects",
+        &status,
+        Some(policy.hash().to_string()),
+        generation,
+        None,
+        scan_errors,
+        ProjectsData { reviews: &reviews },
+    );
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&reviews)?);
-        return Ok(if batch.coverage_incomplete {
-            CommandOutcome::Incomplete
-        } else {
-            CommandOutcome::Complete
-        });
+        print_json(&report)?;
+        return Ok(status.outcome());
     }
 
     if all {
@@ -857,11 +1013,8 @@ fn projects(
         print_skip_breakdown(&review_summary(&reviews));
         print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, false);
     }
-    Ok(if batch.coverage_incomplete {
-        CommandOutcome::Incomplete
-    } else {
-        CommandOutcome::Complete
-    })
+    print_text_outcome(&report);
+    Ok(status.outcome())
 }
 
 fn scan(
@@ -875,7 +1028,16 @@ fn scan(
     let (cfg, config_source) = load_config_with_source(config_path)?;
     let policy = build_policy(&cfg, &config_source)?;
     let store = open_store_at(&path_set)?;
-    scan_and_report(&store, &cfg, &policy, json)
+    let execution = scan_and_report(&store, &cfg, &policy, json, true)?;
+    Ok(execution.status.outcome())
+}
+
+#[derive(Debug)]
+struct ScanExecution {
+    status: CommandStatus,
+    generation: i64,
+    policy_hash: String,
+    scan_errors: Vec<ScanErrorReport>,
 }
 
 fn scan_and_report(
@@ -883,36 +1045,84 @@ fn scan_and_report(
     cfg: &Config,
     policy: &ScopePolicy,
     json: bool,
-) -> Result<CommandOutcome> {
+    terminal: bool,
+) -> Result<ScanExecution> {
     let result = daemon_for_scan(store, cfg, policy).scan_cycle()?;
     let projects = result
         .origins
         .iter()
         .flat_map(|origin| origin.projects.iter().map(|project| project.path.clone()))
         .collect::<BTreeSet<_>>();
-    if json {
-        let origins = result
-            .origins
-            .iter()
-            .map(|origin| {
-                serde_json::json!({
-                    "kind": origin.kind,
-                    "path": origin.configured_path,
-                    "canonical_path": origin.canonical_path,
-                    "completed": origin.completed,
-                    "error": origin.error,
-                })
+    let scan_errors = result
+        .origins
+        .iter()
+        .filter(|origin| !origin.completed)
+        .map(|origin| ScanErrorReport {
+            kind: match origin.kind {
+                crate::scanner::DiscoveryOriginKind::ScanRoot => "scan_root",
+                crate::scanner::DiscoveryOriginKind::ExplicitProject => "explicit_project",
+            }
+            .to_string(),
+            path: origin
+                .canonical_path
+                .clone()
+                .or_else(|| Some(origin.configured_path.clone())),
+            message: origin
+                .error
+                .clone()
+                .unwrap_or_else(|| "origin incomplete".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let incomplete = result.errors > 0 || result.origins.iter().any(|origin| !origin.completed);
+    let mut status = if incomplete {
+        CommandStatus::incomplete(reason::SCAN_INCOMPLETE)
+    } else {
+        CommandStatus::complete()
+    };
+    if result.origins.iter().any(|origin| !origin.completed) {
+        status = status.merge_reason(CommandOutcome::Incomplete, reason::ORIGIN_INCOMPLETE);
+    }
+    let data = serde_json::json!({
+        "origins": result.origins.iter().map(|origin| {
+            serde_json::json!({
+                "kind": origin.kind,
+                "path": origin.configured_path.to_string_lossy(),
+                "canonical_path": origin.canonical_path.as_ref().map(|path| path.to_string_lossy()),
+                "completed": origin.completed,
+                "error": origin.error,
             })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "generation": result.generation,
-                "policy_hash": result.policy_hash,
-                "origins": origins,
-                "projects": projects,
-            }))?
-        );
+        }).collect::<Vec<_>>(),
+        "projects": projects.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+    });
+    let report = CommandReport::new(
+        "scan",
+        &status,
+        Some(result.policy_hash.clone()),
+        Some(result.generation),
+        None,
+        scan_errors.clone(),
+        data,
+    );
+    if json {
+        if terminal {
+            print_json(&report)?;
+        } else {
+            print_stream_event(
+                "scan",
+                serde_json::json!({
+                    "policy_hash": result.policy_hash.clone(),
+                    "generation": result.generation,
+                    "scan_errors": report.scan_errors.iter().map(|error| {
+                        serde_json::json!({
+                            "kind": error.kind,
+                            "path": error.path.as_ref().map(|path| path.to_string_lossy()),
+                            "message": error.message,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "result": report.data,
+                }),
+            );
+        }
     } else {
         println!("Scan complete: errors={}", result.errors);
         println!(
@@ -926,11 +1136,15 @@ fn scan_and_report(
                 origin.error.as_deref().unwrap_or("unknown error")
             );
         }
+        if terminal {
+            print_text_outcome(&report);
+        }
     }
-    Ok(if result.origins.iter().all(|origin| origin.completed) {
-        CommandOutcome::Complete
-    } else {
-        CommandOutcome::Incomplete
+    Ok(ScanExecution {
+        status,
+        generation: result.generation,
+        policy_hash: result.policy_hash,
+        scan_errors,
     })
 }
 
@@ -978,13 +1192,12 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
         let daemon =
             daemon_for_clean(&store, &cfg, cargo, &policy).with_target_reporter(move |review| {
                 if json {
-                    println!(
-                        "{}",
+                    print_stream_event(
+                        "target",
                         serde_json::json!({
-                            "event": "target",
-                            "project": review.path,
-                            "target": review.target_path,
-                        })
+                            "project": review.path.to_string_lossy(),
+                            "target": review.target_path.to_string_lossy(),
+                        }),
                     );
                 } else {
                     println!(
@@ -1011,21 +1224,44 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
             &crate::activity::SysinfoProcessInspector,
             RunSource::Reviewed,
         )?;
-        print_run_result(&result, json, Some(plan.id))?;
-        return Ok(run_result_outcome(&result));
+        let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+        let scan_errors = diagnostics_scan_errors(&diagnostics);
+        let status = run_result_status(&result, &scan_errors);
+        let report = run_command_report(
+            &status,
+            &result,
+            policy.hash(),
+            Some(current_generation_id),
+            Some(plan.id),
+            scan_errors,
+        );
+        print_run_result(&report, json)?;
+        return Ok(status.outcome());
     }
 
-    let mut outcome = CommandOutcome::Complete;
+    let mut status = CommandStatus::complete();
+    let mut scan_errors = Vec::new();
+    let mut scan_generation = None;
     if !no_scan {
-        outcome = outcome.merge(scan_and_report(&store, &cfg, &policy, json)?);
+        let execution = scan_and_report(&store, &cfg, &policy, json, false)?;
+        status = status.merge(execution.status);
+        scan_generation = Some(execution.generation);
+        scan_errors = execution.scan_errors;
+        debug_assert_eq!(execution.policy_hash, policy.hash());
     }
 
     if dry_run {
         reconcile_review_state(&store, &cfg, &policy)?;
         let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "dry-run")?;
+        status = status.merge(review_batch_incomplete_status(&batch));
+        let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+        scan_errors.extend(review_batch_scan_errors(&batch, &diagnostics));
+        normalize_scan_errors(&mut scan_errors);
+        let plan_generation = batch.generation;
+        let generation = batch.generation.or(scan_generation);
         let reviews = batch.reviews;
         let summary = review_summary(&reviews);
-        let plan = match batch.generation {
+        let plan = match plan_generation {
             Some(generation_id) => Some(
                 store.create_review_plan(
                     SystemTime::now(),
@@ -1039,45 +1275,54 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
             ),
             None => None,
         };
+        #[derive(Serialize)]
+        struct DryRunData<'a> {
+            review: Option<serde_json::Value>,
+            reviews: &'a [ProjectReview],
+            summary: &'a crate::safety::ReviewSummary,
+            coverage_incomplete: bool,
+        }
+        let report = CommandReport::new(
+            "run",
+            &status,
+            Some(policy.hash().to_string()),
+            generation,
+            plan.as_ref().map(|plan| plan.id),
+            scan_errors,
+            DryRunData {
+                review: plan.as_ref().map(review_plan_json),
+                reviews: &reviews,
+                summary: &summary,
+                coverage_incomplete: batch.coverage_incomplete,
+            },
+        );
         if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "review",
-                    "review": plan.as_ref().map(review_plan_json),
-                    "reviews": reviews,
-                    "summary": summary,
-                    "coverage_incomplete": batch.coverage_incomplete,
-                })
-            );
+            print_json(&report)?;
         } else {
-            print_review_summary("Dry run", &reviews);
-            print_skip_breakdown(&summary);
-            print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, all);
+            print_review_summary("Dry run", report.data.reviews);
+            print_skip_breakdown(report.data.summary);
+            print_cleanable_target_preview(report.data.reviews, DEFAULT_PREVIEW_LIMIT, all);
             match &plan {
                 Some(plan) => print_review_plan(plan),
                 None => println!(
                     "No review ID was created because no valid matching discovery generation exists."
                 ),
             }
+            print_text_outcome(&report);
         }
-        if batch.coverage_incomplete {
-            outcome = outcome.merge(CommandOutcome::Incomplete);
-        }
-        return Ok(outcome);
+        return Ok(status.outcome());
     }
 
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
     let daemon =
         daemon_for_clean(&store, &cfg, cargo, &policy).with_target_reporter(move |review| {
             if json {
-                println!(
-                    "{}",
+                print_stream_event(
+                    "target",
                     serde_json::json!({
-                        "event": "target",
-                        "project": review.path,
-                        "target": review.target_path,
-                    })
+                        "project": review.path.to_string_lossy(),
+                        "target": review.target_path.to_string_lossy(),
+                    }),
                 );
             } else {
                 println!(
@@ -1088,9 +1333,24 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
             }
         });
     let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
-    print_run_result(&result, json, None)?;
-    outcome = outcome.merge(run_result_outcome(&result));
-    Ok(outcome)
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    scan_errors.extend(diagnostics_scan_errors(&diagnostics));
+    normalize_scan_errors(&mut scan_errors);
+    status = status.merge(run_result_status(&result, &scan_errors));
+    let generation = store
+        .current_generation(policy.hash())?
+        .map(|generation| generation.id)
+        .or(scan_generation);
+    let report = run_command_report(
+        &status,
+        &result,
+        policy.hash(),
+        generation,
+        None,
+        scan_errors,
+    );
+    print_run_result(&report, json)?;
+    Ok(status.outcome())
 }
 
 #[derive(Debug)]
@@ -1098,6 +1358,56 @@ struct ReviewBatch {
     reviews: Vec<ProjectReview>,
     coverage_incomplete: bool,
     generation: Option<i64>,
+    generation_invalid: bool,
+    origin_incomplete: bool,
+    scan_error_paths: Vec<PathBuf>,
+}
+
+fn review_batch_incomplete_status(batch: &ReviewBatch) -> CommandStatus {
+    if !batch.coverage_incomplete {
+        return CommandStatus::complete();
+    }
+    let mut status = CommandStatus::incomplete(reason::SCAN_INCOMPLETE);
+    if batch.generation.is_none() {
+        status = status.merge_reason(
+            CommandOutcome::Incomplete,
+            if batch.generation_invalid {
+                reason::GENERATION_INVALID
+            } else {
+                reason::GENERATION_MISSING
+            },
+        );
+    }
+    if batch.origin_incomplete {
+        status = status.merge_reason(CommandOutcome::Incomplete, reason::ORIGIN_INCOMPLETE);
+    }
+    status
+}
+
+fn review_batch_scan_errors(
+    batch: &ReviewBatch,
+    diagnostics: &CleanupAuthorityDiagnostics,
+) -> Vec<ScanErrorReport> {
+    let mut reports = diagnostics_scan_errors(diagnostics);
+    for path in &batch.scan_error_paths {
+        if reports
+            .iter()
+            .any(|report| report.path.as_deref() == Some(path.as_path()))
+        {
+            continue;
+        }
+        reports.push(ScanErrorReport {
+            kind: "scan".to_string(),
+            path: Some(path.clone()),
+            message: "recent scan or worktree discovery error".to_string(),
+        });
+    }
+    reports.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    reports
 }
 
 fn project_reviews(
@@ -1109,6 +1419,14 @@ fn project_reviews(
 ) -> Result<ReviewBatch> {
     let now = SystemTime::now();
     let generation = store.current_generation(policy.hash())?;
+    let generation_invalid = generation.is_none() && store.project_count()? > 0;
+    let origin_incomplete = match generation.as_ref() {
+        Some(generation) => store
+            .discovery_origins(generation.id)?
+            .iter()
+            .any(|origin| !origin.completed),
+        None => false,
+    };
     let observations = match &generation {
         Some(generation) => store.authorized_observations(generation.id)?,
         None => Vec::new(),
@@ -1172,6 +1490,9 @@ fn project_reviews(
             || scan_coverage_incomplete
             || !discovery_blocks.is_empty(),
         generation: generation.map(|generation| generation.id),
+        generation_invalid,
+        origin_incomplete,
+        scan_error_paths: scan_errors,
     })
 }
 
@@ -1201,41 +1522,95 @@ fn print_review_plan(plan: &ReviewPlan) {
     println!("Candidate bytes: {}", plan.candidate_bytes);
 }
 
-fn print_run_result(
+#[derive(Debug, Clone, Serialize)]
+struct RunResultData {
+    run_id: i64,
+    cleaned: i64,
+    skipped: i64,
+    bytes_recovered: i64,
+    errors: i64,
+    coverage_incomplete: bool,
+}
+
+fn run_command_report(
+    status: &CommandStatus,
     result: &crate::daemon::RunCycleResult,
-    json: bool,
+    policy_hash: &str,
+    generation: Option<i64>,
     review_id: Option<i64>,
-) -> Result<()> {
+    scan_errors: Vec<ScanErrorReport>,
+) -> CommandReport<RunResultData> {
+    CommandReport::new(
+        "run",
+        status,
+        Some(policy_hash.to_string()),
+        generation,
+        review_id,
+        scan_errors,
+        RunResultData {
+            run_id: result.run_id,
+            cleaned: result.cleaned,
+            skipped: result.skipped,
+            bytes_recovered: result.bytes_recovered,
+            errors: result.errors,
+            coverage_incomplete: result.coverage_incomplete,
+        },
+    )
+}
+
+fn print_run_result(report: &CommandReport<RunResultData>, json: bool) -> Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "summary",
-                "review_id": review_id,
-                "run_id": result.run_id,
-                "cleaned": result.cleaned,
-                "skipped": result.skipped,
-                "bytes_recovered": result.bytes_recovered,
-                "errors": result.errors,
-                "coverage_incomplete": result.coverage_incomplete,
-            })
-        );
+        print_json(report)?;
     } else {
         println!(
             "Run complete: cleaned={} skipped={} recovered={} errors={}",
-            result.cleaned, result.skipped, result.bytes_recovered, result.errors
+            report.data.cleaned,
+            report.data.skipped,
+            report.data.bytes_recovered,
+            report.data.errors
         );
+        print_text_outcome(report);
     }
     Ok(())
 }
 
-fn run_result_outcome(result: &crate::daemon::RunCycleResult) -> CommandOutcome {
+fn run_result_status(
+    result: &crate::daemon::RunCycleResult,
+    scan_errors: &[ScanErrorReport],
+) -> CommandStatus {
+    let mut status = CommandStatus::complete();
     if result.errors > 0 {
-        CommandOutcome::Failed
-    } else if result.coverage_incomplete {
-        CommandOutcome::Incomplete
-    } else {
-        CommandOutcome::Complete
+        status = status.merge(CommandStatus::failed(reason::CARGO_FAILED));
+    }
+    if result.coverage_incomplete {
+        status = status.merge(CommandStatus::incomplete(reason::SCAN_INCOMPLETE));
+        if scan_errors
+            .iter()
+            .any(|error| matches!(error.kind.as_str(), "scan_root" | "explicit_project"))
+        {
+            status = status.merge_reason(CommandOutcome::Incomplete, reason::ORIGIN_INCOMPLETE);
+        }
+    }
+    status
+}
+
+fn normalize_scan_errors(errors: &mut Vec<ScanErrorReport>) {
+    errors.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    errors.dedup();
+}
+
+fn print_text_outcome<T>(report: &CommandReport<T>) {
+    println!(
+        "Outcome: {} (code={})",
+        report.outcome.kind, report.outcome.code
+    );
+    if !report.outcome.reasons.is_empty() {
+        println!("Reasons: {}", report.outcome.reasons.join(", "));
     }
 }
 
@@ -1465,7 +1840,12 @@ impl DaemonCycleFactory for ConfigCycleFactory {
     }
 }
 
-fn stats(state_dir: Option<PathBuf>, since: Option<String>, top: usize, json: bool) -> Result<()> {
+fn stats(
+    state_dir: Option<PathBuf>,
+    since: Option<String>,
+    top: usize,
+    json: bool,
+) -> Result<CommandOutcome> {
     let since_time = match since {
         Some(value) => SystemTime::now() - parse_since(&value)?,
         None => SystemTime::UNIX_EPOCH,
@@ -1474,36 +1854,97 @@ fn stats(state_dir: Option<PathBuf>, since: Option<String>, top: usize, json: bo
     let total = store.total_bytes_recovered(since_time)?;
     let top_projects = store.top_projects_by_bytes(since_time, top)?;
     let failed_clean_attempts = store.failed_clean_attempts(since_time)?;
+    let status = CommandStatus::complete();
+    let report = CommandReport::new(
+        "stats",
+        &status,
+        None,
+        None,
+        None,
+        Vec::new(),
+        serde_json::json!({
+            "total_bytes": total,
+            "top_projects": top_projects,
+            "failed_clean_attempts": failed_clean_attempts,
+        }),
+    );
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "total_bytes": total,
-                "top_projects": top_projects,
-                "failed_clean_attempts": failed_clean_attempts,
-            })
-        );
+        print_json(&report)?;
     } else {
-        println!("Bytes recovered: {total}");
-        println!("Failed clean attempts: {failed_clean_attempts}");
-        for (idx, project) in top_projects.iter().enumerate() {
-            println!("  {}. {} - {} bytes", idx + 1, project.path, project.bytes);
+        println!("Bytes recovered: {}", report.data["total_bytes"]);
+        println!(
+            "Failed clean attempts: {}",
+            report.data["failed_clean_attempts"]
+        );
+        for (idx, project) in report.data["top_projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            println!(
+                "  {}. {} - {} bytes",
+                idx + 1,
+                project["path"].as_str().unwrap_or_default(),
+                project["bytes"].as_i64().unwrap_or_default()
+            );
         }
+        print_text_outcome(&report);
     }
-    Ok(())
+    Ok(status.outcome())
 }
 
-fn logs(state_dir: Option<PathBuf>, errors_only: bool, tail: usize) -> Result<()> {
+fn logs(
+    state_dir: Option<PathBuf>,
+    errors_only: bool,
+    tail: usize,
+    json: bool,
+) -> Result<CommandOutcome> {
     let path_set = paths_for(state_dir.as_deref());
+    let status = CommandStatus::complete();
     if errors_only {
         let store = open_store_at(&path_set)?;
         let since = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
-        for error in store.errors_since(since)? {
-            println!("[{}] {:?}: {}", error.category, error.path, error.message);
+        let errors = store.errors_since(since)?;
+        let data = serde_json::json!({
+            "errors": errors.iter().map(|error| {
+                serde_json::json!({
+                    "category": error.category,
+                    "path": error.path,
+                    "message": error.message,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let report = CommandReport::new("logs", &status, None, None, None, Vec::new(), data);
+        if json {
+            print_json(&report)?;
+        } else {
+            for error in errors {
+                println!("[{}] {:?}: {}", error.category, error.path, error.message);
+            }
+            print_text_outcome(&report);
         }
-        return Ok(());
+        return Ok(status.outcome());
     }
-    tail_file(&path_set.log_path, tail)
+    let lines = tail_file_lines(&path_set.log_path, tail)?;
+    let report = CommandReport::new(
+        "logs",
+        &status,
+        None,
+        None,
+        None,
+        Vec::new(),
+        serde_json::json!({"lines": lines}),
+    );
+    if json {
+        print_json(&report)?;
+    } else {
+        for line in report.data["lines"].as_array().into_iter().flatten() {
+            println!("{}", line.as_str().unwrap_or_default());
+        }
+        print_text_outcome(&report);
+    }
+    Ok(status.outcome())
 }
 
 fn load_config(config_path: Option<PathBuf>) -> Result<Config> {
@@ -1610,7 +2051,7 @@ fn parse_since(value: &str) -> Result<Duration> {
     humantime::parse_duration(value).map_err(Into::into)
 }
 
-fn tail_file(path: &Path, n: usize) -> Result<()> {
+fn tail_file_lines(path: &Path, n: usize) -> Result<Vec<String>> {
     let file = fs::File::open(path)?;
     let reader = io::BufReader::new(file);
     let mut lines = Vec::new();
@@ -1620,10 +2061,7 @@ fn tail_file(path: &Path, n: usize) -> Result<()> {
             lines.remove(0);
         }
     }
-    for line in lines {
-        println!("{line}");
-    }
-    Ok(())
+    Ok(lines)
 }
 
 #[cfg(all(test, unix))]
@@ -1650,7 +2088,8 @@ mod tests {
         let store = Store::open(work.path().join("state.db")).unwrap();
         store.migrate().unwrap();
 
-        let outcome = scan_and_report(&store, &config, &policy, false).unwrap();
+        let execution = scan_and_report(&store, &config, &policy, false, true).unwrap();
+        let outcome = execution.status.outcome();
 
         assert_eq!(outcome, CommandOutcome::Incomplete);
         assert_eq!(outcome.code(), 2);

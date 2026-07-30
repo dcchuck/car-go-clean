@@ -7,6 +7,34 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+fn json_lines(output: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("invalid JSON line {line:?}: {error}"))
+        })
+        .collect()
+}
+
+fn terminal_report(output: &[u8], command: &str) -> serde_json::Value {
+    let lines = json_lines(output);
+    let report = lines
+        .last()
+        .unwrap_or_else(|| panic!("missing terminal report for {command}"));
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["command"], command);
+    assert!(report["outcome"]["code"].is_u64());
+    assert!(report["outcome"]["kind"].is_string());
+    assert!(report["outcome"]["reasons"].is_array());
+    assert!(report.get("policy_hash").is_some());
+    assert!(report.get("generation").is_some());
+    assert!(report.get("review_id").is_some());
+    assert!(report["scan_errors"].is_array());
+    assert!(report.get("data").is_some());
+    report.clone()
+}
+
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -203,13 +231,78 @@ fn scan_json_reports_generation_policy_origins_and_projects() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value["generation"].as_i64().unwrap() > 0);
     assert_eq!(value["policy_hash"].as_str().unwrap().len(), 64);
-    assert_eq!(value["origins"][0]["path"], root.to_string_lossy().as_ref());
-    assert_eq!(value["origins"][0]["completed"], true);
-    assert!(value["origins"][0]["error"].is_null());
     assert_eq!(
-        value["projects"][0],
+        value["data"]["origins"][0]["path"],
+        root.to_string_lossy().as_ref()
+    );
+    assert_eq!(value["data"]["origins"][0]["completed"], true);
+    assert!(value["data"]["origins"][0]["error"].is_null());
+    assert_eq!(
+        value["data"]["projects"][0],
         project.canonicalize().unwrap().to_string_lossy().as_ref()
     );
+}
+
+#[test]
+fn complete_scan_json_has_a_versioned_terminal_report() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let report = terminal_report(&output.stdout, "scan");
+    assert_eq!(
+        report["outcome"],
+        serde_json::json!({"code": 0, "kind": "complete", "reasons": []})
+    );
+    assert_eq!(report["policy_hash"].as_str().unwrap().len(), 64);
+    assert!(report["generation"].as_i64().unwrap() > 0);
+    assert!(report["review_id"].is_null());
+    assert_eq!(report["scan_errors"], serde_json::json!([]));
+    assert_eq!(report["data"]["origins"][0]["completed"], true);
+}
+
+#[test]
+fn incomplete_scan_json_has_stable_reasons_and_details() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(root.join("broken/.git")).unwrap();
+    fs::write(root.join("broken/Cargo.toml"), "[workspace]\n").unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let report = terminal_report(&output.stdout, "scan");
+    assert_eq!(report["outcome"]["code"], 2);
+    assert_eq!(report["outcome"]["kind"], "incomplete");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["origin_incomplete", "scan_incomplete"])
+    );
+    assert!(!report["scan_errors"].as_array().unwrap().is_empty());
+    assert!(report["scan_errors"][0]["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
 }
 
 #[test]
@@ -1192,22 +1285,25 @@ fn health_and_status_json_share_authority_diagnostics() {
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-        assert_eq!(report["config_source"], config.to_string_lossy().as_ref());
         assert_eq!(
-            report["canonical_scope_roots"]["scan_dirs"][0],
+            report["data"]["config_source"],
+            config.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            report["data"]["canonical_scope_roots"]["scan_dirs"][0],
             canonical_root.to_string_lossy().as_ref()
         );
         assert_eq!(
-            report["canonical_scope_roots"]["project_dirs"],
+            report["data"]["canonical_scope_roots"]["project_dirs"],
             serde_json::json!([])
         );
         assert_eq!(report["policy_hash"].as_str().unwrap().len(), 64);
-        assert!(report["current_generation"]["id"].as_i64().unwrap() > 0);
+        assert!(report["data"]["current_generation"]["id"].as_i64().unwrap() > 0);
         assert_eq!(
-            report["current_generation"]["policy_hash"],
+            report["data"]["current_generation"]["policy_hash"],
             report["policy_hash"]
         );
-        assert!(report["protected_roots"]
+        assert!(report["data"]["protected_roots"]
             .as_array()
             .unwrap()
             .iter()
@@ -1215,17 +1311,21 @@ fn health_and_status_json_share_authority_diagnostics() {
                 && root.get("kind").is_some()
                 && root.get("provenance").is_some()));
         assert_eq!(
-            report["incomplete_origins"][0]["configured_path"],
+            report["data"]["incomplete_origins"][0]["configured_path"],
             work.path().join("root").to_string_lossy().as_ref()
         );
-        assert!(report["incomplete_origins"][0]["error"]
+        assert!(report["data"]["incomplete_origins"][0]["error"]
             .as_str()
             .is_some_and(|error| !error.is_empty()));
-        assert!(report.get("service_environment_divergence").is_some());
+        assert!(report["data"]
+            .get("service_environment_divergence")
+            .is_some());
         reports.push(report);
     }
 
-    assert_eq!(reports[0], reports[1]);
+    assert_eq!(reports[0]["data"], reports[1]["data"]);
+    assert_eq!(reports[0]["policy_hash"], reports[1]["policy_hash"]);
+    assert_eq!(reports[0]["generation"], reports[1]["generation"]);
 }
 
 #[test]
@@ -1258,6 +1358,126 @@ fn health_and_status_text_share_authority_diagnostics() {
             .stdout(contains("Incomplete origins:"))
             .stdout(contains("canonical="));
     }
+}
+
+#[test]
+fn every_operator_json_command_ends_with_the_same_public_envelope() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+    let home = work.path().join("home");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .assert()
+        .success();
+
+    let invocations = [
+        ("health", vec!["health", "--json", "--skip-cargo"]),
+        ("status", vec!["status", "--json"]),
+        ("projects", vec!["projects", "--json"]),
+        ("scan", vec!["scan", "--json"]),
+        ("run", vec!["run", "--dry-run", "--no-scan", "--json"]),
+        ("stats", vec!["stats", "--json"]),
+        ("logs", vec!["logs", "--errors-only", "--json"]),
+    ];
+    for (expected_command, args) in invocations {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command.args(args);
+        if !matches!(expected_command, "stats" | "logs") {
+            command.args(["--config"]).arg(&config);
+        }
+        let output = command
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{expected_command} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        terminal_report(&output.stdout, expected_command);
+    }
+}
+
+#[test]
+fn status_text_and_json_present_the_same_authority_facts() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+
+    let json_output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let report = terminal_report(&json_output.stdout, "status");
+    let policy_hash = report["policy_hash"].as_str().unwrap();
+    let generation = report["generation"].as_i64().unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["status", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success()
+        .stdout(contains(policy_hash))
+        .stdout(contains(format!("id={generation}")));
+}
+
+#[test]
+fn json_failure_after_parsing_keeps_stdout_parseable() {
+    let work = tempfile::tempdir().unwrap();
+    let invalid_config = work.path().join("invalid.toml");
+    fs::write(&invalid_config, "scan_dirs = [").unwrap();
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--json", "--config"])
+        .arg(&invalid_config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "scan");
+    assert_eq!(
+        report["outcome"],
+        serde_json::json!({
+            "code": 1,
+            "kind": "failed",
+            "reasons": ["command_failed"]
+        })
+    );
+    assert!(!output.stderr.is_empty());
 }
 
 #[test]
@@ -1423,8 +1643,8 @@ fn cargo_failure_is_audited_without_recovery_accounting() {
         .unwrap();
     assert!(output.status.success());
     let stats: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(stats["total_bytes"], 0);
-    assert_eq!(stats["failed_clean_attempts"], 1);
+    assert_eq!(stats["data"]["total_bytes"], 0);
+    assert_eq!(stats["data"]["failed_clean_attempts"], 1);
 }
 
 #[cfg(unix)]
@@ -2612,9 +2832,238 @@ fn dry_run_json_is_newline_delimited_and_structurally_usable() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 2, "{stdout}");
-    assert!(events[0]["generation"].as_i64().unwrap() > 0);
-    assert!(events[1]["review"]["id"].as_i64().unwrap() > 0);
-    assert_eq!(events[1]["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(events[0]["format_version"], 1);
+    assert_eq!(events[0]["event"], "scan");
+    assert!(events[0]["data"]["generation"].as_i64().unwrap() > 0);
+    assert!(events[1]["data"]["review"]["id"].as_i64().unwrap() > 0);
+    assert_eq!(events[1]["data"]["reviews"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_json_stream_versions_target_events_and_ends_with_failed_report() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    write_executable(
+        &work.path().join("bin/cargo"),
+        "#!/bin/sh\nprintf cargo-failed >&2\nexit 7\n",
+    );
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let events = json_lines(&output.stdout);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["format_version"], 1);
+    assert_eq!(events[0]["event"], "target");
+    assert!(events[0].get("outcome").is_none());
+    assert_eq!(
+        events[0]["data"]["project"],
+        work.path()
+            .join("root/project")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(events[0]["data"]["target"]
+        .as_str()
+        .unwrap()
+        .ends_with("/target"));
+
+    let terminal = terminal_report(&output.stdout, "run");
+    assert_eq!(terminal["outcome"]["code"], 1);
+    assert_eq!(terminal["outcome"]["kind"], "failed");
+    assert_eq!(
+        terminal["outcome"]["reasons"],
+        serde_json::json!(["cargo_failed"])
+    );
+    assert_eq!(terminal["review_id"], review_id);
+    assert_eq!(terminal["data"]["errors"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_failure_outranks_incomplete_scan_without_losing_either_reason() {
+    let work = tempfile::tempdir().unwrap();
+    let good_root = work.path().join("good");
+    let project = good_root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    let incomplete_root = work.path().join("incomplete");
+    fs::create_dir_all(incomplete_root.join("broken/.git")).unwrap();
+    fs::write(incomplete_root.join("broken/Cargo.toml"), "[workspace]\n").unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\", \"{}\"]\ntarget_quiet_period = \"1ns\"\n",
+            good_root.display(),
+            incomplete_root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let home = work.path().join("home");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        "#!/bin/sh\nprintf cargo-failed >&2\nexit 9\n",
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "run");
+    assert_eq!(report["outcome"]["kind"], "failed");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["cargo_failed", "origin_incomplete", "scan_incomplete"])
+    );
+    assert_eq!(report["data"]["errors"], 1);
+    assert!(!report["scan_errors"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn safety_skips_alone_do_not_make_json_outcome_incomplete() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let report = terminal_report(&output.stdout, "projects");
+    assert_eq!(
+        report["outcome"],
+        serde_json::json!({"code": 0, "kind": "complete", "reasons": []})
+    );
+    assert!(report["data"]["reviews"][0]["decision"]
+        .get("skipped")
+        .is_some());
+}
+
+#[test]
+fn projects_json_without_current_generation_is_incomplete_for_a_stable_reason() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(work.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        terminal_report(&output.stdout, "projects")["outcome"]["reasons"],
+        serde_json::json!(["generation_missing", "scan_incomplete"])
+    );
+}
+
+#[test]
+fn projects_json_with_only_stale_authority_reports_invalid_generation() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let first_config = work.path().join("first.toml");
+    fs::write(
+        &first_config,
+        format!("scan_dirs = [\"{}\"]\n", root.display()),
+    )
+    .unwrap();
+    let changed_config = work.path().join("changed.toml");
+    fs::write(
+        &changed_config,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"new\"]\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&first_config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--json", "--config"])
+        .arg(&changed_config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        terminal_report(&output.stdout, "projects")["outcome"]["reasons"],
+        serde_json::json!(["generation_invalid", "scan_incomplete"])
+    );
 }
 
 #[test]
@@ -2946,6 +3395,186 @@ fn reviewed_run_fails_cleanly_while_daemon_holds_lock() {
         .stderr(contains("another car-go-clean process is running"));
 
     assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn json_review_failures_use_stable_machine_reason_identifiers() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+
+    let missing = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", "999999", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        terminal_report(&missing.stdout, "run")["outcome"]["reasons"],
+        serde_json::json!(["review_plan_missing"])
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+    let superseded = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(superseded.status.code(), Some(1));
+    assert_eq!(
+        terminal_report(&superseded.stdout, "run")["outcome"]["reasons"],
+        serde_json::json!(["review_plan_missing"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pruned_expired_review_maps_to_missing_in_the_cli_contract() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let connection = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE review_plans SET expires_at = 0 WHERE id = ?1",
+            [review_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "run");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["review_plan_missing"])
+    );
+    assert!(!report["outcome"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "review_plan_expired"));
+}
+
+#[cfg(unix)]
+#[test]
+fn json_policy_mismatch_has_its_own_reason() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let changed_config = work.path().join("changed.toml");
+    fs::write(
+        &changed_config,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"new\"]\ntarget_quiet_period = \"1ns\"\n",
+            work.path().join("root").display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&changed_config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        terminal_report(&output.stdout, "run")["outcome"]["reasons"],
+        serde_json::json!(["review_policy_mismatch"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_lock_failure_is_a_failed_terminal_report() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join("daemon.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        terminal_report(&output.stdout, "run")["outcome"]["reasons"],
+        serde_json::json!(["lock_unavailable"])
+    );
 }
 
 #[cfg(unix)]
