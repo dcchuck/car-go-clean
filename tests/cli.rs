@@ -1247,15 +1247,49 @@ fn version_prints_package_version() {
 }
 
 #[test]
-fn health_passes_with_defaults_when_cargo_check_is_skipped() {
-    let state = tempfile::tempdir().unwrap();
-    let mut cmd = Command::cargo_bin("car-go-clean").unwrap();
-    cmd.args(["health", "--state-dir"])
-        .arg(state.path())
-        .arg("--skip-cargo")
-        .assert()
-        .success()
-        .stdout(contains("OK"));
+fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+
+    for subcommand in ["health", "status"] {
+        let mut json_command = Command::cargo_bin("car-go-clean").unwrap();
+        json_command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state);
+        if subcommand == "health" {
+            json_command.arg("--skip-cargo");
+        }
+        let output = json_command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
+        let report = terminal_report(&output.stdout, subcommand);
+        assert_eq!(
+            report["outcome"]["reasons"],
+            serde_json::json!(["generation_missing", "scan_incomplete"])
+        );
+
+        let mut text_command = Command::cargo_bin("car-go-clean").unwrap();
+        text_command
+            .arg(subcommand)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state);
+        if subcommand == "health" {
+            text_command.arg("--skip-cargo");
+        }
+        text_command
+            .assert()
+            .code(2)
+            .stdout(contains("Outcome: incomplete (code=2)"))
+            .stdout(contains("Reasons: generation_missing, scan_incomplete"));
+    }
 }
 
 #[test]
@@ -1278,12 +1312,16 @@ fn health_and_status_json_share_authority_diagnostics() {
             command.arg("--skip-cargo");
         }
         let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{subcommand} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["outcome"],
+            serde_json::json!({
+                "code": 2,
+                "kind": "incomplete",
+                "reasons": ["origin_incomplete", "scan_incomplete"]
+            })
+        );
 
         assert_eq!(
             report["data"]["config_source"],
@@ -1329,6 +1367,59 @@ fn health_and_status_json_share_authority_diagnostics() {
 }
 
 #[test]
+fn health_and_status_report_recent_pathless_scan_errors_as_incomplete() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .success();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store
+        .record_error(&car_go_clean::store::ErrorRecord {
+            id: 0,
+            ts: SystemTime::now(),
+            category: "scan".to_string(),
+            path: None,
+            message: "scan failed before resolving a path".to_string(),
+        })
+        .unwrap();
+    drop(store);
+
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
+        let report = terminal_report(&output.stdout, subcommand);
+        assert_eq!(
+            report["outcome"]["reasons"],
+            serde_json::json!(["scan_incomplete"])
+        );
+        assert!(report["generation"].as_i64().unwrap() > 0);
+        assert_eq!(report["scan_errors"][0]["path"], serde_json::Value::Null);
+    }
+}
+
+#[test]
 fn health_and_status_text_share_authority_diagnostics() {
     let work = tempfile::tempdir().unwrap();
     let (config, state, home) = seed_incomplete_diagnostic_state(&work);
@@ -1347,7 +1438,7 @@ fn health_and_status_text_share_authority_diagnostics() {
         }
         command
             .assert()
-            .success()
+            .code(2)
             .stdout(contains("Cleanup authority"))
             .stdout(contains("Config source:"))
             .stdout(contains("Canonical scan roots:"))
@@ -1356,7 +1447,9 @@ fn health_and_status_text_share_authority_diagnostics() {
             .stdout(contains("boot_session="))
             .stdout(contains("Protected roots:"))
             .stdout(contains("Incomplete origins:"))
-            .stdout(contains("canonical="));
+            .stdout(contains("canonical="))
+            .stdout(contains("Outcome: incomplete (code=2)"))
+            .stdout(contains("Reasons: origin_incomplete, scan_incomplete"));
     }
 }
 
@@ -1545,8 +1638,11 @@ fn scan_run_stats_work_with_fake_cargo() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .arg("status")
+        .args(["--config"])
+        .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
+        .env("HOME", work.path().join("missing-home"))
         .assert()
         .success()
         .stdout(contains("Source: run (pre-clean snapshot)"));
@@ -1684,19 +1780,26 @@ fn post_cargo_measurement_failure_exits_one_without_losing_the_audit_event() {
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
 
-    Command::cargo_bin("car-go-clean")
+    let output = Command::cargo_bin("car-go-clean")
         .unwrap()
-        .args(["run", "--force", "--config"])
+        .args(["run", "--force", "--json", "--config"])
         .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
         .env("HOME", work.path().join("missing-home"))
         .env("PATH", &path)
-        .assert()
-        .code(1)
-        .stdout(contains("Run complete: cleaned=0"))
-        .stdout(contains("recovered=0"))
-        .stdout(contains("errors=1"));
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "run");
+    assert_eq!(report["outcome"]["kind"], "failed");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["measurement_failed"])
+    );
+    assert_eq!(report["data"]["cleaned"], 0);
+    assert_eq!(report["data"]["bytes_recovered"], 0);
+    assert_eq!(report["data"]["errors"], 1);
 
     let store = Store::open(state.join("state.db")).unwrap();
     store.migrate().unwrap();
@@ -1716,6 +1819,113 @@ fn post_cargo_measurement_failure_exits_one_without_losing_the_audit_event() {
         .message
         .contains("measure target after cargo clean"));
     assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn combined_cargo_and_measurement_failures_retain_both_reasons() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("tree");
+    for name in ["cargo-fails", "measurement-fails"] {
+        let project = root.join(name);
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        "#!/bin/sh\ncase \"$PWD\" in\n  */cargo-fails) printf cargo-failed >&2; exit 7 ;;\n  *) rm -rf target; printf replacement > target; exit 0 ;;\nesac\n",
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", work.path().join("home"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "run");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["cargo_failed", "measurement_failed"])
+    );
+    assert_eq!(report["data"]["errors"], 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn command_execution_failure_uses_cleanup_failed_not_cargo_failed() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("tree");
+    for name in ["first", "second"] {
+        let project = root.join(name);
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ms\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        "#!/bin/sh\nrm -f \"$0\"\nrm -rf target\nexit 0\n",
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--force", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", work.path().join("home"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = terminal_report(&output.stdout, "run");
+    assert_eq!(
+        report["outcome"]["reasons"],
+        serde_json::json!(["cleanup_failed"])
+    );
+    assert_eq!(report["data"]["cargo_failures"], 0);
+    assert_eq!(report["data"]["measurement_failures"], 0);
+    assert_eq!(report["data"]["cleanup_failures"], 1);
+    assert_eq!(report["data"]["errors"], 1);
 }
 
 #[test]
@@ -2548,6 +2758,8 @@ fn status_prints_safe_cleaning_summary() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .arg("status")
+        .args(["--config"])
+        .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
         .assert()
@@ -2642,12 +2854,13 @@ fn status_prints_scheduler_timing() {
         .args(["--state-dir"])
         .arg(&state)
         .assert()
-        .success()
+        .code(2)
         .stdout(contains("Clean interval: 1 hour"))
         .stdout(contains("Scheduler state: recorded"))
         .stdout(contains("Next scheduled clean: overdue by"))
         .stdout(contains("Scan interval: 2 hours"))
-        .stdout(contains("Next scheduled scan: in"));
+        .stdout(contains("Next scheduled scan: in"))
+        .stdout(contains("Reasons: generation_missing, scan_incomplete"));
 }
 
 #[test]
@@ -2705,6 +2918,8 @@ fn dry_run_syncs_stale_cached_projects_before_status_snapshot() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .arg("status")
+        .args(["--config"])
+        .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
         .assert()
@@ -2768,6 +2983,8 @@ fn run_dry_run_syncs_stale_cached_projects_before_review() {
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .arg("status")
+        .args(["--config"])
+        .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
         .assert()

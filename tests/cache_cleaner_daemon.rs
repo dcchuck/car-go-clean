@@ -3033,6 +3033,9 @@ fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
     assert_eq!(result.cleaned, 0);
     assert_eq!(result.bytes_recovered, 0);
     assert_eq!(result.errors, 1);
+    assert_eq!(result.cargo_failures, 1);
+    assert_eq!(result.measurement_failures, 0);
+    assert_eq!(result.cleanup_failures, 0);
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 0);
     assert_eq!(run.bytes_recovered, 0);
@@ -3112,6 +3115,9 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
     assert_eq!(result.cleaned, 1);
     assert_eq!(result.bytes_recovered, 2048);
     assert_eq!(result.errors, 1);
+    assert_eq!(result.cargo_failures, 0);
+    assert_eq!(result.measurement_failures, 1);
+    assert_eq!(result.cleanup_failures, 0);
     let run = store.last_run().unwrap();
     assert_eq!(run.projects_cleaned, 1);
     assert_eq!(run.bytes_recovered, 2048);

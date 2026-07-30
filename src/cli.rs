@@ -616,8 +616,8 @@ fn health(
     let store = open_store(state_dir.as_deref())?;
     let since = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let errors = store.errors_since(since)?;
-    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
-    let status = CommandStatus::complete();
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
+    let status = cleanup_authority_status(&diagnostics);
     let report = CommandReport::new(
         "health",
         &status,
@@ -678,7 +678,8 @@ fn status(
 
     let cached_projects = store.project_count()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
-    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
+    status = status.merge(cleanup_authority_status(&diagnostics));
     let report = CommandReport::new(
         "status",
         &status,
@@ -743,10 +744,15 @@ struct CleanupAuthorityDiagnostics {
     config_source: PathBuf,
     canonical_scope_roots: CanonicalScopeRootsDiagnostics,
     policy_hash: String,
+    generation_state: &'static str,
     current_generation: Option<CurrentGenerationDiagnostics>,
     protected_roots: Vec<ProtectedRootDiagnostics>,
     incomplete_origins: Vec<IncompleteOriginDiagnostics>,
     service_environment_divergence: Option<bool>,
+    #[serde(skip)]
+    scan_coverage_incomplete: bool,
+    #[serde(skip)]
+    scan_error_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -778,7 +784,7 @@ struct IncompleteOriginDiagnostics {
 }
 
 fn diagnostics_scan_errors(diagnostics: &CleanupAuthorityDiagnostics) -> Vec<ScanErrorReport> {
-    diagnostics
+    let mut reports = diagnostics
         .incomplete_origins
         .iter()
         .map(|origin| ScanErrorReport {
@@ -792,12 +798,60 @@ fn diagnostics_scan_errors(diagnostics: &CleanupAuthorityDiagnostics) -> Vec<Sca
                 .clone()
                 .unwrap_or_else(|| "origin incomplete".to_string()),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for path in &diagnostics.scan_error_paths {
+        if reports
+            .iter()
+            .any(|report| report.path.as_deref() == Some(path.as_path()))
+        {
+            continue;
+        }
+        reports.push(ScanErrorReport {
+            kind: "scan".to_string(),
+            path: Some(path.clone()),
+            message: "recent scan or worktree discovery error".to_string(),
+        });
+    }
+    if diagnostics.scan_coverage_incomplete && reports.is_empty() {
+        reports.push(ScanErrorReport {
+            kind: "scan".to_string(),
+            path: None,
+            message: "recent pathless scan or worktree discovery error".to_string(),
+        });
+    }
+    normalize_scan_errors(&mut reports);
+    reports
+}
+
+fn cleanup_authority_status(diagnostics: &CleanupAuthorityDiagnostics) -> CommandStatus {
+    let mut status = CommandStatus::complete();
+    match diagnostics.generation_state {
+        "missing" => {
+            status = status
+                .merge(CommandStatus::incomplete(reason::GENERATION_MISSING))
+                .merge_reason(CommandOutcome::Incomplete, reason::SCAN_INCOMPLETE);
+        }
+        "invalid" => {
+            status = status
+                .merge(CommandStatus::incomplete(reason::GENERATION_INVALID))
+                .merge_reason(CommandOutcome::Incomplete, reason::SCAN_INCOMPLETE);
+        }
+        "current" => {}
+        _ => unreachable!("generation state is internal and enumerated"),
+    }
+    if diagnostics.scan_coverage_incomplete || !diagnostics.incomplete_origins.is_empty() {
+        status = status.merge_reason(CommandOutcome::Incomplete, reason::SCAN_INCOMPLETE);
+    }
+    if !diagnostics.incomplete_origins.is_empty() {
+        status = status.merge_reason(CommandOutcome::Incomplete, reason::ORIGIN_INCOMPLETE);
+    }
+    status
 }
 
 fn cleanup_authority_diagnostics(
     policy: &ScopePolicy,
     store: &Store,
+    scan_interval: Duration,
 ) -> Result<CleanupAuthorityDiagnostics> {
     let policy_diagnostics = policy.diagnostics();
     let current_generation = store.current_generation(policy.hash())?;
@@ -829,6 +883,18 @@ fn cleanup_authority_diagnostics(
             provenance: root_provenance_label(&root.provenance),
         })
         .collect();
+    let generation_state = if current_generation.is_some() {
+        "current"
+    } else if store.project_count()? > 0 {
+        "invalid"
+    } else {
+        "missing"
+    };
+    let scan_error_since = SystemTime::now()
+        .checked_sub(scan_interval)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let scan_coverage_incomplete = store.scan_coverage_incomplete_since(scan_error_since)?;
+    let scan_error_paths = store.scan_error_paths_since(scan_error_since)?;
 
     Ok(CleanupAuthorityDiagnostics {
         config_source: policy_diagnostics.config_source.to_path_buf(),
@@ -837,6 +903,7 @@ fn cleanup_authority_diagnostics(
             project_dirs: policy_diagnostics.canonical_project_paths.to_vec(),
         },
         policy_hash: policy.hash().to_string(),
+        generation_state,
         current_generation,
         protected_roots,
         incomplete_origins,
@@ -845,6 +912,8 @@ fn cleanup_authority_diagnostics(
         // definition; Operator Control populates it once definitions capture
         // the supported root variables.
         service_environment_divergence: None,
+        scan_coverage_incomplete,
+        scan_error_paths,
     })
 }
 
@@ -863,6 +932,7 @@ fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics
         format_paths(&diagnostics.canonical_scope_roots.project_dirs),
     );
     print_row("Policy hash", &diagnostics.policy_hash);
+    print_row("Generation state", diagnostics.generation_state);
     print_row(
         "Current generation",
         diagnostics
@@ -975,7 +1045,7 @@ fn projects(
     };
     let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "projects")?;
     let status = review_batch_incomplete_status(&batch);
-    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
     let scan_errors = review_batch_scan_errors(&batch, &diagnostics);
     let generation = batch.generation;
     let reviews = batch.reviews;
@@ -1224,7 +1294,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
             &crate::activity::SysinfoProcessInspector,
             RunSource::Reviewed,
         )?;
-        let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+        let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
         let scan_errors = diagnostics_scan_errors(&diagnostics);
         let status = run_result_status(&result, &scan_errors);
         let report = run_command_report(
@@ -1254,7 +1324,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
         reconcile_review_state(&store, &cfg, &policy)?;
         let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "dry-run")?;
         status = status.merge(review_batch_incomplete_status(&batch));
-        let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+        let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
         scan_errors.extend(review_batch_scan_errors(&batch, &diagnostics));
         normalize_scan_errors(&mut scan_errors);
         let plan_generation = batch.generation;
@@ -1333,7 +1403,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
             }
         });
     let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
-    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
     scan_errors.extend(diagnostics_scan_errors(&diagnostics));
     normalize_scan_errors(&mut scan_errors);
     status = status.merge(run_result_status(&result, &scan_errors));
@@ -1529,6 +1599,9 @@ struct RunResultData {
     skipped: i64,
     bytes_recovered: i64,
     errors: i64,
+    cargo_failures: i64,
+    measurement_failures: i64,
+    cleanup_failures: i64,
     coverage_incomplete: bool,
 }
 
@@ -1553,6 +1626,9 @@ fn run_command_report(
             skipped: result.skipped,
             bytes_recovered: result.bytes_recovered,
             errors: result.errors,
+            cargo_failures: result.cargo_failures,
+            measurement_failures: result.measurement_failures,
+            cleanup_failures: result.cleanup_failures,
             coverage_incomplete: result.coverage_incomplete,
         },
     )
@@ -1579,9 +1655,19 @@ fn run_result_status(
     scan_errors: &[ScanErrorReport],
 ) -> CommandStatus {
     let mut status = CommandStatus::complete();
-    if result.errors > 0 {
+    if result.cargo_failures > 0 {
         status = status.merge(CommandStatus::failed(reason::CARGO_FAILED));
     }
+    if result.measurement_failures > 0 {
+        status = status.merge(CommandStatus::failed(reason::MEASUREMENT_FAILED));
+    }
+    if result.cleanup_failures > 0 {
+        status = status.merge(CommandStatus::failed(reason::CLEANUP_FAILED));
+    }
+    debug_assert_eq!(
+        result.errors,
+        result.cargo_failures + result.measurement_failures + result.cleanup_failures
+    );
     if result.coverage_incomplete {
         status = status.merge(CommandStatus::incomplete(reason::SCAN_INCOMPLETE));
         if scan_errors

@@ -166,11 +166,13 @@ current authority.
 Use either command to inspect the same authority facts:
 
 ```sh
-car-go-clean health --json
-car-go-clean status --json
+car-go-clean health --json || test $? -eq 2
+car-go-clean status --json || test $? -eq 2
 ```
 
-Text output contains the same cleanup-authority section. JSON includes:
+Exit `2` means the report is valid but cleanup authority is incomplete. Text
+output contains the same cleanup-authority section. The format-v1 JSON
+envelope includes `outcome`, `scan_errors`, and these fields under `data`:
 
 - `config_source` and `canonical_scope_roots`;
 - `policy_hash` and `current_generation`;

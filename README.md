@@ -85,15 +85,17 @@ legitimately return `2` when privacy-protected directories cannot be read.
 Inspect the cleanup authority in human-readable or machine-readable form:
 
 ```sh
-car-go-clean health --json
-car-go-clean status --json
+car-go-clean health --json || test $? -eq 2
+car-go-clean status --json || test $? -eq 2
 ```
 
-Both JSON commands use the same diagnostic shape. It names the effective
-config source, canonical scan and project roots, policy hash, current
-discovery generation, protected roots and their provenance, incomplete scan
-origins, and service-environment divergence when the installed definition
-contains enough information to compare it with the current shell.
+Exit `2` is expected when cleanup authority is incomplete; stdout still
+contains a valid report. Both commands use the format-v1 terminal envelope.
+Authority facts under `data` name the effective config source, canonical scan
+and project roots, policy hash, current discovery generation, protected roots
+and their provenance, incomplete scan origins, and service-environment
+divergence when the installed definition contains enough information to
+compare it with the current shell.
 
 ## Agent Quick Start
 

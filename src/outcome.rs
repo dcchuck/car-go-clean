@@ -6,10 +6,12 @@ pub const FORMAT_VERSION: u32 = 1;
 
 pub mod reason {
     pub const CARGO_FAILED: &str = "cargo_failed";
+    pub const CLEANUP_FAILED: &str = "cleanup_failed";
     pub const COMMAND_FAILED: &str = "command_failed";
     pub const GENERATION_INVALID: &str = "generation_invalid";
     pub const GENERATION_MISSING: &str = "generation_missing";
     pub const LOCK_UNAVAILABLE: &str = "lock_unavailable";
+    pub const MEASUREMENT_FAILED: &str = "measurement_failed";
     pub const ORIGIN_INCOMPLETE: &str = "origin_incomplete";
     pub const REVIEW_GENERATION_MISMATCH: &str = "review_generation_mismatch";
     pub const REVIEW_PLAN_EXPIRED: &str = "review_plan_expired";

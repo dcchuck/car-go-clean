@@ -129,6 +129,9 @@ pub struct RunCycleResult {
     pub skipped: i64,
     pub bytes_recovered: i64,
     pub errors: i64,
+    pub cargo_failures: i64,
+    pub measurement_failures: i64,
+    pub cleanup_failures: i64,
     pub coverage_incomplete: bool,
 }
 
@@ -558,6 +561,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let mut cleaner_skipped = 0;
         let mut bytes_recovered = 0;
         let mut errors_count = 0;
+        let mut cargo_failures = 0;
+        let mut measurement_failures = 0;
+        let mut cleanup_failures = 0;
 
         for prepared in &mut reviews {
             let review = &mut prepared.review;
@@ -632,6 +638,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     let measurement_failed =
                         if let Some(measurement_error) = &result.measurement_error {
                             errors_count += 1;
+                            measurement_failures += 1;
                             self.store.record_error(&ErrorRecord {
                                 id: 0,
                                 ts: now,
@@ -649,6 +656,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         self.store.mark_project_cleaned(&path, now)?;
                     } else if result.exit_code != 0 {
                         errors_count += 1;
+                        cargo_failures += 1;
                         let detail = if result.stderr_excerpt.is_empty() {
                             format!("cargo clean exited {}", result.exit_code)
                         } else {
@@ -668,6 +676,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 }
                 Err(err) => {
                     errors_count += 1;
+                    cleanup_failures += 1;
                     self.store.record_error(&ErrorRecord {
                         id: 0,
                         ts: self.clock.now(),
@@ -700,6 +709,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             skipped,
             bytes_recovered,
             errors: errors_count,
+            cargo_failures,
+            measurement_failures,
+            cleanup_failures,
             coverage_incomplete,
         };
         self.log_run_cycle(&result);
@@ -734,6 +746,18 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             Value::from(result.bytes_recovered),
         );
         fields.insert("errors".to_string(), Value::from(result.errors));
+        fields.insert(
+            "cargo_failures".to_string(),
+            Value::from(result.cargo_failures),
+        );
+        fields.insert(
+            "measurement_failures".to_string(),
+            Value::from(result.measurement_failures),
+        );
+        fields.insert(
+            "cleanup_failures".to_string(),
+            Value::from(result.cleanup_failures),
+        );
         fields.insert(
             "coverage_incomplete".to_string(),
             Value::from(result.coverage_incomplete),
