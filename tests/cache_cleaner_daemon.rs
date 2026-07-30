@@ -12,7 +12,7 @@ use car_go_clean::activity::{
     activity_signals_for_process, NoopProcessInspector, ProcessInspector,
 };
 use car_go_clean::cache::Cache;
-use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
+use car_go_clean::cleaner::{CleanAttemptOutcome, CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::config;
 use car_go_clean::daemon::{
     clamp_next_scan_at, Clock, Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions,
@@ -1213,6 +1213,7 @@ struct FakeRunner {
     replace_target_with_file_for: Option<PathBuf>,
     exit_code: i32,
     stderr: String,
+    failure: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1587,6 +1588,9 @@ impl CommandRunner for FakeRunner {
                 .map(|(key, value)| (to_string(key), value.map(to_string)))
                 .collect(),
         });
+        if let Some(message) = &self.failure {
+            anyhow::bail!("{message}");
+        }
         if self.delete_target {
             let _ = fs::remove_dir_all(dir.join("target"));
         }
@@ -3335,7 +3339,7 @@ fn observation_refresh_failure_after_cargo_preserves_audit_without_marking_clean
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
     let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].exit_code, 0);
+    assert_eq!(events[0].exit_code, Some(0));
     let persisted_project = store
         .all_projects()
         .unwrap()
@@ -3788,7 +3792,8 @@ fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
     assert_eq!(run.errors_count, 1);
     let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].exit_code, 7);
+    assert_eq!(events[0].exit_code, Some(7));
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::CargoNonzero);
     assert!(events[0].bytes_before > events[0].bytes_after);
     assert_eq!(
         store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
@@ -3800,6 +3805,78 @@ fn failed_cargo_clean_is_audited_without_success_or_recovery_accounting() {
             && error.message.contains("cargo clean exited 7")
             && error.message.contains("cargo metadata failed")
     }));
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
+}
+
+#[test]
+fn runner_failure_is_persisted_and_counted_once_without_success_accounting() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(store_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+
+    let runner = FakeRunner {
+        failure: Some("spawn cargo clean: injected runner failure".to_string()),
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.bytes_recovered, 0);
+    assert_eq!(result.errors, 1);
+    assert_eq!(result.cargo_failures, 0);
+    assert_eq!(result.measurement_failures, 0);
+    assert_eq!(result.cleanup_failures, 1);
+    let run = store.last_run().unwrap();
+    assert_eq!(run.projects_cleaned, 0);
+    assert_eq!(run.bytes_recovered, 0);
+    assert_eq!(run.errors_count, 1);
+
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::RunnerFailure);
+    assert_eq!(events[0].exit_code, None);
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("injected runner failure"));
     assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
 }
 
@@ -3875,7 +3952,11 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
         .iter()
         .find(|event| event.path == unmeasurable.to_string_lossy())
         .unwrap();
-    assert_eq!(unmeasurable_event.exit_code, 0);
+    assert_eq!(unmeasurable_event.exit_code, Some(0));
+    assert_eq!(
+        unmeasurable_event.outcome,
+        CleanAttemptOutcome::MeasurementFailure
+    );
     assert_eq!(
         unmeasurable_event.stderr_excerpt,
         "cargo completed with a warning"
@@ -3883,6 +3964,10 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
     assert_eq!(
         unmeasurable_event.bytes_after,
         unmeasurable_event.bytes_before
+    );
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
     );
 
     let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();

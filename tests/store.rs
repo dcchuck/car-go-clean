@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use car_go_clean::cleaner::CleanAttemptOutcome;
 use car_go_clean::identity::{BootSessionId, FilesystemIdentity, MountIdentity, ReviewedIdentity};
 use car_go_clean::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use car_go_clean::store::{
@@ -9,11 +10,27 @@ use car_go_clean::store::{
     ObservationReconciliation, OriginReconciliation, PlanLoadError, ScanPublication, Store,
     WorktreeReconciliation, REVIEW_PLAN_RETENTION, REVIEW_PLAN_TTL,
 };
-
 fn test_store(path: &Path) -> Store {
     let store = Store::open(path).unwrap();
     store.migrate().unwrap();
     store
+}
+
+fn sqlite_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let bytes = row.get::<_, Vec<u8>>(index)?;
+    Ok(u64::from_be_bytes(bytes.try_into().map_err(
+        |bytes: Vec<u8>| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Blob,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected 8 identity bytes, got {}", bytes.len()),
+                )
+                .into(),
+            )
+        },
+    )?))
 }
 
 #[test]
@@ -103,7 +120,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             INSERT INTO runs (
                 id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
             ) VALUES
-                (1, 100, 300, 2, 1500, 0),
+                (1, 100, 300, 2, 1500, 2),
                 (2, 400, 500, 4, 444, 5);
             ",
         )
@@ -163,14 +180,14 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
     };
     assert_eq!(
         runs,
-        vec![(1, 100, Some(300), 1, 900, 1), (2, 400, Some(500), 0, 0, 5),]
+        vec![(1, 100, Some(300), 1, 900, 3), (2, 400, Some(500), 0, 0, 5),]
     );
     let schema_version = inspection
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 13);
+    assert_eq!(schema_version, 14);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -395,8 +412,9 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
             bytes_before: 1024,
             bytes_after: 0,
             duration_ms: 10,
-            exit_code: 0,
+            exit_code: Some(0),
             stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::Success,
         })
         .unwrap();
     let review_summary = ReviewSummary {
@@ -1267,8 +1285,9 @@ fn records_runs_clean_events_errors_and_stats() {
             bytes_before: 1000,
             bytes_after: 100,
             duration_ms: 25,
-            exit_code: 0,
+            exit_code: Some(0),
             stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::Success,
         })
         .unwrap();
     store
@@ -1280,8 +1299,51 @@ fn records_runs_clean_events_errors_and_stats() {
             bytes_before: 500,
             bytes_after: 0,
             duration_ms: 10,
-            exit_code: 9,
+            exit_code: Some(9),
             stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::CargoNonzero,
+        })
+        .unwrap();
+    store
+        .record_clean_event(&CleanEvent {
+            id: 0,
+            run_id,
+            ts: t0 + Duration::from_secs(20),
+            path: "/a".to_string(),
+            bytes_before: 100,
+            bytes_after: 300,
+            duration_ms: 10,
+            exit_code: Some(0),
+            stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::Success,
+        })
+        .unwrap();
+    store
+        .record_clean_event(&CleanEvent {
+            id: 0,
+            run_id,
+            ts: t0 + Duration::from_secs(30),
+            path: "/runner".to_string(),
+            bytes_before: 500,
+            bytes_after: 500,
+            duration_ms: 10,
+            exit_code: None,
+            stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::RunnerFailure,
+        })
+        .unwrap();
+    store
+        .record_clean_event(&CleanEvent {
+            id: 0,
+            run_id,
+            ts: t0 + Duration::from_secs(40),
+            path: "/measurement".to_string(),
+            bytes_before: 500,
+            bytes_after: 0,
+            duration_ms: 10,
+            exit_code: Some(0),
+            stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::MeasurementFailure,
         })
         .unwrap();
     store
@@ -1318,7 +1380,7 @@ fn records_runs_clean_events_errors_and_stats() {
     assert_eq!(top[0].bytes, 900);
     assert_eq!(
         store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
-        1
+        3
     );
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
 }
@@ -1569,7 +1631,7 @@ fn records_scheduler_status_snapshot() {
 }
 
 fn create_legacy_database(path: &Path, version: i64) {
-    assert!(matches!(version, 1 | 4 | 7 | 8));
+    assert!((1..=8).contains(&version));
     let connection = rusqlite::Connection::open(path).unwrap();
     connection
         .execute_batch(
@@ -1743,8 +1805,47 @@ fn completed_origin(
 }
 
 #[test]
+fn observation_identities_round_trip_u64_max() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(90);
+    let generation = store
+        .reconcile_generation(
+            observed_at,
+            &GenerationReconciliation {
+                policy_hash: "policy-u64-observation".to_string(),
+                boot_session_id: Some("boot-u64".to_string()),
+                origins: vec![completed_origin(
+                    "/workspace",
+                    vec![observed_project(
+                        "/workspace/project",
+                        u64::MAX,
+                        u64::MAX - 1,
+                        Some((u64::MAX - 2, u64::MAX - 3)),
+                        observed_at,
+                    )],
+                )],
+            },
+        )
+        .unwrap();
+
+    let observations = store.authorized_observations(generation.id).unwrap();
+
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].project_identity.device, u64::MAX);
+    assert_eq!(observations[0].project_identity.inode, u64::MAX - 1);
+    assert_eq!(
+        observations[0].target_identity.as_ref().unwrap().device,
+        u64::MAX - 2
+    );
+    assert_eq!(
+        observations[0].target_identity.as_ref().unwrap().inode,
+        u64::MAX - 3
+    );
+}
+
+#[test]
 fn discovery_generation_migrations_preserve_history_without_granting_authority() {
-    for version in [1, 4, 7, 8] {
+    for version in 1..=8 {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join(format!("v{version}.db"));
         create_legacy_database(&database, version);
@@ -1774,7 +1875,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 13);
+        assert_eq!(schema_version, 14);
     }
 }
 
@@ -1788,6 +1889,38 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             "
             CREATE TABLE schema_version (version INTEGER NOT NULL);
             INSERT INTO schema_version(version) VALUES (9);
+            CREATE TABLE projects (
+                path TEXT PRIMARY KEY,
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_cleaned_at INTEGER
+            );
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                projects_cleaned INTEGER NOT NULL DEFAULT 0,
+                bytes_recovered INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE clean_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                ts INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                bytes_before INTEGER NOT NULL,
+                bytes_after INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER NOT NULL DEFAULT 0,
+                stderr_excerpt TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                path TEXT,
+                message TEXT NOT NULL
+            );
             CREATE TABLE scheduler_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 updated_at INTEGER NOT NULL,
@@ -1881,10 +2014,10 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             [],
             |row| {
                 Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, Option<u64>>(2)?,
-                    row.get::<_, Option<u64>>(3)?,
+                    sqlite_u64(row, 0)?,
+                    sqlite_u64(row, 1)?,
+                    Some(sqlite_u64(row, 2)?),
+                    Some(sqlite_u64(row, 3)?),
                     row.get::<_, bool>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
@@ -1909,7 +2042,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 13);
+    assert_eq!(schema_version, 14);
 }
 
 #[test]
@@ -1961,7 +2094,7 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
                 ALTER TABLE project_observations DROP COLUMN target_mount_id;
                 ALTER TABLE review_plan_targets DROP COLUMN project_mount_id;
                 ALTER TABLE review_plan_targets DROP COLUMN target_mount_id;
-                DELETE FROM schema_version WHERE version = 13;
+                DELETE FROM schema_version WHERE version >= 13;
                 ",
             )
             .unwrap();
@@ -1987,7 +2120,7 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        13
+        14
     );
     assert_eq!(
         inspection
@@ -2694,6 +2827,354 @@ fn review_plan_round_trips_order_and_complete_review_authority() {
 }
 
 #[test]
+fn review_plan_identities_round_trip_u64_max() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = test_store(&database);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(11_000);
+    let generation = review_generation(&store, now, "policy-u64-plan");
+    let review = persisted_review(
+        "/logical/max",
+        Some("/physical/max"),
+        ProjectClass::Workspace,
+        4_096,
+        Some((
+            u64::MAX,
+            u64::MAX - 1,
+            u64::MAX - 2,
+            u64::MAX - 3,
+            Some("boot-u64"),
+        )),
+        CleanDecision::Cleanable,
+    );
+
+    let created = store
+        .create_review_plan(
+            now,
+            "policy-u64-plan",
+            generation.id,
+            false,
+            4_096,
+            std::slice::from_ref(&review),
+        )
+        .unwrap();
+    let loaded = store
+        .load_review_plan(created.id, now, "policy-u64-plan", generation.id)
+        .unwrap();
+
+    assert_eq!(loaded.targets[0].review, review);
+    let inspection = rusqlite::Connection::open(database).unwrap();
+    let storage = inspection
+        .query_row(
+            "
+            SELECT
+                typeof(project_device), length(project_device),
+                typeof(project_inode), length(project_inode),
+                typeof(target_device), length(target_device),
+                typeof(target_inode), length(target_inode)
+            FROM review_plan_targets
+            WHERE plan_id = ?1
+            ",
+            [created.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        storage,
+        (
+            "blob".to_string(),
+            8,
+            "blob".to_string(),
+            8,
+            "blob".to_string(),
+            8,
+            "blob".to_string(),
+            8,
+        )
+    );
+}
+
+#[test]
+fn version_thirteen_signed_identities_migrate_losslessly_without_revoking_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let now = SystemTime::now();
+    let (generation, plan, review) = {
+        let store = test_store(&database);
+        let generation = store
+            .reconcile_generation(
+                now,
+                &GenerationReconciliation {
+                    policy_hash: "policy-v13".to_string(),
+                    boot_session_id: Some("boot-v13".to_string()),
+                    origins: vec![completed_origin(
+                        "/workspace",
+                        vec![observed_project(
+                            "/workspace/project",
+                            7,
+                            11,
+                            Some((7, 12)),
+                            now,
+                        )],
+                    )],
+                },
+            )
+            .unwrap();
+        let review = persisted_review(
+            "/workspace/project",
+            Some("/workspace/project"),
+            ProjectClass::Workspace,
+            100,
+            Some((7, 11, 7, 12, Some("boot-v13"))),
+            CleanDecision::Cleanable,
+        );
+        let plan = store
+            .create_review_plan(
+                now,
+                "policy-v13",
+                generation.id,
+                false,
+                100,
+                std::slice::from_ref(&review),
+            )
+            .unwrap();
+        (generation, plan, review)
+    };
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                PRAGMA ignore_check_constraints = ON;
+                UPDATE project_observations
+                SET project_device = 7,
+                    project_inode = 11,
+                    target_device = 7,
+                    target_inode = 12;
+                UPDATE review_plan_targets
+                SET project_device = 7,
+                    project_inode = 11,
+                    target_device = 7,
+                    target_inode = 12;
+                PRAGMA ignore_check_constraints = OFF;
+                DELETE FROM schema_version WHERE version >= 14;
+                ",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+
+    let current = store.current_generation("policy-v13").unwrap().unwrap();
+    assert_eq!(current.id, generation.id);
+    assert_eq!(current.policy_hash, generation.policy_hash);
+    assert_eq!(current.boot_session_id, generation.boot_session_id);
+    let observations = store.authorized_observations(generation.id).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].project_identity.device, 7);
+    assert_eq!(observations[0].project_identity.inode, 11);
+    assert_eq!(observations[0].target_identity.as_ref().unwrap().device, 7);
+    assert_eq!(observations[0].target_identity.as_ref().unwrap().inode, 12);
+    let loaded = store
+        .load_review_plan(plan.id, now, "policy-v13", generation.id)
+        .unwrap();
+    assert_eq!(loaded.targets[0].review, review);
+
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        14
+    );
+    for table in ["project_observations", "review_plan_targets"] {
+        let storage = inspection
+            .query_row(
+                &format!(
+                    "
+                    SELECT
+                        typeof(project_device), length(project_device),
+                        typeof(project_inode), length(project_inode),
+                        typeof(target_device), length(target_device),
+                        typeof(target_inode), length(target_inode)
+                    FROM {table}
+                    LIMIT 1
+                    "
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            storage,
+            (
+                "blob".to_string(),
+                8,
+                "blob".to_string(),
+                8,
+                "blob".to_string(),
+                8,
+                "blob".to_string(),
+                8,
+            ),
+            "{table}"
+        );
+    }
+}
+
+#[test]
+fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+    {
+        let store = test_store(&database);
+        let run_id = store.start_run(started_at).unwrap();
+        for (offset, path, exit_code, outcome) in [
+            (1, "/success", Some(0), CleanAttemptOutcome::Success),
+            (
+                2,
+                "/cargo-nonzero",
+                Some(7),
+                CleanAttemptOutcome::CargoNonzero,
+            ),
+            (
+                3,
+                "/measurement",
+                Some(0),
+                CleanAttemptOutcome::MeasurementFailure,
+            ),
+        ] {
+            store
+                .record_clean_event(&CleanEvent {
+                    id: 0,
+                    run_id,
+                    ts: started_at + Duration::from_secs(offset),
+                    path: path.to_string(),
+                    bytes_before: 1_000,
+                    bytes_after: 100,
+                    duration_ms: 5,
+                    exit_code,
+                    stderr_excerpt: String::new(),
+                    outcome,
+                })
+                .unwrap();
+        }
+        store
+            .record_error(&ErrorRecord {
+                id: 0,
+                ts: started_at + Duration::from_secs(3),
+                category: "clean".to_string(),
+                path: Some("/measurement".to_string()),
+                message: "measure target after cargo clean: injected read failure".to_string(),
+            })
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE clean_events_v13 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    ts INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    bytes_before INTEGER NOT NULL,
+                    bytes_after INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    exit_code INTEGER NOT NULL DEFAULT 0,
+                    stderr_excerpt TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO clean_events_v13 (
+                    id,
+                    run_id,
+                    ts,
+                    path,
+                    bytes_before,
+                    bytes_after,
+                    duration_ms,
+                    exit_code,
+                    stderr_excerpt
+                )
+                SELECT
+                    id,
+                    run_id,
+                    ts,
+                    path,
+                    bytes_before,
+                    bytes_after,
+                    duration_ms,
+                    exit_code,
+                    stderr_excerpt
+                FROM clean_events;
+                DROP TABLE clean_events;
+                ALTER TABLE clean_events_v13 RENAME TO clean_events;
+                CREATE INDEX idx_clean_events_ts ON clean_events(ts);
+                DELETE FROM schema_version WHERE version >= 14;
+                ",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.outcome).collect::<Vec<_>>(),
+        vec![
+            CleanAttemptOutcome::Success,
+            CleanAttemptOutcome::CargoNonzero,
+            CleanAttemptOutcome::MeasurementFailure,
+        ]
+    );
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        2
+    );
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        900
+    );
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        14
+    );
+}
+
+#[test]
 fn review_plan_load_reports_each_authority_failure_without_fallback() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
@@ -3056,80 +3537,93 @@ fn review_plan_load_rejects_an_older_generation_when_the_newest_is_invalid() {
 }
 
 #[test]
-fn version_eleven_migration_adds_review_plans_without_changing_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("state.db");
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(37_000);
-    {
-        let store = test_store(&database);
-        store.upsert_project("/history/project", now).unwrap();
-        let run_id = store.start_run(now).unwrap();
-        store
-            .record_clean_event(&CleanEvent {
-                id: 0,
-                run_id,
-                ts: now,
-                path: "/history/project".to_string(),
-                bytes_before: 900,
-                bytes_after: 100,
-                duration_ms: 3,
-                exit_code: 0,
-                stderr_excerpt: String::new(),
-            })
-            .unwrap();
-        store
-            .record_error(&ErrorRecord {
-                id: 0,
-                ts: now,
-                category: "scan".to_string(),
-                path: Some("/history/project".to_string()),
-                message: "historical warning".to_string(),
-            })
-            .unwrap();
-        store.finish_run(run_id, now, 1, 800, 1).unwrap();
-    }
-    {
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "
-                DROP INDEX idx_discovery_generations_single_valid;
-                ALTER TABLE project_observations DROP COLUMN project_mount_id;
-                ALTER TABLE project_observations DROP COLUMN target_mount_id;
-                DROP TABLE review_plan_targets;
-                DROP TABLE review_plans;
-                DELETE FROM schema_version WHERE version >= 12;
-                ",
-            )
-            .unwrap();
-        assert_eq!(
+fn versions_ten_and_eleven_add_review_plans_without_changing_history() {
+    for version in 10..=11 {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!("v{version}.db"));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(37_000);
+        {
+            let store = test_store(&database);
+            store.upsert_project("/history/project", now).unwrap();
+            let run_id = store.start_run(now).unwrap();
+            store
+                .record_clean_event(&CleanEvent {
+                    id: 0,
+                    run_id,
+                    ts: now,
+                    path: "/history/project".to_string(),
+                    bytes_before: 900,
+                    bytes_after: 100,
+                    duration_ms: 3,
+                    exit_code: Some(0),
+                    stderr_excerpt: String::new(),
+                    outcome: CleanAttemptOutcome::Success,
+                })
+                .unwrap();
+            store
+                .record_error(&ErrorRecord {
+                    id: 0,
+                    ts: now,
+                    category: "scan".to_string(),
+                    path: Some("/history/project".to_string()),
+                    message: "historical warning".to_string(),
+                })
+                .unwrap();
+            store.finish_run(run_id, now, 1, 800, 1).unwrap();
+        }
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
             connection
+                .execute_batch(&format!(
+                    "
+                    DROP INDEX idx_discovery_generations_single_valid;
+                    ALTER TABLE project_observations DROP COLUMN project_mount_id;
+                    ALTER TABLE project_observations DROP COLUMN target_mount_id;
+                    DROP TABLE review_plan_targets;
+                    DROP TABLE review_plans;
+                    DELETE FROM schema_version WHERE version > {version};
+                    "
+                ))
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                version
+            );
+        }
+
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+        assert!(store.table_exists("review_plans").unwrap());
+        assert!(store.table_exists("review_plan_targets").unwrap());
+        assert_eq!(store.all_projects().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .clean_events_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+        assert_eq!(store.last_run().unwrap().bytes_recovered, 800);
+        assert_eq!(
+            store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+            800
+        );
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            inspection
                 .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            11
+            14
         );
     }
-
-    let store = Store::open(&database).unwrap();
-    store.migrate().unwrap();
-    assert!(store.table_exists("review_plans").unwrap());
-    assert!(store.table_exists("review_plan_targets").unwrap());
-    assert_eq!(store.all_projects().unwrap().len(), 1);
-    assert_eq!(
-        store
-            .clean_events_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
-    assert_eq!(store.last_run().unwrap().bytes_recovered, 800);
-    assert_eq!(
-        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
-        800
-    );
 }
 
 #[test]
@@ -3153,8 +3647,9 @@ fn review_plan_pruning_preserves_run_clean_project_error_and_recovery_history() 
             bytes_before: 500,
             bytes_after: 200,
             duration_ms: 5,
-            exit_code: 0,
+            exit_code: Some(0),
             stderr_excerpt: String::new(),
+            outcome: CleanAttemptOutcome::Success,
         })
         .unwrap();
     store

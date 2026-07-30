@@ -1,8 +1,38 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use car_go_clean::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning};
+use car_go_clean::config::{
+    default_path, load, load_default, paths, prepare_migration, Config, ConfigWarning,
+};
+
+struct EnvironmentGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvironmentGuard {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+fn environment_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 #[test]
 fn default_config_scans_home_and_has_intervals() {
@@ -68,9 +98,82 @@ fn default_config_scans_home_and_has_intervals() {
 }
 
 #[test]
-fn load_missing_file_returns_defaults() {
-    let cfg = load("/definitely/not/here/car-go-clean.toml").expect("missing config should load");
+fn load_missing_implicit_default_returns_defaults() {
+    let cfg =
+        load_default("/definitely/not/here/car-go-clean.toml").expect("missing default config");
     assert_eq!(cfg.clean_interval, Duration::from_secs(24 * 60 * 60));
+}
+
+#[test]
+fn load_missing_explicit_file_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.toml");
+
+    let error = format!("{:#}", load(&path).unwrap_err());
+
+    assert!(
+        error.contains(&format!("read {}", path.display())),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_dangling_explicit_symlink_is_an_error() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    symlink(dir.path().join("missing-target.toml"), &path).unwrap();
+
+    let error = format!("{:#}", load(&path).unwrap_err());
+
+    assert!(
+        error.contains(&format!("read {}", path.display())),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_dangling_implicit_default_is_not_treated_as_absent() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    symlink(dir.path().join("missing-target.toml"), &path).unwrap();
+
+    let error = format!("{:#}", load_default(&path).unwrap_err());
+
+    assert!(
+        error.contains(&format!("read {}", path.display())),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_inaccessible_explicit_path_is_an_error_when_permissions_are_enforced() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("private");
+    let path = parent.join("config.toml");
+    fs::create_dir(&parent).unwrap();
+    fs::write(&path, "scan_dirs = [\"/tmp\"]\n").unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = load(&path);
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains(&format!("read {}", path.display())),
+        "{error}"
+    );
 }
 
 #[test]
@@ -362,18 +465,45 @@ target_quiet_period = "45m"
 
 #[test]
 fn default_and_state_paths_follow_xdg() {
+    let _lock = environment_lock();
     let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
-    std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+    let _config = EnvironmentGuard::set("XDG_CONFIG_HOME", dir.path().join("config"));
+    let _state = EnvironmentGuard::set("XDG_STATE_HOME", dir.path().join("state"));
 
     assert_eq!(
-        default_path(),
+        default_path().unwrap(),
         dir.path().join("config/car-go-clean/config.toml")
     );
 
-    let p = paths();
+    let p = paths().unwrap();
     assert_eq!(p.state_dir, dir.path().join("state/car-go-clean"));
     assert_eq!(p.db_path, p.state_dir.join("state.db"));
     assert_eq!(p.log_path, p.state_dir.join("car-go-clean.log"));
     assert_eq!(p.lock_path, p.state_dir.join("daemon.lock"));
+}
+
+#[test]
+fn xdg_config_home_rejects_empty_and_relative_roots() {
+    let _lock = environment_lock();
+    for value in ["", "relative/config"] {
+        let _config = EnvironmentGuard::set("XDG_CONFIG_HOME", value);
+
+        let error = format!("{:#}", default_path().unwrap_err());
+
+        assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
+        assert!(error.contains("nonempty absolute path"), "{error}");
+    }
+}
+
+#[test]
+fn xdg_state_home_rejects_empty_and_relative_roots() {
+    let _lock = environment_lock();
+    for value in ["", "relative/state"] {
+        let _state = EnvironmentGuard::set("XDG_STATE_HOME", value);
+
+        let error = format!("{:#}", paths().unwrap_err());
+
+        assert!(error.contains("XDG_STATE_HOME"), "{error}");
+        assert!(error.contains("nonempty absolute path"), "{error}");
+    }
 }

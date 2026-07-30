@@ -1040,6 +1040,82 @@ fn config_command_keeps_warning_off_round_trippable_stdout() {
         .stdout(predicate::str::contains("scan_dirs"));
 }
 
+#[test]
+fn config_command_allows_only_an_absent_implicit_default() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_config = work.path().join("config-root");
+    fs::create_dir_all(&home).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("config")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .assert()
+        .success()
+        .stdout(contains("scan_dirs"));
+
+    let explicit = work.path().join("missing.toml");
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "--config"])
+        .arg(&explicit)
+        .env("HOME", &home)
+        .assert()
+        .code(1)
+        .stderr(contains(format!("read {}", explicit.display())));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_command_rejects_a_dangling_explicit_path() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempfile::tempdir().unwrap();
+    let explicit = work.path().join("config.toml");
+    symlink(work.path().join("missing-target.toml"), &explicit).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "--config"])
+        .arg(&explicit)
+        .env("HOME", work.path().join("home"))
+        .assert()
+        .code(1)
+        .stderr(contains(format!("read {}", explicit.display())));
+}
+
+#[test]
+fn commands_reject_empty_or_relative_xdg_roots() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    for value in ["", "relative/config"] {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("config")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", value)
+            .assert()
+            .code(1)
+            .stderr(contains("XDG_CONFIG_HOME"))
+            .stderr(contains("nonempty absolute path"));
+    }
+    for value in ["", "relative/state"] {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("stats")
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", value)
+            .assert()
+            .code(1)
+            .stderr(contains("XDG_STATE_HOME"))
+            .stderr(contains("nonempty absolute path"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn config_migrate_renames_legacy_excludes_idempotently() {
@@ -2042,7 +2118,7 @@ fn cargo_failure_is_audited_without_recovery_accounting() {
     );
     let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].exit_code, 7);
+    assert_eq!(events[0].exit_code, Some(7));
     assert!(events[0].bytes_before > events[0].bytes_after);
     assert_eq!(events[0].stderr_excerpt, "cargo failed: λ\n");
     let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
@@ -2140,7 +2216,7 @@ fn post_cargo_measurement_failure_exits_one_without_losing_the_audit_event() {
     assert_eq!(run.errors_count, 1);
     let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].exit_code, 0);
+    assert_eq!(events[0].exit_code, Some(0));
     assert_eq!(events[0].stderr_excerpt, "cargo warning\n");
     assert_eq!(events[0].bytes_after, events[0].bytes_before);
     let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();

@@ -170,46 +170,57 @@ impl ConfigMigration {
     }
 }
 
-pub fn default_path() -> PathBuf {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg).join("car-go-clean/config.toml");
-    }
-    current_home_dir().join(".config/car-go-clean/config.toml")
+pub fn default_path() -> Result<PathBuf> {
+    Ok(environment_root("XDG_CONFIG_HOME", &current_home_dir())?.join("car-go-clean/config.toml"))
 }
 
-pub fn paths() -> PathSet {
-    let state_dir = if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(xdg).join("car-go-clean")
-    } else {
-        current_home_dir().join(".local/state/car-go-clean")
-    };
-    PathSet {
+pub fn paths() -> Result<PathSet> {
+    let state_dir = environment_root("XDG_STATE_HOME", &current_home_dir())?.join("car-go-clean");
+    Ok(PathSet {
         db_path: state_dir.join("state.db"),
         log_path: state_dir.join("car-go-clean.log"),
         lock_path: state_dir.join("daemon.lock"),
         state_dir,
-    }
+    })
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
-    if !path.exists() {
+    let body = read_required(path)?;
+    parse_config(path, &body)
+}
+
+pub fn load_default(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let Some(body) = read_optional_default(path)? else {
         let cfg = Config::default();
         cfg.validate()?;
         return Ok(cfg);
-    }
-    let body = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    };
+    parse_config(path, &body)
+}
+
+fn parse_config(path: &Path, body: &str) -> Result<Config> {
     let raw: RawConfig =
-        toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+        toml::from_str(body).with_context(|| format!("parse {}", path.display()))?;
     apply_overlay(raw).with_context(|| format!("validate {}", path.display()))
 }
 
 pub fn prepare_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigration>> {
     let path = path.as_ref();
-    if !path.exists() {
+    let before = read_required(path)?;
+    prepare_migration_from_contents(path, before)
+}
+
+pub fn prepare_default_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigration>> {
+    let path = path.as_ref();
+    let Some(before) = read_optional_default(path)? else {
         return Ok(None);
-    }
-    let before = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    };
+    prepare_migration_from_contents(path, before)
+}
+
+fn prepare_migration_from_contents(path: &Path, before: String) -> Result<Option<ConfigMigration>> {
     let raw: RawConfig =
         toml::from_str(&before).with_context(|| format!("parse {}", path.display()))?;
     if raw.excludes.is_some() && raw.override_excludes.is_some() {
@@ -245,6 +256,36 @@ pub fn prepare_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigratio
         before,
         after,
     }))
+}
+
+fn read_required(path: &Path) -> Result<String> {
+    fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
+
+fn read_optional_default(path: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_required(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn environment_root(variable: &str, home: &Path) -> Result<PathBuf> {
+    let root = match env::var_os(variable) {
+        Some(value) => PathBuf::from(value),
+        None => match variable {
+            "XDG_CONFIG_HOME" => home.join(".config"),
+            "XDG_STATE_HOME" => home.join(".local/state"),
+            _ => unreachable!("unsupported XDG root"),
+        },
+    };
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(anyhow!(
+            "{variable} must be a nonempty absolute path; got {}",
+            root.display()
+        ));
+    }
+    Ok(root)
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {

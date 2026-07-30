@@ -1,7 +1,10 @@
 use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
-use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
+use crate::config::{
+    default_path, load, load_default, paths, prepare_default_migration, prepare_migration, Config,
+    ConfigWarning, PathSet,
+};
 use crate::daemon::{Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions, RunSource};
 use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
@@ -456,8 +459,18 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
                 Ok(CommandOutcome::Complete)
             }
             Some(ConfigCommands::Migrate) => {
-                let path = config.unwrap_or_else(default_path);
-                match prepare_migration(&path)? {
+                let (path, migration) = match config {
+                    Some(path) => {
+                        let migration = prepare_migration(&path)?;
+                        (path, migration)
+                    }
+                    None => {
+                        let path = default_path()?;
+                        let migration = prepare_default_migration(&path)?;
+                        (path, migration)
+                    }
+                };
+                match migration {
                     Some(migration) => {
                         print!("{}", migration.unified_diff());
                         migration.apply()?;
@@ -1294,7 +1307,7 @@ fn scan(
     state_dir: Option<PathBuf>,
     json: bool,
 ) -> Result<CommandOutcome> {
-    let path_set = paths_for(state_dir.as_deref());
+    let path_set = paths_for(state_dir.as_deref())?;
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
     let (cfg, config_source) = load_config_with_source(config_path)?;
@@ -1433,7 +1446,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
         review,
         json,
     } = options;
-    let path_set = paths_for(state_dir.as_deref());
+    let path_set = paths_for(state_dir.as_deref())?;
     let _lock = lockfile::try_acquire(&path_set.lock_path)
         .context("another car-go-clean process is running")?;
     let (cfg, config_source) = load_config_with_source(config_path)?;
@@ -2095,8 +2108,9 @@ fn class_label(class: ProjectClass) -> &'static str {
 }
 
 fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
-    let path_set = paths_for(state_dir.as_deref());
+    let path_set = paths_for(state_dir.as_deref())?;
     let _lock = lockfile::try_acquire(&path_set.lock_path).context("daemon already running")?;
+    let config_is_implicit_default = config_path.is_none();
     let (cfg, config_source) = load_config_with_source(config_path)?;
     let policy = build_policy(&cfg, &config_source)?;
     let logger = Logger::new(&path_set.log_path)?;
@@ -2105,17 +2119,25 @@ fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()
     let store = open_store_at(&path_set)?;
     let daemon = daemon_for_clean(&store, &cfg, cargo, &policy)
         .with_logger(logger)
-        .with_cycle_factory(Arc::new(ConfigCycleFactory { config_source }));
+        .with_cycle_factory(Arc::new(ConfigCycleFactory {
+            config_source,
+            config_is_implicit_default,
+        }));
     daemon.run_forever()
 }
 
 struct ConfigCycleFactory {
     config_source: PathBuf,
+    config_is_implicit_default: bool,
 }
 
 impl DaemonCycleFactory for ConfigCycleFactory {
     fn snapshot(&self) -> Result<DaemonCycleSnapshot> {
-        let cfg = load(&self.config_source)?;
+        let cfg = if self.config_is_implicit_default {
+            load_default(&self.config_source)?
+        } else {
+            load(&self.config_source)?
+        };
         cfg.validate()?;
         let policy = build_policy(&cfg, &self.config_source)?;
         Ok(DaemonCycleSnapshot::new(
@@ -2189,7 +2211,7 @@ fn logs(
     tail: usize,
     json: bool,
 ) -> Result<CommandOutcome> {
-    let path_set = paths_for(state_dir.as_deref());
+    let path_set = paths_for(state_dir.as_deref())?;
     let status = CommandStatus::complete();
     if errors_only {
         let store = open_store_at(&path_set)?;
@@ -2241,8 +2263,13 @@ fn load_config(config_path: Option<PathBuf>) -> Result<Config> {
 }
 
 fn load_config_with_source(config_path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
-    let path = config_path.unwrap_or_else(default_path);
-    let cfg = load(&path)?;
+    let (cfg, path) = match config_path {
+        Some(path) => (load(&path)?, path),
+        None => {
+            let path = default_path()?;
+            (load_default(&path)?, path)
+        }
+    };
     cfg.validate()?;
     if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
         eprintln!(
@@ -2257,7 +2284,7 @@ fn build_policy(cfg: &Config, config_source: &Path) -> Result<ScopePolicy> {
 }
 
 fn open_store(state_dir: Option<&Path>) -> Result<Store> {
-    open_store_at(&paths_for(state_dir))
+    open_store_at(&paths_for(state_dir)?)
 }
 
 fn open_store_at(path_set: &PathSet) -> Result<Store> {
@@ -2266,15 +2293,22 @@ fn open_store_at(path_set: &PathSet) -> Result<Store> {
     Ok(store)
 }
 
-fn paths_for(state_dir: Option<&Path>) -> PathSet {
-    let mut path_set = paths();
+fn paths_for(state_dir: Option<&Path>) -> Result<PathSet> {
     if let Some(state_dir) = state_dir {
-        path_set.state_dir = state_dir.to_path_buf();
-        path_set.db_path = state_dir.join("state.db");
-        path_set.log_path = state_dir.join("car-go-clean.log");
-        path_set.lock_path = state_dir.join("daemon.lock");
+        if state_dir.as_os_str().is_empty() || !state_dir.is_absolute() {
+            return Err(anyhow!(
+                "--state-dir must be a nonempty absolute path; got {}",
+                state_dir.display()
+            ));
+        }
+        return Ok(PathSet {
+            state_dir: state_dir.to_path_buf(),
+            db_path: state_dir.join("state.db"),
+            log_path: state_dir.join("car-go-clean.log"),
+            lock_path: state_dir.join("daemon.lock"),
+        });
     }
-    path_set
+    paths()
 }
 
 fn daemon_for_scan<'a>(

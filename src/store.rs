@@ -1,3 +1,4 @@
+use crate::cleaner::CleanAttemptOutcome;
 use crate::identity::{FilesystemIdentity, MountIdentity, ReviewedIdentity};
 use crate::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use anyhow::{bail, Context, Result};
@@ -44,8 +45,9 @@ pub struct CleanEvent {
     pub bytes_before: i64,
     pub bytes_after: i64,
     pub duration_ms: i64,
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
     pub stderr_excerpt: String,
+    pub outcome: CleanAttemptOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,14 +510,11 @@ impl Store {
                         WHERE run_id = runs.id
                           AND exit_code = 0
                     ), 0),
-                    errors_count = MAX(
-                        errors_count,
-                        (
-                            SELECT COUNT(*)
-                            FROM clean_events
-                            WHERE run_id = runs.id
-                              AND exit_code <> 0
-                        )
+                    errors_count = errors_count + (
+                        SELECT COUNT(*)
+                        FROM clean_events
+                        WHERE run_id = runs.id
+                          AND exit_code <> 0
                     );
 
                 UPDATE projects
@@ -843,6 +842,12 @@ impl Store {
             if current < 13 {
                 tx.execute("INSERT INTO schema_version(version) VALUES (13)", [])?;
             }
+            tx.commit()?;
+        }
+        if current < 14 {
+            let tx = self.conn.unchecked_transaction()?;
+            migrate_lossless_identities_and_attempt_outcomes(&tx)?;
+            tx.execute("INSERT INTO schema_version(version) VALUES (14)", [])?;
             tx.commit()?;
         }
         self.prune_review_plans(SystemTime::now(), None)?;
@@ -1644,11 +1649,11 @@ impl Store {
               )
             ",
             params![
-                identity.project.device,
-                identity.project.inode,
+                encode_u64_identity(identity.project.device),
+                encode_u64_identity(identity.project.inode),
                 identity.project.mount.0.as_str(),
-                identity.target.device,
-                identity.target.inode,
+                encode_u64_identity(identity.target.device),
+                encode_u64_identity(identity.target.inode),
                 identity.target.mount.0.as_str(),
                 identity
                     .boot_session
@@ -1717,8 +1722,18 @@ impl Store {
         self.conn.execute(
             "
             INSERT INTO clean_events
-                (run_id, ts, path, bytes_before, bytes_after, duration_ms, exit_code, stderr_excerpt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (
+                    run_id,
+                    ts,
+                    path,
+                    bytes_before,
+                    bytes_after,
+                    duration_ms,
+                    exit_code,
+                    stderr_excerpt,
+                    attempt_outcome
+                )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ",
             params![
                 event.run_id,
@@ -1728,7 +1743,8 @@ impl Store {
                 event.bytes_after,
                 event.duration_ms,
                 event.exit_code,
-                event.stderr_excerpt
+                event.stderr_excerpt,
+                event.outcome.as_str(),
             ],
         )?;
         Ok(())
@@ -1737,11 +1753,31 @@ impl Store {
     pub fn clean_events_since(&self, since: SystemTime) -> Result<Vec<CleanEvent>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT id, run_id, ts, path, bytes_before, bytes_after, duration_ms, exit_code, stderr_excerpt
+            SELECT
+                id,
+                run_id,
+                ts,
+                path,
+                bytes_before,
+                bytes_after,
+                duration_ms,
+                exit_code,
+                stderr_excerpt,
+                attempt_outcome
             FROM clean_events WHERE ts >= ?1 ORDER BY ts
             ",
         )?;
         let rows = stmt.query_map([to_epoch(since)?], |row| {
+            let label = row.get::<_, String>(9)?;
+            let outcome = parse_clean_attempt_outcome(&label).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    invalid_data_error(format!(
+                        "unknown persisted clean attempt outcome {label:?}"
+                    )),
+                )
+            })?;
             Ok(CleanEvent {
                 id: row.get(0)?,
                 run_id: row.get(1)?,
@@ -1752,6 +1788,7 @@ impl Store {
                 duration_ms: row.get(6)?,
                 exit_code: row.get(7)?,
                 stderr_excerpt: row.get(8)?,
+                outcome,
             })
         })?;
         collect_rows(rows)
@@ -1848,8 +1885,9 @@ impl Store {
     pub fn total_bytes_recovered(&self, since: SystemTime) -> Result<i64> {
         let total = self.conn.query_row(
             "
-            SELECT COALESCE(SUM(bytes_before - bytes_after), 0)
-            FROM clean_events WHERE ts >= ?1 AND exit_code = 0
+            SELECT COALESCE(SUM(MAX(bytes_before - bytes_after, 0)), 0)
+            FROM clean_events
+            WHERE ts >= ?1 AND attempt_outcome = 'success'
             ",
             [to_epoch(since)?],
             |row| row.get(0),
@@ -1860,9 +1898,9 @@ impl Store {
     pub fn top_projects_by_bytes(&self, since: SystemTime, n: usize) -> Result<Vec<ProjectBytes>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT path, SUM(bytes_before - bytes_after) AS recovered
+            SELECT path, SUM(MAX(bytes_before - bytes_after, 0)) AS recovered
             FROM clean_events
-            WHERE ts >= ?1 AND exit_code = 0
+            WHERE ts >= ?1 AND attempt_outcome = 'success'
             GROUP BY path
             ORDER BY recovered DESC
             LIMIT ?2
@@ -1880,7 +1918,11 @@ impl Store {
     pub fn failed_clean_attempts(&self, since: SystemTime) -> Result<i64> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM clean_events WHERE ts >= ?1 AND exit_code <> 0",
+                "
+                SELECT COUNT(*)
+                FROM clean_events
+                WHERE ts >= ?1 AND attempt_outcome <> 'success'
+                ",
                 [to_epoch(since)?],
                 |row| row.get(0),
             )
@@ -2342,17 +2384,17 @@ fn reconcile_generation_in_transaction(
                     generation_id,
                     origin_id,
                     project_path,
-                    observation.project_identity.device,
-                    observation.project_identity.inode,
+                    encode_u64_identity(observation.project_identity.device),
+                    encode_u64_identity(observation.project_identity.inode),
                     observation.project_identity.mount.0.as_str(),
                     observation
                         .target_identity
                         .as_ref()
-                        .map(|identity| identity.device),
+                        .map(|identity| encode_u64_identity(identity.device)),
                     observation
                         .target_identity
                         .as_ref()
-                        .map(|identity| identity.inode),
+                        .map(|identity| encode_u64_identity(identity.inode)),
                     observation
                         .target_identity
                         .as_ref()
@@ -2381,6 +2423,579 @@ fn reconcile_generation_in_transaction(
         policy_hash: reconciliation.policy_hash.clone(),
         boot_session_id: reconciliation.boot_session_id.clone(),
     })
+}
+
+#[derive(Debug)]
+struct LegacyProjectObservation {
+    generation_id: i64,
+    origin_id: i64,
+    project_path: String,
+    project_device: u64,
+    project_inode: u64,
+    project_mount_id: Option<String>,
+    target_device: Option<u64>,
+    target_inode: Option<u64>,
+    target_mount_id: Option<String>,
+    observed_at: i64,
+    authorized: bool,
+    blocked_reason: Option<String>,
+    boot_session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct LegacyReviewPlanTarget {
+    plan_id: i64,
+    ordinal: i64,
+    project_path: String,
+    canonical_project_path: Option<String>,
+    project_class: String,
+    target_path: String,
+    project_device: Option<u64>,
+    project_inode: Option<u64>,
+    project_mount_id: Option<String>,
+    target_device: Option<u64>,
+    target_inode: Option<u64>,
+    target_mount_id: Option<String>,
+    review_boot_session_id: Option<String>,
+    reviewed_bytes: i64,
+    decision: String,
+    skip_reason: Option<String>,
+    skip_newest_age_secs: Option<i64>,
+}
+
+#[derive(Debug)]
+struct LegacyCleanEvent {
+    id: i64,
+    run_id: i64,
+    ts: i64,
+    path: String,
+    bytes_before: i64,
+    bytes_after: i64,
+    duration_ms: i64,
+    exit_code: Option<i32>,
+    stderr_excerpt: String,
+    outcome: CleanAttemptOutcome,
+}
+
+fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Result<()> {
+    let project_observations = {
+        let mut statement = tx.prepare(
+            "
+            SELECT
+                generation_id,
+                origin_id,
+                project_path,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                observed_at,
+                authorized,
+                blocked_reason,
+                boot_session_id
+            FROM project_observations
+            ORDER BY generation_id, origin_id, project_path
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyProjectObservation {
+                generation_id: row.get(0)?,
+                origin_id: row.get(1)?,
+                project_path: row.get(2)?,
+                project_device: required_u64_identity(row, 3, "project_device")?,
+                project_inode: required_u64_identity(row, 4, "project_inode")?,
+                project_mount_id: row.get(5)?,
+                target_device: optional_u64_identity(row, 6, "target_device")?,
+                target_inode: optional_u64_identity(row, 7, "target_inode")?,
+                target_mount_id: row.get(8)?,
+                observed_at: row.get(9)?,
+                authorized: row.get(10)?,
+                blocked_reason: row.get(11)?,
+                boot_session_id: row.get(12)?,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+
+    let review_plan_targets = {
+        let mut statement = tx.prepare(
+            "
+            SELECT
+                plan_id,
+                ordinal,
+                project_path,
+                canonical_project_path,
+                project_class,
+                target_path,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                review_boot_session_id,
+                reviewed_bytes,
+                decision,
+                skip_reason,
+                skip_newest_age_secs
+            FROM review_plan_targets
+            ORDER BY plan_id, ordinal
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyReviewPlanTarget {
+                plan_id: row.get(0)?,
+                ordinal: row.get(1)?,
+                project_path: row.get(2)?,
+                canonical_project_path: row.get(3)?,
+                project_class: row.get(4)?,
+                target_path: row.get(5)?,
+                project_device: optional_u64_identity(row, 6, "project_device")?,
+                project_inode: optional_u64_identity(row, 7, "project_inode")?,
+                project_mount_id: row.get(8)?,
+                target_device: optional_u64_identity(row, 9, "target_device")?,
+                target_inode: optional_u64_identity(row, 10, "target_inode")?,
+                target_mount_id: row.get(11)?,
+                review_boot_session_id: row.get(12)?,
+                reviewed_bytes: row.get(13)?,
+                decision: row.get(14)?,
+                skip_reason: row.get(15)?,
+                skip_newest_age_secs: row.get(16)?,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+
+    let clean_events_have_outcome =
+        transaction_column_exists(tx, "clean_events", "attempt_outcome")?;
+    let clean_events = {
+        let outcome_expression = if clean_events_have_outcome {
+            "attempt_outcome"
+        } else {
+            "
+            CASE
+                WHEN EXISTS(
+                    SELECT 1
+                    FROM errors
+                    WHERE errors.ts = clean_events.ts
+                      AND errors.category = 'clean'
+                      AND errors.path = clean_events.path
+                      AND errors.message LIKE
+                          'measure target after cargo clean:%'
+                ) THEN 'measurement_failure'
+                WHEN exit_code = 0 THEN 'success'
+                ELSE 'cargo_nonzero'
+            END
+            "
+        };
+        let sql = format!(
+            "
+            SELECT
+                id,
+                run_id,
+                ts,
+                path,
+                bytes_before,
+                bytes_after,
+                duration_ms,
+                exit_code,
+                stderr_excerpt,
+                {outcome_expression}
+            FROM clean_events
+            ORDER BY id
+            "
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            let label = row.get::<_, String>(9)?;
+            let outcome = parse_clean_attempt_outcome(&label).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    invalid_data_error(format!(
+                        "unknown persisted clean attempt outcome {label:?}"
+                    )),
+                )
+            })?;
+            Ok(LegacyCleanEvent {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                ts: row.get(2)?,
+                path: row.get(3)?,
+                bytes_before: row.get(4)?,
+                bytes_after: row.get(5)?,
+                duration_ms: row.get(6)?,
+                exit_code: row.get(7)?,
+                stderr_excerpt: row.get(8)?,
+                outcome,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+
+    tx.execute_batch(
+        "
+        CREATE TABLE project_observations_v14 (
+            generation_id INTEGER NOT NULL
+                REFERENCES discovery_generations(id) ON DELETE CASCADE,
+            origin_id INTEGER NOT NULL
+                REFERENCES discovery_origins(id) ON DELETE CASCADE,
+            project_path TEXT NOT NULL,
+            project_device BLOB NOT NULL
+                CHECK(typeof(project_device) = 'blob' AND length(project_device) = 8),
+            project_inode BLOB NOT NULL
+                CHECK(typeof(project_inode) = 'blob' AND length(project_inode) = 8),
+            project_mount_id TEXT,
+            target_device BLOB
+                CHECK(target_device IS NULL OR (
+                    typeof(target_device) = 'blob' AND length(target_device) = 8
+                )),
+            target_inode BLOB
+                CHECK(target_inode IS NULL OR (
+                    typeof(target_inode) = 'blob' AND length(target_inode) = 8
+                )),
+            target_mount_id TEXT,
+            observed_at INTEGER NOT NULL,
+            authorized INTEGER NOT NULL CHECK(authorized IN (0, 1)),
+            blocked_reason TEXT,
+            boot_session_id TEXT,
+            PRIMARY KEY(generation_id, origin_id, project_path)
+        );
+
+        CREATE TABLE review_plan_targets_v14 (
+            plan_id INTEGER NOT NULL
+                REFERENCES review_plans(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            project_path TEXT NOT NULL,
+            canonical_project_path TEXT,
+            project_class TEXT NOT NULL
+                CHECK(project_class IN (
+                    'workspace',
+                    'managed_cache',
+                    'container_storage'
+                )),
+            target_path TEXT NOT NULL,
+            project_device BLOB
+                CHECK(project_device IS NULL OR (
+                    typeof(project_device) = 'blob' AND length(project_device) = 8
+                )),
+            project_inode BLOB
+                CHECK(project_inode IS NULL OR (
+                    typeof(project_inode) = 'blob' AND length(project_inode) = 8
+                )),
+            project_mount_id TEXT,
+            target_device BLOB
+                CHECK(target_device IS NULL OR (
+                    typeof(target_device) = 'blob' AND length(target_device) = 8
+                )),
+            target_inode BLOB
+                CHECK(target_inode IS NULL OR (
+                    typeof(target_inode) = 'blob' AND length(target_inode) = 8
+                )),
+            target_mount_id TEXT,
+            review_boot_session_id TEXT,
+            reviewed_bytes INTEGER NOT NULL CHECK(reviewed_bytes >= 0),
+            decision TEXT NOT NULL CHECK(decision IN ('cleanable', 'skipped')),
+            skip_reason TEXT,
+            skip_newest_age_secs INTEGER CHECK(skip_newest_age_secs >= 0),
+            CHECK(
+                (
+                    project_device IS NULL
+                    AND project_inode IS NULL
+                    AND target_device IS NULL
+                    AND target_inode IS NULL
+                    AND review_boot_session_id IS NULL
+                )
+                OR (
+                    project_device IS NOT NULL
+                    AND project_inode IS NOT NULL
+                    AND target_device IS NOT NULL
+                    AND target_inode IS NOT NULL
+                )
+            ),
+            CHECK(
+                (decision = 'cleanable' AND skip_reason IS NULL)
+                OR (decision = 'skipped' AND skip_reason IS NOT NULL)
+            ),
+            CHECK(
+                (skip_reason = 'active_recent_write'
+                    AND skip_newest_age_secs IS NOT NULL)
+                OR (skip_reason <> 'active_recent_write'
+                    AND skip_newest_age_secs IS NULL)
+                OR skip_reason IS NULL
+            ),
+            PRIMARY KEY(plan_id, ordinal)
+        );
+
+        ",
+    )?;
+
+    tx.execute_batch(
+        "
+        CREATE TABLE clean_events_v14 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id),
+            ts INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            bytes_before INTEGER NOT NULL,
+            bytes_after INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER,
+            stderr_excerpt TEXT NOT NULL DEFAULT '',
+            attempt_outcome TEXT NOT NULL
+                CHECK(attempt_outcome IN (
+                    'success',
+                    'cargo_nonzero',
+                    'runner_failure',
+                    'measurement_failure'
+                )),
+            CHECK(
+                (attempt_outcome = 'success' AND exit_code = 0)
+                OR (attempt_outcome = 'cargo_nonzero'
+                    AND exit_code IS NOT NULL AND exit_code <> 0)
+                OR (attempt_outcome = 'runner_failure' AND exit_code IS NULL)
+                OR (attempt_outcome = 'measurement_failure'
+                    AND exit_code IS NOT NULL)
+            )
+        );
+        ",
+    )?;
+
+    for observation in project_observations {
+        tx.execute(
+            "
+            INSERT INTO project_observations_v14 (
+                generation_id,
+                origin_id,
+                project_path,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                observed_at,
+                authorized,
+                blocked_reason,
+                boot_session_id
+            )
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13
+            )
+            ",
+            params![
+                observation.generation_id,
+                observation.origin_id,
+                observation.project_path,
+                encode_u64_identity(observation.project_device),
+                encode_u64_identity(observation.project_inode),
+                observation.project_mount_id,
+                observation.target_device.map(encode_u64_identity),
+                observation.target_inode.map(encode_u64_identity),
+                observation.target_mount_id,
+                observation.observed_at,
+                observation.authorized,
+                observation.blocked_reason,
+                observation.boot_session_id,
+            ],
+        )?;
+    }
+
+    for target in review_plan_targets {
+        tx.execute(
+            "
+            INSERT INTO review_plan_targets_v14 (
+                plan_id,
+                ordinal,
+                project_path,
+                canonical_project_path,
+                project_class,
+                target_path,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                review_boot_session_id,
+                reviewed_bytes,
+                decision,
+                skip_reason,
+                skip_newest_age_secs
+            )
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+            )
+            ",
+            params![
+                target.plan_id,
+                target.ordinal,
+                target.project_path,
+                target.canonical_project_path,
+                target.project_class,
+                target.target_path,
+                target.project_device.map(encode_u64_identity),
+                target.project_inode.map(encode_u64_identity),
+                target.project_mount_id,
+                target.target_device.map(encode_u64_identity),
+                target.target_inode.map(encode_u64_identity),
+                target.target_mount_id,
+                target.review_boot_session_id,
+                target.reviewed_bytes,
+                target.decision,
+                target.skip_reason,
+                target.skip_newest_age_secs,
+            ],
+        )?;
+    }
+
+    for event in clean_events {
+        tx.execute(
+            "
+            INSERT INTO clean_events_v14 (
+                id,
+                run_id,
+                ts,
+                path,
+                bytes_before,
+                bytes_after,
+                duration_ms,
+                exit_code,
+                stderr_excerpt,
+                attempt_outcome
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                event.id,
+                event.run_id,
+                event.ts,
+                event.path,
+                event.bytes_before,
+                event.bytes_after,
+                event.duration_ms,
+                event.exit_code,
+                event.stderr_excerpt,
+                event.outcome.as_str(),
+            ],
+        )?;
+    }
+
+    tx.execute_batch(
+        "
+        DROP TABLE project_observations;
+        ALTER TABLE project_observations_v14 RENAME TO project_observations;
+        CREATE INDEX idx_project_observations_authorized
+            ON project_observations(generation_id, authorized, project_path);
+
+        DROP TABLE review_plan_targets;
+        ALTER TABLE review_plan_targets_v14 RENAME TO review_plan_targets;
+
+        DROP TABLE clean_events;
+        ALTER TABLE clean_events_v14 RENAME TO clean_events;
+        CREATE INDEX idx_clean_events_ts ON clean_events(ts);
+        ",
+    )?;
+    Ok(())
+}
+
+fn transaction_column_exists(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn encode_u64_identity(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn required_u64_identity(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &str,
+) -> rusqlite::Result<u64> {
+    optional_u64_identity(row, index, column)?.ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Null,
+            invalid_data_error(format!("{column} must not be NULL")),
+        )
+    })
+}
+
+fn optional_u64_identity(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &str,
+) -> rusqlite::Result<Option<u64>> {
+    use rusqlite::types::ValueRef;
+
+    let value = row.get_ref(index)?;
+    let decoded = match value {
+        ValueRef::Null => return Ok(None),
+        ValueRef::Integer(value) if value >= 0 => value as u64,
+        ValueRef::Blob(value) if value.len() == size_of::<u64>() => {
+            let bytes: [u8; size_of::<u64>()] = value.try_into().expect("length checked");
+            u64::from_be_bytes(bytes)
+        }
+        ValueRef::Text(value) => {
+            let value = std::str::from_utf8(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            value.parse::<u64>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?
+        }
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                index,
+                other.data_type(),
+                invalid_data_error(format!(
+                    "{column} must be a nonnegative integer, decimal text, or 8-byte blob"
+                )),
+            ));
+        }
+    };
+    Ok(Some(decoded))
+}
+
+fn parse_clean_attempt_outcome(label: &str) -> Option<CleanAttemptOutcome> {
+    match label {
+        "success" => Some(CleanAttemptOutcome::Success),
+        "cargo_nonzero" => Some(CleanAttemptOutcome::CargoNonzero),
+        "runner_failure" => Some(CleanAttemptOutcome::RunnerFailure),
+        "measurement_failure" => Some(CleanAttemptOutcome::MeasurementFailure),
+        _ => None,
+    }
+}
+
+fn invalid_data_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
 }
 
 fn record_error_in_transaction(
@@ -2628,8 +3243,8 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
 }
 
 fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectObservation> {
-    let target_device = row.get::<_, Option<u64>>(6)?;
-    let target_inode = row.get::<_, Option<u64>>(7)?;
+    let target_device = optional_u64_identity(row, 6, "target_device")?;
+    let target_inode = optional_u64_identity(row, 7, "target_inode")?;
     let target_mount = row.get::<_, Option<String>>(8)?;
     let target_identity = match (target_device, target_inode, target_mount) {
         (Some(device), Some(inode), Some(mount)) => Some(FilesystemIdentity {
@@ -2651,8 +3266,8 @@ fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pro
         origin_id: row.get(1)?,
         project_path: PathBuf::from(row.get::<_, String>(2)?),
         project_identity: FilesystemIdentity {
-            device: row.get(3)?,
-            inode: row.get(4)?,
+            device: required_u64_identity(row, 3, "project_device")?,
+            inode: required_u64_identity(row, 4, "project_inode")?,
             mount: MountIdentity(row.get(5)?),
         },
         target_identity,
@@ -2732,11 +3347,11 @@ fn insert_review_plan_target(
         boot_session_id,
     ) = match review.reviewed_identity.as_ref() {
         Some(identity) => (
-            Some(i64::try_from(identity.project.device)?),
-            Some(i64::try_from(identity.project.inode)?),
+            Some(encode_u64_identity(identity.project.device)),
+            Some(encode_u64_identity(identity.project.inode)),
             Some(identity.project.mount.0.as_str()),
-            Some(i64::try_from(identity.target.device)?),
-            Some(i64::try_from(identity.target.inode)?),
+            Some(encode_u64_identity(identity.target.device)),
+            Some(encode_u64_identity(identity.target.inode)),
             Some(identity.target.mount.0.as_str()),
             identity
                 .boot_session
@@ -2883,11 +3498,11 @@ fn load_review_plan_from_connection(
         let canonical_project_path = row.get::<_, Option<String>>(2)?.map(PathBuf::from);
         let project_class = parse_project_class(&row.get::<_, String>(3)?)?;
         let target_path = PathBuf::from(row.get::<_, String>(4)?);
-        let project_device = row.get::<_, Option<i64>>(5)?;
-        let project_inode = row.get::<_, Option<i64>>(6)?;
+        let project_device = optional_u64_identity(row, 5, "project_device")?;
+        let project_inode = optional_u64_identity(row, 6, "project_inode")?;
         let project_mount_id = row.get::<_, Option<String>>(7)?;
-        let target_device = row.get::<_, Option<i64>>(8)?;
-        let target_inode = row.get::<_, Option<i64>>(9)?;
+        let target_device = optional_u64_identity(row, 8, "target_device")?;
+        let target_inode = optional_u64_identity(row, 9, "target_inode")?;
         let target_mount_id = row.get::<_, Option<String>>(10)?;
         let boot_session_id = row.get::<_, Option<String>>(11)?;
         let reviewed_identity = parse_reviewed_identity(
@@ -3084,11 +3699,11 @@ fn parse_skip_reason(reason: &str, newest_age_secs: Option<i64>) -> Result<SkipR
 }
 
 fn parse_reviewed_identity(
-    project_device: Option<i64>,
-    project_inode: Option<i64>,
+    project_device: Option<u64>,
+    project_inode: Option<u64>,
     project_mount_id: Option<String>,
-    target_device: Option<i64>,
-    target_inode: Option<i64>,
+    target_device: Option<u64>,
+    target_inode: Option<u64>,
     target_mount_id: Option<String>,
     boot_session_id: Option<String>,
 ) -> Result<Option<ReviewedIdentity>> {
@@ -3110,21 +3725,13 @@ fn parse_reviewed_identity(
             Some(target_mount_id),
         ) => Ok(Some(ReviewedIdentity {
             project: FilesystemIdentity {
-                device: project_device
-                    .try_into()
-                    .context("project device is out of range")?,
-                inode: project_inode
-                    .try_into()
-                    .context("project inode is out of range")?,
+                device: project_device,
+                inode: project_inode,
                 mount: MountIdentity(project_mount_id),
             },
             target: FilesystemIdentity {
-                device: target_device
-                    .try_into()
-                    .context("target device is out of range")?,
-                inode: target_inode
-                    .try_into()
-                    .context("target inode is out of range")?,
+                device: target_device,
+                inode: target_inode,
                 mount: MountIdentity(target_mount_id),
             },
             boot_session: boot_session_id.map(crate::identity::BootSessionId),

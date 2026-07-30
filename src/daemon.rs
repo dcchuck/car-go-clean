@@ -1,6 +1,6 @@
 use crate::activity::{ActivitySampler, ActivitySignal, ProcessInspector};
 use crate::cache::Cache;
-use crate::cleaner::{Cleaner, CommandRunner};
+use crate::cleaner::{CleanAttemptOutcome, Cleaner, CommandRunner};
 use crate::identity::{compare_persisted, IdentityComparison};
 use crate::logging::Logger;
 use crate::safety::{
@@ -17,7 +17,7 @@ use crate::store::{
     ObservationReconciliation, OriginReconciliation, ProjectObservation, ScanPublication,
     SchedulerStatus, Store, WorktreeReconciliation,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -647,6 +647,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 }
                 Ok(result) => {
                     let now = self.clock.now();
+                    let outcome = result
+                        .outcome
+                        .context("non-skipped clean result is missing its attempt outcome")?;
                     self.store.record_clean_event(&CleanEvent {
                         id: 0,
                         run_id,
@@ -657,8 +660,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         duration_ms: result.duration.as_millis() as i64,
                         exit_code: result.exit_code,
                         stderr_excerpt: result.stderr_excerpt.clone(),
+                        outcome,
                     })?;
-                    if prepared.reverified_across_boot {
+                    if prepared.reverified_across_boot
+                        && outcome != CleanAttemptOutcome::RunnerFailure
+                    {
                         if let (Some(generation_id), Some(identity)) =
                             (generation_id, review.reviewed_identity.as_ref())
                         {
@@ -669,8 +675,46 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                             )?;
                         }
                     }
-                    let measurement_failed =
-                        if let Some(measurement_error) = &result.measurement_error {
+                    match outcome {
+                        CleanAttemptOutcome::Success => {
+                            projects_cleaned += 1;
+                            bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
+                            self.store.mark_project_cleaned(&path, now)?;
+                        }
+                        CleanAttemptOutcome::CargoNonzero => {
+                            errors_count += 1;
+                            cargo_failures += 1;
+                            let exit_code = result
+                                .exit_code
+                                .context("nonzero Cargo attempt is missing its exit code")?;
+                            let detail = if result.stderr_excerpt.is_empty() {
+                                format!("cargo clean exited {exit_code}")
+                            } else {
+                                format!("cargo clean exited {exit_code}: {}", result.stderr_excerpt)
+                            };
+                            self.store.record_error(&ErrorRecord {
+                                id: 0,
+                                ts: now,
+                                category: "clean".to_string(),
+                                path: path.to_str().map(str::to_owned),
+                                message: detail,
+                            })?;
+                        }
+                        CleanAttemptOutcome::RunnerFailure => {
+                            errors_count += 1;
+                            cleanup_failures += 1;
+                            self.store.record_error(&ErrorRecord {
+                                id: 0,
+                                ts: now,
+                                category: "clean".to_string(),
+                                path: path.to_str().map(str::to_owned),
+                                message: result
+                                    .attempt_error
+                                    .clone()
+                                    .context("runner failure is missing its audit message")?,
+                            })?;
+                        }
+                        CleanAttemptOutcome::MeasurementFailure => {
                             errors_count += 1;
                             measurement_failures += 1;
                             self.store.record_error(&ErrorRecord {
@@ -678,34 +722,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                                 ts: now,
                                 category: "clean".to_string(),
                                 path: path.to_str().map(str::to_owned),
-                                message: measurement_error.clone(),
+                                message: result
+                                    .measurement_error
+                                    .clone()
+                                    .context("measurement failure is missing its audit message")?,
                             })?;
-                            true
-                        } else {
-                            false
-                        };
-                    if result.exit_code == 0 && !measurement_failed {
-                        projects_cleaned += 1;
-                        bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
-                        self.store.mark_project_cleaned(&path, now)?;
-                    } else if result.exit_code != 0 {
-                        errors_count += 1;
-                        cargo_failures += 1;
-                        let detail = if result.stderr_excerpt.is_empty() {
-                            format!("cargo clean exited {}", result.exit_code)
-                        } else {
-                            format!(
-                                "cargo clean exited {}: {}",
-                                result.exit_code, result.stderr_excerpt
-                            )
-                        };
-                        self.store.record_error(&ErrorRecord {
-                            id: 0,
-                            ts: now,
-                            category: "clean".to_string(),
-                            path: path.to_str().map(str::to_owned),
-                            message: detail,
-                        })?;
+                        }
                     }
                 }
                 Err(err) => {

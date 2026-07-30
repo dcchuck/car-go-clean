@@ -12,14 +12,35 @@ pub struct CleanOutcome {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanAttemptOutcome {
+    Success,
+    CargoNonzero,
+    RunnerFailure,
+    MeasurementFailure,
+}
+
+impl CleanAttemptOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::CargoNonzero => "cargo_nonzero",
+            Self::RunnerFailure => "runner_failure",
+            Self::MeasurementFailure => "measurement_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanResult {
     pub path: PathBuf,
     pub bytes_before: i64,
     pub bytes_after: i64,
     pub duration: Duration,
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
     pub stderr_excerpt: String,
+    pub outcome: Option<CleanAttemptOutcome>,
+    pub attempt_error: Option<String>,
     pub measurement_error: Option<String>,
     pub skipped: bool,
 }
@@ -34,8 +55,12 @@ pub struct RealRunner;
 impl CommandRunner for RealRunner {
     fn run(&self, _dir: &Path, cmd: &mut Command) -> Result<CleanOutcome> {
         let output = cmd.output().context("run cargo clean")?;
+        let exit_code = output
+            .status
+            .code()
+            .context("cargo clean terminated without an exit code")?;
         Ok(CleanOutcome {
-            exit_code: output.status.code().unwrap_or(1),
+            exit_code,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
@@ -86,8 +111,10 @@ impl<R: CommandRunner> Cleaner<R> {
             bytes_before: 0,
             bytes_after: 0,
             duration: Duration::ZERO,
-            exit_code: 0,
+            exit_code: None,
             stderr_excerpt: String::new(),
+            outcome: None,
+            attempt_error: None,
             measurement_error: None,
             skipped: false,
         };
@@ -111,14 +138,28 @@ impl<R: CommandRunner> Cleaner<R> {
             result.skipped = true;
             return Ok(result);
         }
-        let outcome = self.runner.run(project_dir, &mut cmd)?;
+        let outcome = match self.runner.run(project_dir, &mut cmd) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                result.duration = start.elapsed();
+                result.outcome = Some(CleanAttemptOutcome::RunnerFailure);
+                result.attempt_error = Some(error.to_string());
+                return Ok(result);
+            }
+        };
         result.duration = start.elapsed();
-        result.exit_code = outcome.exit_code;
+        result.exit_code = Some(outcome.exit_code);
         result.stderr_excerpt = stderr_excerpt(&outcome.stderr);
+        result.outcome = Some(if outcome.exit_code == 0 {
+            CleanAttemptOutcome::Success
+        } else {
+            CleanAttemptOutcome::CargoNonzero
+        });
         match dir_size(&target_dir) {
             Ok(bytes_after) => result.bytes_after = bytes_after,
             Err(error) => {
                 result.bytes_after = result.bytes_before;
+                result.outcome = Some(CleanAttemptOutcome::MeasurementFailure);
                 result.measurement_error =
                     Some(format!("measure target after cargo clean: {error:#}"));
             }
@@ -236,5 +277,21 @@ mod tests {
     #[test]
     fn stderr_excerpt_preserves_short_input() {
         assert_eq!(stderr_excerpt("cargo failed: λ"), "cargo failed: λ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_process_is_not_fabricated_as_exit_one() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "kill -KILL $$"]);
+
+        let error = RealRunner.run(Path::new("."), &mut command).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cargo clean terminated without an exit code"),
+            "{error:#}"
+        );
     }
 }
