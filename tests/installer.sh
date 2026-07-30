@@ -9,7 +9,7 @@ fake_bin="$work_dir/bin"
 fixture_dir="$work_dir/fixture"
 fixture_archive="$work_dir/car-go-clean.tar.xz"
 curl_log="$work_dir/curl.log"
-expected_hash=fixture-sha256
+expected_hash=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 cleanup() {
     rm -rf "$work_dir"
@@ -77,7 +77,25 @@ case "$url" in
             printf ' ' >> "$CURL_LOG"
         fi
         printf '%s' "$url" >> "$CURL_LOG"
-        printf '%s  %s\n' "$EXPECTED_HASH" "$archive_name" > "$output"
+        case "${CHECKSUM_FORMAT-binary}" in
+            binary) printf '%s *%s\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
+            text) printf '%s  %s\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
+            wrong-name) printf '%s *%s-wrong\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
+            uppercase)
+                printf '%s *%s\n' \
+                    "$(printf '%s' "$EXPECTED_HASH" | tr 'a-f' 'A-F')" \
+                    "$archive_name" \
+                    > "$output"
+                ;;
+            extra-space) printf '%s   %s\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
+            extra-line)
+                printf '%s *%s\n%s *%s\n' \
+                    "$EXPECTED_HASH" "$archive_name" \
+                    "$EXPECTED_HASH" "$archive_name" \
+                    > "$output"
+                ;;
+            *) exit 64 ;;
+        esac
         ;;
     *)
         echo "unexpected curl URL: $url" >&2
@@ -142,6 +160,32 @@ run_installer \
     --install-dir "$override_dir"
 cmp "$fixture_dir/car-go-clean" "$override_dir/car-go-clean"
 test "$(cat "$curl_log")" = "https://artifacts.example.invalid/releases/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://artifacts.example.invalid/releases/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+: > "$curl_log"
+text_checksum_dir="$work_dir/text-checksum-install"
+CHECKSUM_FORMAT=text run_installer \
+    --version 0.2.0 \
+    --download-base-url https://artifacts.example.invalid/releases/v0.2.0 \
+    --install-dir "$text_checksum_dir"
+cmp "$fixture_dir/car-go-clean" "$text_checksum_dir/car-go-clean"
+
+for hostile_checksum_format in wrong-name uppercase extra-space extra-line
+do
+    : > "$curl_log"
+    hostile_dir="$work_dir/hostile-$hostile_checksum_format-install"
+    mkdir -p "$hostile_dir"
+    printf '%s' 'old binary' > "$hostile_dir/car-go-clean"
+    if CHECKSUM_FORMAT="$hostile_checksum_format" run_installer \
+        --version 0.2.0 \
+        --download-base-url https://artifacts.example.invalid/releases/v0.2.0 \
+        --install-dir "$hostile_dir"
+    then
+        echo "accepted hostile checksum format: $hostile_checksum_format" >&2
+        exit 1
+    fi
+    test "$(cat "$hostile_dir/car-go-clean")" = "old binary"
+done
+unset CHECKSUM_FORMAT
 
 : > "$curl_log"
 loopback_dir="$work_dir/loopback-install"

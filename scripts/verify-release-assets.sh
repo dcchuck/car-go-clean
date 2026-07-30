@@ -55,13 +55,18 @@ checksum_for() {
     archive=$1
     checksum=$2
     expected=$(awk -v archive="$archive" '
-        NF {
+        {
             count++
-            if (NF != 2 || $2 != archive ||
-                length($1) != 64 || $1 !~ /^[0-9a-f]+$/) {
+            hash = substr($0, 1, 64)
+            separator = substr($0, 65, 1)
+            marker = substr($0, 66, 1)
+            filename = substr($0, 67)
+            if (length($0) != 66 + length(archive) ||
+                length(hash) != 64 || hash !~ /^[0-9a-f]+$/ ||
+                separator != " " || (marker != " " && marker != "*") ||
+                filename != archive) {
                 exit 1
             }
-            hash=$1
         }
         END {
             if (count != 1) {

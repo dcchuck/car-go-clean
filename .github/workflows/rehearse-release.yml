@@ -20,7 +20,29 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      evidence_key: ${{ steps.evidence_key.outputs.value }}
+      safe_exact_sha: ${{ steps.evidence_key.outputs.safe_exact_sha }}
     steps:
+      - id: evidence_key
+        name: Normalize the evidence key
+        env:
+          CANDIDATE_SHA: ${{ inputs.commit_sha }}
+        run: |
+          candidate_sha=$CANDIDATE_SHA
+          case "$candidate_sha" in
+            *[!0-9a-f]*) candidate_sha= ;;
+          esac
+          if test "${#candidate_sha}" -eq 40
+          then
+            evidence_key=$candidate_sha
+            safe_exact_sha=$candidate_sha
+          else
+            evidence_key="run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            safe_exact_sha=invalid
+          fi
+          printf 'value=%s\n' "$evidence_key" >> "$GITHUB_OUTPUT"
+          printf 'safe_exact_sha=%s\n' "$safe_exact_sha" >> "$GITHUB_OUTPUT"
       - id: checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -31,14 +53,17 @@ jobs:
         run: |
           git fetch --force origin main:refs/remotes/origin/main
           git fetch --force origin 'refs/tags/*:refs/tags/*'
-      - name: Validate exact SHA and version
+      - id: validate_inputs
+        name: Validate exact SHA and version
         run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.95.0"
-      - name: Install verified cargo-dist
+      - id: install_dist
+        name: Install verified cargo-dist
         run: scripts/install-cargo-dist.sh
-      - name: Plan exact release
+      - id: dist_plan
+        name: Plan exact release
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-plan"
           dist plan \
@@ -49,6 +74,9 @@ jobs:
         if: ${{ always() }}
         env:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate_inputs.outcome }}
+          INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
+          DIST_PLAN_OUTCOME: ${{ steps.dist_plan.outcome }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           if command -v dist >/dev/null 2>&1
@@ -58,11 +86,14 @@ jobs:
             cargo_dist_version=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg exact_sha "${{ steps.evidence_key.outputs.safe_exact_sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg runner_os "${{ runner.os }}" \
             --arg runner_arch "${{ runner.arch }}" \
             --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg validation "$VALIDATE_OUTCOME" \
+            --arg install_dist "$INSTALL_DIST_OUTCOME" \
+            --arg dist_plan "$DIST_PLAN_OUTCOME" \
             --arg cargo_dist_version "$cargo_dist_version" \
             '{
               format_version: 1,
@@ -71,7 +102,12 @@ jobs:
               version: $version,
               runner: {os: $runner_os, architecture: $runner_arch},
               cargo_dist_version: $cargo_dist_version,
-              outcomes: {checkout: $checkout},
+              outcomes: {
+                checkout: $checkout,
+                validation: $validation,
+                install_cargo_dist: $install_dist,
+                dist_plan: $dist_plan
+              },
               action_pins: {
                 checkout: "d23441a48e516b6c34aea4fa41551a30e30af803",
                 upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
@@ -82,7 +118,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-plan-${{ inputs.commit_sha }}
+          name: release-rehearsal-plan-${{ steps.evidence_key.outputs.value }}
           path: ${{ runner.temp }}/rehearsal-plan
           if-no-files-found: error
           retention-days: 14
@@ -90,7 +126,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-evidence-validate-${{ inputs.commit_sha }}
+          name: release-rehearsal-evidence-validate-${{ steps.evidence_key.outputs.value }}
           path: ${{ runner.temp }}/rehearsal-evidence
           if-no-files-found: error
           retention-days: 14
@@ -180,15 +216,17 @@ jobs:
           cp "target/distrib/$archive" "$RUNNER_TEMP/rehearsal-artifacts/"
           cp "target/distrib/$checksum" "$RUNNER_TEMP/rehearsal-artifacts/"
           cp "$RUNNER_TEMP/${{ matrix.target }}-dist-manifest.json" \
-            "$RUNNER_TEMP/rehearsal-artifacts/rehearsal-${{ inputs.commit_sha }}-${{ matrix.target }}-dist-manifest.json"
-      - name: Attest target archive
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+            "$RUNNER_TEMP/rehearsal-artifacts/rehearsal-${{ needs.validate.outputs.evidence_key }}-${{ matrix.target }}-dist-manifest.json"
+      - id: attest_archive
+        name: Attest target archive
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: ${{ runner.temp }}/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz
-      - name: Upload target archive and manifest
+      - id: upload_archive
+        name: Upload target archive and manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-build-${{ inputs.commit_sha }}-${{ matrix.target }}
+          name: release-rehearsal-build-${{ needs.validate.outputs.evidence_key }}-${{ matrix.target }}
           path: ${{ runner.temp }}/rehearsal-artifacts
           if-no-files-found: error
           retention-days: 14
@@ -198,6 +236,8 @@ jobs:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
           BUILD_OUTCOME: ${{ steps.build_target.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest_archive.outcome }}
+          ARCHIVE_UPLOAD_OUTCOME: ${{ steps.upload_archive.outcome }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           archive="$RUNNER_TEMP/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz"
@@ -219,7 +259,7 @@ jobs:
             cargo_dist_version=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg target "${{ matrix.target }}" \
             --arg requested_runner "${{ matrix.runner }}" \
@@ -231,6 +271,8 @@ jobs:
             --arg checkout "$CHECKOUT_OUTCOME" \
             --arg install_dist "$INSTALL_DIST_OUTCOME" \
             --arg build "$BUILD_OUTCOME" \
+            --arg attest "$ATTEST_OUTCOME" \
+            --arg archive_upload "$ARCHIVE_UPLOAD_OUTCOME" \
             '{
               format_version: 1,
               phase: "build",
@@ -248,12 +290,14 @@ jobs:
               outcomes: {
                 checkout: $checkout,
                 install_cargo_dist: $install_dist,
-                build: $build
+                build: $build,
+                attestation: $attest,
+                archive_upload: $archive_upload
               },
               action_pins: {
                 checkout: "d23441a48e516b6c34aea4fa41551a30e30af803",
                 upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-                attest_build_provenance: "e8998f949152b193b063cb0ec769d69d929409be",
+                attest: "508db95dd578ae2727ebd6217d5ba78e4fbda05d",
                 rust_toolchain: "2c7215f132e9ebf062739d9130488b56d53c060c"
               }
             }' > "$RUNNER_TEMP/rehearsal-evidence/build-${{ matrix.target }}.json"
@@ -261,7 +305,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-evidence-build-${{ inputs.commit_sha }}-${{ matrix.target }}
+          name: release-rehearsal-evidence-build-${{ needs.validate.outputs.evidence_key }}-${{ matrix.target }}
           path: ${{ runner.temp }}/rehearsal-evidence
           if-no-files-found: error
           retention-days: 14
@@ -302,7 +346,7 @@ jobs:
         name: Download all target archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: release-rehearsal-build-${{ inputs.commit_sha }}-*
+          pattern: release-rehearsal-build-${{ needs.validate.outputs.evidence_key }}-*
           path: ${{ runner.temp }}/rehearsal-artifacts
           merge-multiple: true
       - id: smoke_paths
@@ -440,7 +484,7 @@ jobs:
             archive_hash=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg target "${{ matrix.target }}" \
             --arg requested_runner "${{ matrix.runner }}" \
@@ -480,7 +524,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-evidence-smoke-${{ inputs.commit_sha }}-${{ matrix.target }}
+          name: release-rehearsal-evidence-smoke-${{ needs.validate.outputs.evidence_key }}-${{ matrix.target }}
           path: ${{ runner.temp }}/rehearsal-evidence
           if-no-files-found: error
           retention-days: 14
@@ -488,6 +532,7 @@ jobs:
   runner-resolution:
     name: Verify hosted runner resolution
     needs:
+      - validate
       - build
       - smoke
     if: ${{ always() }}
@@ -534,7 +579,7 @@ jobs:
           fi
 
           jq -n \
-            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg resolution "$resolution" \
             --arg coverage_statement "$coverage_statement" \
@@ -558,15 +603,19 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-evidence-runner-${{ inputs.commit_sha }}
+          name: release-rehearsal-evidence-runner-${{ needs.validate.outputs.evidence_key }}
           path: ${{ runner.temp }}/rehearsal-evidence
           if-no-files-found: error
           retention-days: 14
 
   tap-capability:
     name: Rehearse public tap capability
-    needs: runner-resolution
-    if: ${{ always() }}
+    needs:
+      - validate
+      - build
+      - smoke
+      - runner-resolution
+    if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.runner-resolution.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -587,7 +636,8 @@ jobs:
             exit 1
           }
           scripts/rehearse-tap-capability.sh
-      - name: Cleanup tap rehearsal
+      - id: cleanup
+        name: Cleanup tap rehearsal
         if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -604,13 +654,15 @@ jobs:
         env:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           CAPABILITY_OUTCOME: ${{ steps.capability.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           jq -n \
-            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg checkout "$CHECKOUT_OUTCOME" \
             --arg capability "$CAPABILITY_OUTCOME" \
+            --arg cleanup "$CLEANUP_OUTCOME" \
             '{
               format_version: 1,
               phase: "tap-capability",
@@ -619,14 +671,15 @@ jobs:
               repository: "dcchuck/homebrew-tap",
               outcomes: {
                 checkout: $checkout,
-                capability: $capability
+                capability: $capability,
+                cleanup: $cleanup
               }
             }' > "$RUNNER_TEMP/rehearsal-evidence/tap-capability.json"
       - name: Upload tap-capability evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-evidence-tap-${{ inputs.commit_sha }}
+          name: release-rehearsal-evidence-tap-${{ needs.validate.outputs.evidence_key }}
           path: ${{ runner.temp }}/rehearsal-evidence
           if-no-files-found: error
           retention-days: 14
@@ -644,30 +697,193 @@ jobs:
     permissions:
       actions: read
     steps:
-      - name: Download per-job evidence
+      - id: download_evidence
+        name: Download per-job evidence
+        if: ${{ always() }}
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: release-rehearsal-evidence-*-${{ inputs.commit_sha }}*
-          path: evidence
+          pattern: release-rehearsal-evidence-*-${{ needs.validate.outputs.evidence_key }}*
+          path: raw-evidence
           merge-multiple: true
-      - name: Download exact release plan
+      - id: download_plan
+        name: Download exact release plan
+        if: ${{ always() }}
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: release-rehearsal-plan-${{ inputs.commit_sha }}
-          path: evidence/plan
-      - name: Verify sanitized evidence inventory
+          name: release-rehearsal-plan-${{ needs.validate.outputs.evidence_key }}
+          path: raw-evidence/plan
+      - id: inventory
+        name: Index partial evidence
+        if: ${{ always() }}
+        env:
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          VERSION: ${{ inputs.version }}
+          EVIDENCE_DOWNLOAD_OUTCOME: ${{ steps.download_evidence.outcome }}
+          PLAN_DOWNLOAD_OUTCOME: ${{ steps.download_plan.outcome }}
         run: |
-          test "$(find evidence -type f -name '*.json' | awk 'END {print NR + 0}')" -ge 11
-          if rg -n '/Users/|/home/runner|HOMEBREW_TAP_TOKEN|gh[ps]_' evidence
+          set -eu
+          mkdir -p raw-evidence
+          rm -rf evidence
+          mkdir -p evidence/jobs evidence/plan
+
+          expected=$(mktemp)
+          available=$(mktemp)
+          trap 'rm -f "$expected" "$available"' EXIT HUP INT TERM
+          printf '%s\n' \
+            validate.json \
+            build-aarch64-apple-darwin.json \
+            build-x86_64-apple-darwin.json \
+            build-aarch64-unknown-linux-musl.json \
+            build-x86_64-unknown-linux-musl.json \
+            smoke-aarch64-apple-darwin.json \
+            smoke-x86_64-apple-darwin.json \
+            smoke-aarch64-unknown-linux-musl.json \
+            smoke-x86_64-unknown-linux-musl.json \
+            runner-resolution.json \
+            tap-capability.json \
+            > "$expected"
+          cp "$expected" evidence/expected-evidence-files.txt
+          : > "$available"
+          : > evidence/missing-evidence-files.txt
+          : > evidence/missing-supporting-files.txt
+          : > evidence/invalid-json-files.txt
+          : > evidence/sanitization-findings.txt
+          : > evidence/unexpected-files.txt
+
+          forbidden='/Users/|/home/runner|HOMEBREW_TAP_TOKEN|gh[ps]_[[:alnum:]_]'
+          preserve_json() {
+            relative=$1
+            source=$2
+            destination=$3
+            if ! jq -e . "$source" >/dev/null 2>&1
+            then
+              printf '%s\n' "$relative" >> evidence/invalid-json-files.txt
+              return
+            fi
+            if LC_ALL=C grep -Eq "$forbidden" "$source"
+            then
+              printf '%s\n' "$relative" >> evidence/sanitization-findings.txt
+              return
+            fi
+            cp "$source" "$destination"
+          }
+
+          while IFS= read -r name
+          do
+            source="raw-evidence/$name"
+            if test ! -f "$source"
+            then
+              printf '%s\n' "$name" >> evidence/missing-evidence-files.txt
+              continue
+            fi
+            preserve_json "$name" "$source" "evidence/jobs/$name"
+            if test -f "evidence/jobs/$name"
+            then
+              printf '%s\n' "$name" >> "$available"
+            fi
+          done < "$expected"
+
+          if test ! -f raw-evidence/plan/dist-plan.json
           then
-            echo "rehearsal evidence contains a forbidden home path or token marker" >&2
-            exit 1
+            printf '%s\n' plan/dist-plan.json \
+              > evidence/missing-supporting-files.txt
+          else
+            preserve_json \
+              plan/dist-plan.json \
+              raw-evidence/plan/dist-plan.json \
+              evidence/plan/dist-plan.json
           fi
+
+          find raw-evidence -type f -print |
+            sed 's#^raw-evidence/##' |
+            LC_ALL=C sort |
+            while IFS= read -r relative
+            do
+              if test "$relative" = plan/dist-plan.json ||
+                 grep -Fqx "$relative" "$expected"
+              then
+                continue
+              fi
+              printf '%s\n' "$relative"
+            done > evidence/unexpected-files.txt
+
+          complete=true
+          for report in \
+            evidence/missing-evidence-files.txt \
+            evidence/missing-supporting-files.txt \
+            evidence/invalid-json-files.txt \
+            evidence/unexpected-files.txt
+          do
+            if test -s "$report"
+            then
+              complete=false
+            fi
+          done
+          sanitized=true
+          if test -s evidence/sanitization-findings.txt
+          then
+            sanitized=false
+          fi
+
+          if test "$complete" = true && test "$sanitized" = true
+          then
+            status=ready
+          elif test "$complete" = false && test "$sanitized" = false
+          then
+            status=incomplete-unsanitized
+          elif test "$complete" = false
+          then
+            status=incomplete
+          else
+            status=unsanitized
+          fi
+          printf '%s\n' "$status" > evidence/aggregate-status.txt
+
+          jq -n \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
+            --arg evidence_download "$EVIDENCE_DOWNLOAD_OUTCOME" \
+            --arg plan_download "$PLAN_DOWNLOAD_OUTCOME" \
+            --argjson complete "$complete" \
+            --argjson sanitized "$sanitized" \
+            --argjson available_evidence_files \
+              "$(jq -R -s 'split("\n") | map(select(length > 0))' "$available")" \
+            --argjson missing_evidence_files \
+              "$(jq -R -s 'split("\n") | map(select(length > 0))' evidence/missing-evidence-files.txt)" \
+            --argjson missing_supporting_files \
+              "$(jq -R -s 'split("\n") | map(select(length > 0))' evidence/missing-supporting-files.txt)" \
+            --argjson sanitization_findings \
+              "$(jq -R -s 'split("\n") | map(select(length > 0))' evidence/sanitization-findings.txt)" \
+            '{
+              format_version: 1,
+              exact_sha: $exact_sha,
+              version: $version,
+              collection_outcomes: {
+                evidence_download: $evidence_download,
+                plan_download: $plan_download
+              },
+              complete: $complete,
+              sanitized: $sanitized,
+              available_evidence_files: $available_evidence_files,
+              missing_evidence_files: $missing_evidence_files,
+              missing_supporting_files: $missing_supporting_files,
+              sanitization_findings: $sanitization_findings
+            }' > evidence/aggregate-inventory.json
+
           find evidence -type f -print | LC_ALL=C sort
-      - name: Upload release rehearsal evidence
+      - id: upload_aggregate
+        name: Upload release rehearsal evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-rehearsal-${{ inputs.commit_sha }}
+          name: release-rehearsal-${{ needs.validate.outputs.evidence_key }}
           path: evidence
           if-no-files-found: error
           retention-days: 30
+      - name: Enforce complete sanitized evidence
+        if: ${{ always() }}
+        run: |
+          test -f evidence/aggregate-status.txt
+          test "$(cat evidence/aggregate-status.txt)" = ready

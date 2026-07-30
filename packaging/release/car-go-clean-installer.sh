@@ -133,12 +133,20 @@ download_release_file "$work_dir/$archive_name" "$base_url/$archive_name"
 download_release_file "$work_dir/$checksum_name" "$base_url/$checksum_name"
 
 expected_hash=$(awk -v file="$archive_name" '
-    NF {
+    {
         count++
-        if (count != 1 || NF != 2 || $2 != file) {
+        hash = substr($0, 1, 64)
+        separator = substr($0, 65, 1)
+        marker = substr($0, 66, 1)
+        filename = substr($0, 67)
+        if (count != 1 ||
+            length($0) != 66 + length(file) ||
+            length(hash) != 64 || hash !~ /^[0-9a-f]+$/ ||
+            separator != " " || (marker != " " && marker != "*") ||
+            filename != file) {
             exit 1
         }
-        print $1
+        print hash
     }
     END {
         if (count != 1) {

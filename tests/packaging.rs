@@ -577,8 +577,8 @@ fn rehearse_release_dispatch_is_exact_sha_bound_and_uses_only_pinned_actions() {
             "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         ),
         (
-            "actions/attest-build-provenance",
-            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+            "actions/attest",
+            "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
         ),
         (
             "dtolnay/rust-toolchain",
@@ -681,7 +681,7 @@ fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
     assert_eq!(
         uses_action(
             build_steps,
-            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+            "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
         )
         .len(),
         1
@@ -724,7 +724,7 @@ fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
         assert!(upload["with"]["name"]
             .as_str()
             .unwrap()
-            .contains("${{ inputs.commit_sha }}-${{ matrix.target }}"));
+            .contains("${{ needs.validate.outputs.evidence_key }}-${{ matrix.target }}"));
     }
 }
 
@@ -749,9 +749,38 @@ fn rehearse_release_fails_closed_on_intel_or_tap_gaps_and_aggregates_evidence() 
     }
 
     let tap_job = &rehearsal["jobs"]["tap-capability"];
-    assert!(tap_job["if"].as_str().unwrap().contains("always()"));
+    let tap_needs = tap_job["needs"]
+        .as_vec()
+        .expect("tap capability must list every trusted prerequisite")
+        .iter()
+        .map(|need| need.as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        tap_needs,
+        BTreeSet::from(["validate", "build", "smoke", "runner-resolution"])
+    );
+    let tap_gate = tap_job["if"]
+        .as_str()
+        .expect("tap capability must have an explicit result gate");
+    assert_eq!(
+        tap_gate,
+        "${{ needs.validate.result == 'success' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.runner-resolution.result == 'success' }}",
+        "the secret-bearing job must run only after every direct prerequisite succeeds"
+    );
     let tap_steps = workflow_steps(&rehearsal, "tap-capability");
+    let checkout = uses_action(
+        tap_steps,
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    )[0];
+    assert!(
+        checkout["if"].is_badvalue(),
+        "trusted checkout must use the successful job gate"
+    );
     let capability = named_step(tap_steps, "Rehearse tap capability");
+    assert!(
+        capability["if"].is_badvalue(),
+        "secret-bearing execution must use the successful job gate"
+    );
     assert_eq!(
         capability["env"]["GH_TOKEN"].as_str(),
         Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
@@ -768,14 +797,260 @@ fn rehearse_release_fails_closed_on_intel_or_tap_gaps_and_aggregates_evidence() 
         cleanup["env"]["GH_TOKEN"].as_str(),
         Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
     );
+    let tap_evidence = named_step(tap_steps, "Write tap-capability evidence");
+    assert_eq!(tap_evidence["if"].as_str(), Some("${{ always() }}"));
+    let tap_upload = named_step(tap_steps, "Upload tap-capability evidence");
+    assert_eq!(tap_upload["if"].as_str(), Some("${{ always() }}"));
 
     let aggregate_job = &rehearsal["jobs"]["aggregate-evidence"];
     assert!(aggregate_job["if"].as_str().unwrap().contains("always()"));
     let aggregate_steps = workflow_steps(&rehearsal, "aggregate-evidence");
+    for name in ["Download per-job evidence", "Download exact release plan"] {
+        let download = named_step(aggregate_steps, name);
+        assert_eq!(download["if"].as_str(), Some("${{ always() }}"));
+        assert_eq!(download["continue-on-error"].as_bool(), Some(true));
+    }
+    let inventory = named_step(aggregate_steps, "Index partial evidence");
+    assert_eq!(inventory["if"].as_str(), Some("${{ always() }}"));
     let upload = named_step(aggregate_steps, "Upload release rehearsal evidence");
+    assert_eq!(upload["if"].as_str(), Some("${{ always() }}"));
     assert_eq!(
         upload["with"]["name"].as_str(),
-        Some("release-rehearsal-${{ inputs.commit_sha }}")
+        Some("release-rehearsal-${{ needs.validate.outputs.evidence_key }}")
+    );
+    let enforce = named_step(aggregate_steps, "Enforce complete sanitized evidence");
+    assert_eq!(enforce["if"].as_str(), Some("${{ always() }}"));
+    let upload_index = aggregate_steps
+        .iter()
+        .position(|step| std::ptr::eq(step, upload))
+        .unwrap();
+    let enforce_index = aggregate_steps
+        .iter()
+        .position(|step| std::ptr::eq(step, enforce))
+        .unwrap();
+    assert!(
+        upload_index < enforce_index,
+        "aggregate evidence must be uploaded before incompleteness fails the job"
+    );
+}
+
+#[test]
+fn rehearse_release_evidence_records_gate_outcomes_and_rejects_unsafe_artifact_names() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+
+    let validate_steps = workflow_steps(&rehearsal, "validate");
+    let normalize = named_step(validate_steps, "Normalize the evidence key");
+    for (candidate, expected) in [
+        (
+            "0123456789abcdef0123456789abcdef01234567",
+            "value=0123456789abcdef0123456789abcdef01234567\nsafe_exact_sha=0123456789abcdef0123456789abcdef01234567\n",
+        ),
+        (
+            "../../bad candidate HOMEBREW_TAP_TOKEN",
+            "value=run-123-4\nsafe_exact_sha=invalid\n",
+        ),
+    ] {
+        let output_file = tempdir().unwrap();
+        let github_output = output_file.path().join("github-output");
+        let output = Command::new("sh")
+            .args(["-eu", "-c", run_command(normalize).unwrap()])
+            .env("CANDIDATE_SHA", candidate)
+            .env("GITHUB_RUN_ID", "123")
+            .env("GITHUB_RUN_ATTEMPT", "4")
+            .env("GITHUB_OUTPUT", &github_output)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "evidence-key normalization failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(github_output).unwrap(), expected);
+    }
+
+    for (name, id) in [
+        ("Validate exact SHA and version", "validate_inputs"),
+        ("Install verified cargo-dist", "install_dist"),
+        ("Plan exact release", "dist_plan"),
+    ] {
+        assert_eq!(
+            named_step(validate_steps, name)["id"].as_str(),
+            Some(id),
+            "{name} needs a stable evidence ID"
+        );
+    }
+    let validation_evidence = named_step(validate_steps, "Write validation evidence");
+    for (name, value) in [
+        ("VALIDATE_OUTCOME", "${{ steps.validate_inputs.outcome }}"),
+        ("INSTALL_DIST_OUTCOME", "${{ steps.install_dist.outcome }}"),
+        ("DIST_PLAN_OUTCOME", "${{ steps.dist_plan.outcome }}"),
+    ] {
+        assert_eq!(validation_evidence["env"][name].as_str(), Some(value));
+    }
+
+    let build_steps = workflow_steps(&rehearsal, "build");
+    assert_eq!(
+        named_step(build_steps, "Attest target archive")["id"].as_str(),
+        Some("attest_archive")
+    );
+    assert_eq!(
+        named_step(build_steps, "Upload target archive and manifest")["id"].as_str(),
+        Some("upload_archive")
+    );
+    let build_evidence = named_step(build_steps, "Write target build evidence");
+    assert_eq!(
+        build_evidence["env"]["ATTEST_OUTCOME"].as_str(),
+        Some("${{ steps.attest_archive.outcome }}")
+    );
+    assert_eq!(
+        build_evidence["env"]["ARCHIVE_UPLOAD_OUTCOME"].as_str(),
+        Some("${{ steps.upload_archive.outcome }}")
+    );
+
+    for (_, job) in rehearsal["jobs"].as_hash().unwrap() {
+        for step in job["steps"].as_vec().unwrap() {
+            for field in ["name", "pattern"] {
+                if let Some(value) = step["with"][field].as_str() {
+                    assert!(
+                        !value.contains("${{ inputs.commit_sha }}"),
+                        "untrusted raw dispatch input is used in artifact {field} `{value}`"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rehearse_release_aggregate_preserves_a_sanitized_partial_inventory() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+    let aggregate_steps = workflow_steps(&rehearsal, "aggregate-evidence");
+    let inventory = named_step(aggregate_steps, "Index partial evidence");
+    let work = tempdir().unwrap();
+    let raw_evidence = work.path().join("raw-evidence");
+    let evidence = work.path().join("evidence");
+    fs::create_dir(&raw_evidence).unwrap();
+    fs::write(
+        raw_evidence.join("validate.json"),
+        r#"{"format_version":1,"phase":"validate","exact_sha":"0123456789abcdef0123456789abcdef01234567","outcomes":{"validation":"failure"}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new("sh")
+        .args(["-eu", "-c", run_command(inventory).unwrap()])
+        .current_dir(work.path())
+        .env("EXACT_SHA", "0123456789abcdef0123456789abcdef01234567")
+        .env("VERSION", "0.4.0")
+        .env("EVIDENCE_DOWNLOAD_OUTCOME", "failure")
+        .env("PLAN_DOWNLOAD_OUTCOME", "failure")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "partial inventory generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let missing = fs::read_to_string(evidence.join("missing-evidence-files.txt")).unwrap();
+    let actual_missing = missing.lines().collect::<BTreeSet<_>>();
+    let expected_missing = BTreeSet::from([
+        "build-aarch64-apple-darwin.json",
+        "build-aarch64-unknown-linux-musl.json",
+        "build-x86_64-apple-darwin.json",
+        "build-x86_64-unknown-linux-musl.json",
+        "runner-resolution.json",
+        "smoke-aarch64-apple-darwin.json",
+        "smoke-aarch64-unknown-linux-musl.json",
+        "smoke-x86_64-apple-darwin.json",
+        "smoke-x86_64-unknown-linux-musl.json",
+        "tap-capability.json",
+    ]);
+    assert_eq!(actual_missing, expected_missing);
+    assert_eq!(
+        fs::read_to_string(evidence.join("missing-supporting-files.txt")).unwrap(),
+        "plan/dist-plan.json\n"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("aggregate-inventory.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(
+        report["exact_sha"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(report["version"], "0.4.0");
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["sanitized"], true);
+    assert_eq!(
+        report["available_evidence_files"],
+        serde_json::json!(["validate.json"])
+    );
+    assert_eq!(
+        fs::read_to_string(evidence.join("aggregate-status.txt")).unwrap(),
+        "incomplete\n"
+    );
+}
+
+#[test]
+fn rehearse_release_aggregate_omits_unsanitized_fragments_without_echoing_secrets() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+    let aggregate_steps = workflow_steps(&rehearsal, "aggregate-evidence");
+    let inventory = named_step(aggregate_steps, "Index partial evidence");
+    let work = tempdir().unwrap();
+    let raw_evidence = work.path().join("raw-evidence");
+    let evidence = work.path().join("evidence");
+    fs::create_dir(&raw_evidence).unwrap();
+    fs::write(
+        raw_evidence.join("validate.json"),
+        r#"{"format_version":1,"phase":"validate","diagnostic":"HOMEBREW_TAP_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let output = Command::new("sh")
+        .args(["-eu", "-c", run_command(inventory).unwrap()])
+        .current_dir(work.path())
+        .env("EXACT_SHA", "0123456789abcdef0123456789abcdef01234567")
+        .env("VERSION", "0.4.0")
+        .env("EVIDENCE_DOWNLOAD_OUTCOME", "success")
+        .env("PLAN_DOWNLOAD_OUTCOME", "failure")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "unsanitized partial inventory generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!evidence.join("jobs/validate.json").exists());
+    assert_eq!(
+        fs::read_to_string(evidence.join("sanitization-findings.txt")).unwrap(),
+        "validate.json\n"
+    );
+    for entry in fs::read_dir(&evidence).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            assert!(
+                !fs::read_to_string(entry.path())
+                    .unwrap()
+                    .contains("HOMEBREW_TAP_TOKEN"),
+                "sanitized aggregate echoed the forbidden marker in {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("aggregate-inventory.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["sanitized"], false);
+    assert_eq!(
+        report["sanitization_findings"],
+        serde_json::json!(["validate.json"])
+    );
+    assert_eq!(
+        fs::read_to_string(evidence.join("aggregate-status.txt")).unwrap(),
+        "incomplete-unsanitized\n"
     );
 }
 

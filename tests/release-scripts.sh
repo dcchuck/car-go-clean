@@ -144,8 +144,17 @@ car-go-clean-x86_64-unknown-linux-musl.tar.xz
 for archive in $archives
 do
     printf 'archive fixture: %s\n' "$archive" > "$artifacts/$archive"
-    printf '%s  %s\n' "$(hash_file "$artifacts/$archive")" "$archive" \
-        > "$artifacts/$archive.sha256"
+    case "$archive" in
+        car-go-clean-aarch64-apple-darwin.tar.xz)
+            # cargo-dist 0.32.0 emits the binary-mode checksum marker.
+            printf '%s *%s\n' "$(hash_file "$artifacts/$archive")" "$archive" \
+                > "$artifacts/$archive.sha256"
+            ;;
+        *)
+            printf '%s  %s\n' "$(hash_file "$artifacts/$archive")" "$archive" \
+                > "$artifacts/$archive.sha256"
+            ;;
+    esac
 done
 
 inventory=$("$asset_verifier" v0.4.0 "$artifacts")
@@ -187,6 +196,27 @@ expect_failure "malformed checksum line" "$asset_verifier" v0.4.0 "$artifacts"
 cp "$work/good-checksum" "$checksum"
 cat "$work/good-checksum" >> "$checksum"
 expect_failure "duplicate checksum lines" "$asset_verifier" v0.4.0 "$artifacts"
+cp "$work/good-checksum" "$checksum"
+
+checksum_hash=$(hash_file "$artifacts/car-go-clean-aarch64-apple-darwin.tar.xz")
+printf '%s *%s\n' \
+    "$checksum_hash" \
+    car-go-clean-wrong-target.tar.xz \
+    > "$checksum"
+expect_failure "binary checksum for the wrong basename" \
+    "$asset_verifier" v0.4.0 "$artifacts"
+printf '%s   %s\n' \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with a nonstandard marker" \
+    "$asset_verifier" v0.4.0 "$artifacts"
+printf '%s *%s\n' \
+    "$(printf '%s' "$checksum_hash" | tr 'a-f' 'A-F')" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with uppercase hexadecimal" \
+    "$asset_verifier" v0.4.0 "$artifacts"
 cp "$work/good-checksum" "$checksum"
 
 extra=car-go-clean-extra-target.tar.xz
