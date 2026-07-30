@@ -136,7 +136,10 @@ interface as identity.
   authoritative for the pre-Cargo recheck, regardless of boot session. This is
   the check that actually defends against replacement during a run.
 
-Inode mismatch within the same generation always blocks.
+An inode mismatch always blocks for same-boot or unavailable-boot comparisons,
+and for the process-local pre-Cargo recheck. A known different boot may
+re-authorize the current identity only after the full restat and policy checks
+above.
 
 ### Scan Scheduling for Migrated or Repolicied State
 
