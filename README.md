@@ -71,12 +71,27 @@ after installation.
 
 ## Quick Start
 
-Check the binary and service state, then create a review:
+Check the binary and service state before creating a review:
 
 ```sh
 car-go-clean version
 car-go-clean service status
 car-go-clean health
+```
+
+If status reports `Running: yes`, decide whether to pause the daemon before
+continuing. `service stop` is a persistent disable across login and reboot, so
+run it only after intentionally approving that service-state change. Remember
+that the service was running so you can restore it after the reviewed flow:
+
+```sh
+car-go-clean service stop
+```
+
+If status reports stopped or not installed, do not change service state. Once
+no daemon is running, create the review:
+
+```sh
 car-go-clean run --dry-run --all
 ```
 
@@ -91,6 +106,13 @@ car-go-clean run --review REVIEW_ID
 car-go-clean stats
 ```
 
+If you stopped an originally running service, restore it after the reviewed
+run (or after deciding not to execute the review):
+
+```sh
+car-go-clean service start
+```
+
 Review plans expire after 30 minutes, and only the newest 20 are retained. A
 plan is rejected if its policy or discovery generation changed. Immediately
 before Cargo runs, car-go-clean revalidates every persisted target. That check
@@ -102,16 +124,6 @@ Bare `car-go-clean run` remains available, but it is dynamic and destructive:
 it scans and accepts the fresh target set in one operation. Use it only when
 you intentionally accept that behavior. The reviewed two-command flow above
 is the recommended manual path.
-
-If the service is running, stop it before the preview and start it only after
-the reviewed run:
-
-```sh
-car-go-clean service stop
-car-go-clean run --dry-run --all
-car-go-clean run --review REVIEW_ID
-car-go-clean service start
-```
 
 `service stop` is persistent across login and reboot. `service start`
 re-enables and starts the installed definition.
@@ -171,10 +183,14 @@ Copy this prompt into your coding agent:
 > If the existing binary is v0.2.0 or v0.3.0, stop the ordinary install path
 > and follow the repository's v0.4 state-preserving upgrade-helper
 > instructions. Do not run a plain `brew upgrade`, `brew install`, or ordinary
-> shell installer first. For any other existing version, read the target
-> release's upgrade instructions before replacement. Only when no binary is
-> installed should you use the README's fresh-install Homebrew or verified
-> shell-installer command.
+> shell installer first. Choose the helper method that owns the existing
+> visible command, not a desired migration method; the helper will verify
+> Homebrew formula ownership or a safe shell-owned binary before any service
+> stop. Cross-method migration requires a separate explicit uninstall and
+> fresh install. For any other existing version, read the target release's
+> upgrade instructions before replacement. Only when no binary is installed
+> should you use the README's fresh-install Homebrew or verified shell-installer
+> command.
 >
 > If the shell installer is selected, it does not edit `PATH`. After it
 > succeeds, run:
@@ -191,12 +207,23 @@ Copy this prompt into your coding agent:
 > usage and explain the choice.
 >
 > After completing the correct fresh-install or upgrade flow, verify the
-> installed version and run:
+> installed version and inspect service state before any preview:
 >
 > ```sh
 > car-go-clean version
 > car-go-clean service status
 > car-go-clean health
+> ```
+>
+> If the daemon is running, do not preview yet. Explain that `service stop`
+> persistently disables it across login and reboot, then ask approval for this
+> bounded review window: stop it, create and inspect a preview, leave it stopped
+> while asking separately for reviewed execution approval, and restore the
+> originally running service after execution or cancellation. Only after that
+> approval run `car-go-clean service stop`. If the service is already stopped
+> or absent, make no service change. Once no daemon is running, run:
+>
+> ```sh
 > car-go-clean run --dry-run --all
 > ```
 >
@@ -222,8 +249,11 @@ Copy this prompt into your coding agent:
 > around scan errors or process locks. Never execute dynamic bare
 > `car-go-clean run` on the user's behalf. If daemon operation is approved,
 > use `car-go-clean service install`, re-check installed/enabled/running state,
-> and explain any environment-recapture warning. Report blockers, exit codes,
-> service state, and final results clearly.
+> and explain any environment-recapture warning. If the service was running
+> before the approved review window, restore it with `car-go-clean service
+> start` after reviewed execution or cancellation, as already authorized by
+> that window. Report blockers, exit codes, service state, and final results
+> clearly.
 
 ## Background Service (Optional)
 

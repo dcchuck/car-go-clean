@@ -255,6 +255,43 @@ fn mac_status_models_persistent_enablement_and_process_state_separately() {
 }
 
 #[test]
+fn mac_status_ignores_neighboring_disabled_labels() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "legacy definition").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n  \"com.dcchuck.car-go-clean.helper\" => true\n}\n"
+                    .to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+        ]),
+    );
+
+    assert_eq!(
+        manager.status().unwrap(),
+        ServiceStatus {
+            installed: true,
+            enabled: true,
+            active: false,
+        }
+    );
+}
+
+#[test]
 fn mac_stop_disables_before_bootout_and_start_enables_before_bootstrap() {
     let work = tempfile::tempdir().unwrap();
     let plist = work

@@ -1081,21 +1081,27 @@ fn parse_launchd_enabled(output: &str) -> Result<bool> {
     if !trimmed.contains('{') || !trimmed.ends_with('}') {
         bail!("malformed launchctl print-disabled output");
     }
-    let matching = trimmed
-        .lines()
-        .filter(|line| line.contains(LABEL))
-        .collect::<Vec<_>>();
+    let exact_key = format!("\"{LABEL}\"");
+    let mut matching = Vec::new();
+    for line in trimmed.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once("=>") else {
+            if line == exact_key {
+                bail!("malformed launchctl print-disabled output");
+            }
+            continue;
+        };
+        if key.trim() == exact_key {
+            matching.push(value.trim().trim_end_matches(';'));
+        }
+    }
     if matching.is_empty() {
         return Ok(true);
     }
     if matching.len() != 1 {
         bail!("malformed launchctl print-disabled output");
     }
-    let value = matching[0]
-        .split_once("=>")
-        .map(|(_, value)| value.trim().trim_end_matches(';'))
-        .ok_or_else(|| anyhow!("malformed launchctl print-disabled output"))?;
-    match value {
+    match matching[0] {
         "true" => Ok(false),
         "false" => Ok(true),
         _ => bail!("malformed launchctl print-disabled output"),

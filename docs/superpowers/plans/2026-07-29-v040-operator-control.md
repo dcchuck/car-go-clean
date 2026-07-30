@@ -32,7 +32,7 @@
 
 **Interfaces:**
 - Consumes: current `ScopePolicy::hash`, `DiscoveryGeneration::id`, and complete `ProjectReview` records.
-- Produces: schema version 10, `Store::create_review_plan`, `Store::load_review_plan`, and `Store::prune_review_plans`.
+- Produces: schema version 12, `Store::create_review_plan`, `Store::load_review_plan`, and `Store::prune_review_plans`. Runtime Safety Slices A and B already own schema versions 10 and 11, respectively.
 
 - [ ] **Step 1: Add failing schema and plan tests**
 
@@ -46,7 +46,7 @@ cargo test --locked --test store review_plan
 
 Expected: compilation fails because review-plan APIs do not exist.
 
-- [ ] **Step 3: Add schema version 10**
+- [ ] **Step 3: Add schema version 12**
 
 Use:
 
@@ -56,29 +56,72 @@ CREATE TABLE review_plans (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     policy_hash TEXT NOT NULL,
-    generation_id INTEGER NOT NULL REFERENCES discovery_generations(id),
-    coverage_incomplete INTEGER NOT NULL CHECK(coverage_incomplete IN (0, 1)),
-    candidate_bytes INTEGER NOT NULL
+    generation_id INTEGER NOT NULL
+        REFERENCES discovery_generations(id) ON DELETE CASCADE,
+    coverage_incomplete INTEGER NOT NULL
+        CHECK(coverage_incomplete IN (0, 1)),
+    candidate_bytes INTEGER NOT NULL CHECK(candidate_bytes >= 0)
 );
 
 CREATE TABLE review_plan_targets (
     plan_id INTEGER NOT NULL REFERENCES review_plans(id) ON DELETE CASCADE,
-    ordinal INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
     project_path TEXT NOT NULL,
+    canonical_project_path TEXT,
+    project_class TEXT NOT NULL
+        CHECK(project_class IN (
+            'workspace',
+            'managed_cache',
+            'container_storage'
+        )),
     target_path TEXT NOT NULL,
-    project_device INTEGER NOT NULL,
-    project_inode INTEGER NOT NULL,
-    target_device INTEGER NOT NULL,
-    target_inode INTEGER NOT NULL,
-    reviewed_bytes INTEGER NOT NULL,
-    decision TEXT NOT NULL,
+    project_device INTEGER CHECK(project_device >= 0),
+    project_inode INTEGER CHECK(project_inode >= 0),
+    target_device INTEGER CHECK(target_device >= 0),
+    target_inode INTEGER CHECK(target_inode >= 0),
+    review_boot_session_id TEXT,
+    reviewed_bytes INTEGER NOT NULL CHECK(reviewed_bytes >= 0),
+    decision TEXT NOT NULL CHECK(decision IN ('cleanable', 'skipped')),
     skip_reason TEXT,
+    skip_newest_age_secs INTEGER CHECK(skip_newest_age_secs >= 0),
+    CHECK(
+        (
+            project_device IS NULL
+            AND project_inode IS NULL
+            AND target_device IS NULL
+            AND target_inode IS NULL
+            AND review_boot_session_id IS NULL
+        )
+        OR (
+            project_device IS NOT NULL
+            AND project_inode IS NOT NULL
+            AND target_device IS NOT NULL
+            AND target_inode IS NOT NULL
+        )
+    ),
+    CHECK(
+        (decision = 'cleanable' AND skip_reason IS NULL)
+        OR (decision = 'skipped' AND skip_reason IS NOT NULL)
+    ),
+    CHECK(
+        (skip_reason = 'active_recent_write'
+            AND skip_newest_age_secs IS NOT NULL)
+        OR (skip_reason <> 'active_recent_write'
+            AND skip_newest_age_secs IS NULL)
+        OR skip_reason IS NULL
+    ),
     PRIMARY KEY(plan_id, ordinal)
 );
 
 CREATE INDEX idx_review_plans_expires ON review_plans(expires_at);
-INSERT INTO schema_version(version) VALUES (10);
+INSERT INTO schema_version(version) VALUES (12);
 ```
+
+Enable `PRAGMA foreign_keys = ON` on every opened connection so generation and
+plan deletion cascades are behavioral guarantees. The nullable identity group
+preserves complete `ProjectReview` authority: canonical project path, project
+class, exact project/target device and inode, optional boot scope, reviewed
+bytes, and the full typed decision payload.
 
 - [ ] **Step 4: Implement typed plan APIs**
 
@@ -100,7 +143,12 @@ pub struct ReviewPlan {
 }
 ```
 
-Creation and target inserts are one transaction. `load_review_plan` returns a typed `PlanLoadError::{Missing, Expired, PolicyMismatch, GenerationMismatch}`. Prune expired/mismatched plans on store open and every creation, then retain the newest 20.
+Creation and target inserts are one transaction. `load_review_plan` returns a
+typed `PlanLoadError::{Missing, Expired, PolicyMismatch, GenerationMismatch}`.
+Store open prunes expired plans and plans whose generation is missing,
+unauthorized, or no longer newest for its policy. Creation and load additionally
+prune against the supplied current policy/generation authority, then creation
+retains only the newest 20 plans.
 
 - [ ] **Step 5: Run store tests**
 
@@ -408,13 +456,20 @@ git commit -m "feat: persist service enablement safely"
 
 Create `tests/upgrade.sh` with command shims that emulate real v0.2/v0.3 output and assert:
 
+- the requested method owns the existing visible binary before any service
+  stop or replacement; shell-shadowed Homebrew, Homebrew-shadowed shell,
+  missing formula ownership, and ambiguous shell symlinks fail without
+  mutation;
 - active old service is stopped natively and restored if Homebrew fails before replacement;
 - active old service upgrades, accepts preview `0` or `2`, then starts only after explicit execution approval;
 - preview `1` leaves the new service stopped and prints rollback/start guidance;
 - stopped stays stopped;
 - absent stays absent;
 - legacy `excludes` warns and prints `config migrate`;
-- the helper requires exact `0.4.0`.
+- the helper requires exact `0.4.0`;
+- a changed or malicious `PATH`/shell command cache between phases cannot
+  replace the exact binary used for resume, config, preview, or reviewed
+  execution.
 
 - [ ] **Step 2: Add the failing test entry point**
 
@@ -440,6 +495,23 @@ The helper accepts:
 ```
 
 It records old state before replacement, uses native launchctl/systemctl commands compatible with old binaries, registers a trap only until replacement succeeds, validates exact version, runs `config`, generates a dry-run review, accepts status `0` or `2`, and requires a supplied review ID before cleanup. It never enables a previously stopped/absent service.
+
+Before reading service state or mutating anything, resolve the visible
+`car-go-clean` to an absolute executable and prove that `--method` owns it.
+Homebrew ownership requires both installed-formula inventory/prefix and exact
+physical resolution of the visible command to that formula binary. Shell
+ownership rejects a Homebrew-owned command, symlinked or ambiguous targets,
+and unwritable binary/parent paths. Cross-method migration is unsupported in
+this helper; users explicitly uninstall and then follow the fresh-install
+journey.
+
+The helper is intentionally two phase. After replacement, derive and validate
+the exact v0.4 binary path (the exact keg binary for Homebrew and the validated
+existing target for shell), then persist it with method, old version, original
+service state, phase, and review ID in an atomically replaced mode-0600 session.
+The line parser accepts every field exactly once and never uses `source` or
+`eval`. Every resumed version/config/preview/review invocation uses the
+persisted absolute path and never re-resolves bare `car-go-clean`.
 
 - [ ] **Step 4: Publish the helper with release assets**
 
@@ -554,7 +626,11 @@ make test
 
 - [ ] **Step 3: Run command-state matrices**
 
-Run the service fake-runner matrix and upgrade helper matrix for macOS/Linux × installed/enabled/active combinations and v0.2/v0.3 × active/stopped/absent.
+Run the service fake-runner matrix and upgrade helper matrix for macOS/Linux ×
+installed/enabled/active combinations and v0.2/v0.3 × active/stopped/absent.
+Every successful preview cell asserts mode 0600 on the session. Every actual
+phase-two execution branch asserts exactly one `run --review 42`; preview
+failure/non-execution branches assert zero.
 
 - [ ] **Step 4: Inspect the exact diff**
 

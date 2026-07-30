@@ -182,6 +182,15 @@ Configuration and state survive uninstall.
 The upgrade helper/recipe supports active, stopped, and absent service states
 from both v0.2.0 and v0.3.0.
 
+Before reading service state or stopping anything, the helper resolves the
+visible command and proves the requested method owns that exact installation.
+Homebrew requires installed-formula inventory and an exact physical match
+between the visible command and the formula-prefix binary. Shell rejects a
+Homebrew-owned command, symlinks, ambiguous/non-absolute paths, and unwritable
+replacement targets. `--method` describes current ownership, not a desired
+migration destination. Cross-method migration is a separate explicit
+uninstall/fresh-install journey outside the v0.4 helper.
+
 For an active old service:
 
 1. Record old status using the old supported `service status`.
@@ -189,17 +198,24 @@ For an active old service:
    existing definition.
 3. Register failure recovery that uses old supported behavior to restore the
    service if Homebrew fails before replacing the old binary.
-4. Upgrade the binary and require exact `0.4.0`.
-5. Run `car-go-clean config` under the new binary to surface a deprecated
+4. Upgrade the binary, derive its exact absolute path, and require exact
+   `0.4.0` through that path.
+5. Persist a strict, atomically replaced mode-0600 session containing the
+   method, old version/state, phase, review ID, and exact binary path. Parsing
+   accepts every field once and never uses `source` or `eval`.
+6. Run config under the exact new binary to surface a deprecated
    legacy `excludes` key before anything depends on config loading, and print
    the `config migrate` invocation. A deprecated key is a warning, not a stop.
-6. Use v0.4 to keep the service disabled while generating a dry-run plan.
-7. Treat preview exit `0` **and** exit `2` as success, printing the
+7. Use the exact v0.4 path to keep the service disabled while generating a
+   dry-run plan.
+8. Treat preview exit `0` **and** exit `2` as success, printing the
    incomplete-coverage detail for `2`. Only exit `1` is a failed preview.
    Gating on "exit code is zero" here would strand every macOS operator whose
    home directory contains a TCC-protected folder.
-8. If the preview succeeded, execute the operator-approved path and explicitly
-   `service start`.
+9. If the preview succeeded, resume from the private session, validate and
+   execute the operator-approved review through the persisted exact binary
+   path, and explicitly restore only a service that was originally active.
+   A changed `PATH` or shell command cache cannot redirect phase two.
 
 If Homebrew fails before replacing the binary, restore the previously active
 old service and report the failure. If the binary is replaced but its version

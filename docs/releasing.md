@@ -105,7 +105,8 @@ gh pr merge "$formula_pr" --repo dcchuck/homebrew-tap --merge --delete-branch
 
 Exercise the released `car-go-clean-upgrade.sh` against v0.2.0 and v0.3.0
 fixtures for active, stopped, and absent service state. The helper is the
-supported two-phase path:
+supported two-phase path. `--method` must name the owner of the existing
+visible binary; it is not a requested migration destination:
 
 ```sh
 ./car-go-clean-upgrade.sh --version 0.4.0 --method homebrew
@@ -116,18 +117,22 @@ supported two-phase path:
 ```
 
 Phase one records old state, stops an active old service with the native
-manager, installs exact v0.4.0, validates config, and creates
-`run --dry-run --all` review state. Preview exit `0` and `2` are accepted;
-exit `1` stops with recovery guidance. Its session makes the same phase-one
-command resumable. Phase two executes only the supplied persisted ID, accepts
-reviewed exit `0` or `2`, and restores only a service that was originally
-active. A pre-replacement failure rolls an active old service back; an
-ambiguous post-replacement execution fails closed and must not be repeated
-blindly.
+manager, upgrades through the verified owner, derives and validates the exact
+v0.4.0 binary, validates config, and creates `run --dry-run --all` review
+state. Preview exit `0` and `2` are accepted; exit `1` stops with recovery
+guidance. Its mode-0600 session persists that absolute binary path and makes
+the same phase-one command resumable. Phase two invokes that exact path,
+executes only the supplied persisted ID, accepts reviewed exit `0` or `2`, and
+restores only a service that was originally active. A pre-replacement failure
+rolls an active old service back; an ambiguous post-replacement execution
+fails closed and must not be repeated blindly.
 
-Use `--method shell` consistently in both phases when validating the shell
-installer route. Confirm the helper warns on v0.4's still-supported legacy
-`excludes` key and points to `car-go-clean config migrate`; v0.5 removes that
+Use `--method shell` consistently in both phases only when the visible old
+binary is shell-owned; use `homebrew` only when the visible old binary resolves
+to the installed formula. Cross-method migration is deliberately outside this
+helper and requires an explicit uninstall followed by a fresh install. Confirm
+the helper warns on v0.4's still-supported legacy `excludes` key and points to
+`car-go-clean config migrate`; v0.5 removes that
 key.
 
 Finally run the [fresh-install validation](fresh-install-validation.md) in a

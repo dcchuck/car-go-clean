@@ -23,7 +23,9 @@ Do not treat the Rust 1.95 pass as proof of Rust 1.88 compatibility.
 
 This is a fresh-install rehearsal. Verify absence before any replacement
 command; an existing v0.2.0 or v0.3.0 must use the release's state-preserving
-upgrade helper instead.
+upgrade helper instead. Its `--method` must match the owner of the existing
+visible binary. To change installation methods, uninstall explicitly and run a
+separate fresh-install rehearsal; the v0.4 helper does not migrate ownership.
 
 ```sh
 if command -v car-go-clean >/dev/null 2>&1

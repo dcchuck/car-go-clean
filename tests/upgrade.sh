@@ -6,6 +6,7 @@ upgrade="$root/packaging/release/car-go-clean-upgrade.sh"
 work_dir=$(mktemp -d)
 fake_bin="$work_dir/bin"
 case_root="$work_dir/cases"
+car_go_clean_fixture="$work_dir/car-go-clean-fixture"
 
 cleanup() {
     rm -rf "$work_dir"
@@ -29,10 +30,11 @@ test "$1" = "-u"
 printf '%s\n' 501
 EOF
 
-cat > "$fake_bin/car-go-clean" <<'EOF'
+cat > "$car_go_clean_fixture" <<'EOF'
 #!/bin/sh
 set -eu
 printf 'car-go-clean %s\n' "$*" >> "$CALL_LOG"
+printf '%s\n' "$0" >> "$BINARY_PATH_LOG"
 version=$(cat "$VERSION_FILE")
 if [ "${BREW_ROLLBACK_FIXTURE-0}" = 1 ]; then
     test "$(cat "$BREW_LINKED_FORMULA")" != unlinked
@@ -155,6 +157,12 @@ cat > "$fake_bin/brew" <<'EOF'
 set -eu
 printf 'brew %s\n' "$*" >> "$CALL_LOG"
 case "$1" in
+    --prefix)
+        test "$#" -eq 2
+        test "$2" = car-go-clean
+        test "${BREW_INSTALLED-1}" = 1
+        printf '%s\n' "$BREW_PREFIX"
+        ;;
     tap)
         test "$#" -eq 1
         cat "$BREW_TAPS_FILE"
@@ -321,7 +329,7 @@ else
 fi
 EOF
 
-chmod +x "$fake_bin"/*
+chmod +x "$fake_bin"/* "$car_go_clean_fixture"
 
 new_case() {
     name=$1
@@ -344,8 +352,11 @@ new_case() {
     brew_extracted_version_file="$current_case/brew-extracted-version"
     brew_installed_formula_file="$current_case/brew-installed-formula"
     output_file="$current_case/output"
-    mkdir -p "$home" "$state_dir"
+    binary_path_log="$current_case/binary-paths"
+    brew_prefix="$current_case/brew-prefix"
+    mkdir -p "$home" "$state_dir" "$brew_prefix/bin"
     : > "$call_log"
+    : > "$binary_path_log"
     printf '%s\n' "$old_version" > "$version_file"
     printf '%s\n' "$old_state" > "$service_state"
     printf 'dcchuck/tap\n' > "$brew_taps_file"
@@ -354,6 +365,18 @@ new_case() {
     : > "$brew_extracted_version_file"
     : > "$brew_installed_formula_file"
     rm -f "$executed_review"
+    cp "$car_go_clean_fixture" "$brew_prefix/bin/car-go-clean"
+    chmod +x "$brew_prefix/bin/car-go-clean"
+    rm -f "$fake_bin/car-go-clean"
+    case "$method" in
+        homebrew)
+            ln -s "$brew_prefix/bin/car-go-clean" "$fake_bin/car-go-clean"
+            ;;
+        shell)
+            cp "$car_go_clean_fixture" "$fake_bin/car-go-clean"
+            chmod +x "$fake_bin/car-go-clean"
+            ;;
+    esac
 
     USER=cgc-fixture
     TEST_PLATFORM=$platform
@@ -377,6 +400,8 @@ new_case() {
     BREW_LINKED_VERSION_FILE=$brew_linked_version_file
     BREW_EXTRACTED_VERSION_FILE=$brew_extracted_version_file
     BREW_INSTALLED_FORMULA_FILE=$brew_installed_formula_file
+    BREW_PREFIX=$brew_prefix
+    BINARY_PATH_LOG=$binary_path_log
     BREW_LINK_FAIL=0
     BREW_LINK_WRONG_VERSION=0
     ROLLBACK_EXPECTED_VERSION=$old_version
@@ -399,6 +424,7 @@ new_case() {
     export BREW_ROLLBACK_FIXTURE BREW_TAPS_FILE BREW_LINKED_FORMULA
     export BREW_LINKED_VERSION_FILE BREW_EXTRACTED_VERSION_FILE
     export BREW_INSTALLED_FORMULA_FILE BREW_LINK_FAIL BREW_LINK_WRONG_VERSION
+    export BREW_PREFIX BINARY_PATH_LOG
     export ROLLBACK_EXPECTED_VERSION
     export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
     export BREW_UPDATE_FAIL BREW_REPLACE_FAIL SHELL_DOWNLOAD_FAIL
@@ -431,7 +457,7 @@ assert_status() {
 }
 
 assert_output_has() {
-    grep -F "$1" "$output_file" >/dev/null || {
+    grep -F -- "$1" "$output_file" >/dev/null || {
         echo "missing output: $1" >&2
         cat "$output_file" >&2
         exit 1
@@ -439,7 +465,7 @@ assert_output_has() {
 }
 
 assert_calls_have() {
-    grep -F "$1" "$call_log" >/dev/null || {
+    grep -F -- "$1" "$call_log" >/dev/null || {
         echo "missing call: $1" >&2
         cat "$call_log" >&2
         exit 1
@@ -447,11 +473,21 @@ assert_calls_have() {
 }
 
 assert_calls_lack() {
-    if grep -F "$1" "$call_log" >/dev/null; then
+    if grep -F -- "$1" "$call_log" >/dev/null; then
         echo "unexpected call: $1" >&2
         cat "$call_log" >&2
         exit 1
     fi
+}
+
+assert_review_call_count() {
+    expected=$1
+    actual=$(grep -c '^car-go-clean run --review 42$' "$call_log" || :)
+    test "$actual" -eq "$expected" || {
+        echo "expected $expected reviewed executions, got $actual" >&2
+        cat "$call_log" >&2
+        exit 1
+    }
 }
 
 assert_session_mode_600() {
@@ -584,11 +620,13 @@ run_upgrade_outcome_matrix_cell() {
     case "$preview_outcome" in
         0|2)
             assert_status 0
+            assert_session_mode_600
             test "$(session_value phase)" = review_pending
             test "$(session_value review_id)" = 42
             assert_matrix_service_stopped
             : > "$call_log"
             run_upgrade --version 0.4.0 --method "$method" --execute-review 42
+            assert_review_call_count 1
             case "$execute_outcome" in
                 0|2)
                     assert_status 0
@@ -610,6 +648,7 @@ run_upgrade_outcome_matrix_cell() {
             test "$(session_value review_id)" = none
             assert_matrix_service_stopped
             assert_calls_lack "car-go-clean run --review"
+            assert_review_call_count 0
             ;;
     esac
 }
@@ -640,6 +679,92 @@ done
 # Coverage gate: 2 platforms × 2 versions × 3 service states ×
 # 3 preview outcomes × 3 execute outcomes.
 test "$matrix_cells" -eq 108
+
+# Upgrade method follows the owner of the visible command and rejects ambiguity
+# before stopping a service or replacing a binary.
+new_case shell-shadows-brew Darwin 0.2.0 running shell
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+assert_output_has "visible car-go-clean"
+assert_output_has "--method shell"
+assert_calls_lack "launchctl bootout"
+assert_calls_lack "brew update"
+assert_calls_lack "installer "
+
+new_case brew-visible-with-shell-request Darwin 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+assert_output_has "Homebrew"
+assert_output_has "--method homebrew"
+assert_calls_lack "launchctl bootout"
+assert_calls_lack "brew update"
+assert_calls_lack "installer "
+
+new_case homebrew-method-without-formula Linux 0.2.0 running shell
+BREW_INSTALLED=0
+export BREW_INSTALLED
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+assert_output_has "not owned by Homebrew"
+assert_calls_lack "systemctl --user stop"
+assert_calls_lack "brew update"
+
+new_case ambiguous-shell-symlink Linux 0.3.0 running shell
+mv "$fake_bin/car-go-clean" "$current_case/real-shell-binary"
+ln -s "$current_case/real-shell-binary" "$fake_bin/car-go-clean"
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+assert_output_has "symlink"
+assert_calls_lack "systemctl --user stop"
+assert_calls_lack "installer "
+
+# Phase two uses the exact binary path persisted by phase one even when PATH
+# later resolves a malicious binary.
+new_case phase-two-malicious-path Darwin 0.2.0 stopped homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+persisted_binary=$(session_value binary_path)
+expected_brew_binary=$(CDPATH='' cd -P "$brew_prefix/bin" && pwd -P)/car-go-clean
+test "$persisted_binary" = "$expected_brew_binary"
+rm -f "$fake_bin/car-go-clean"
+cat > "$fake_bin/car-go-clean" <<'EOF'
+#!/bin/sh
+echo "malicious PATH binary invoked" >&2
+exit 88
+EOF
+chmod +x "$fake_bin/car-go-clean"
+: > "$binary_path_log"
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+assert_review_call_count 1
+test "$(sort -u "$binary_path_log")" = "$persisted_binary"
+
+new_case phase-two-stale-shell-path Linux 0.3.0 stopped shell
+run_upgrade --version 0.4.0 --method shell
+assert_status 0
+persisted_binary=$(session_value binary_path)
+expected_shell_binary=$(CDPATH='' cd -P "$fake_bin" && pwd -P)/car-go-clean
+test "$persisted_binary" = "$expected_shell_binary"
+mkdir -p "$current_case/malicious-bin"
+cat > "$current_case/malicious-bin/car-go-clean" <<'EOF'
+#!/bin/sh
+echo "stale shell/PATH binary invoked" >&2
+exit 89
+EOF
+chmod +x "$current_case/malicious-bin/car-go-clean"
+: > "$binary_path_log"
+: > "$call_log"
+if PATH="$current_case/malicious-bin:$fake_bin:/usr/bin:/bin" HOME="$home" \
+    "$upgrade" --version 0.4.0 --method shell --execute-review 42 \
+    > "$output_file" 2>&1; then
+    run_status=0
+else
+    run_status=$?
+fi
+assert_status 0
+assert_review_call_count 1
+test "$(sort -u "$binary_path_log")" = "$persisted_binary"
 
 # v0.2/v0.3 and active/stopped/absent states stay exact across both platforms.
 for fixture in \
@@ -770,6 +895,15 @@ assert_output_has "car-go-clean service start"
 
 CONFIG_EXIT=0
 export CONFIG_EXIT
+persisted_binary=$(session_value binary_path)
+rm -f "$fake_bin/car-go-clean"
+cat > "$fake_bin/car-go-clean" <<'EOF'
+#!/bin/sh
+echo "malicious preview-resume PATH binary invoked" >&2
+exit 87
+EOF
+chmod +x "$fake_bin/car-go-clean"
+: > "$binary_path_log"
 : > "$call_log"
 run_upgrade --version 0.4.0 --method homebrew
 assert_status 0
@@ -777,6 +911,7 @@ test "$(session_value phase)" = review_pending
 test "$(session_value review_id)" = 42
 assert_calls_lack "brew "
 assert_calls_lack "service status"
+test "$(sort -u "$binary_path_log")" = "$persisted_binary"
 test "$(cat "$service_state")" = stopped
 
 new_case stopped-preview-failure Linux 0.3.0 stopped shell
@@ -1086,7 +1221,9 @@ test "$run_status" -ne 0
 assert_output_has "symlink"
 rm "$state_dir/upgrade-session"
 
-printf 'format=2\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\n' \
+manual_binary=$(CDPATH='' cd -P "$brew_prefix/bin" && pwd -P)/car-go-clean
+printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\n' \
+    "$manual_binary" \
     > "$state_dir/upgrade-session"
 chmod 644 "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
@@ -1098,6 +1235,30 @@ printf 'unexpected=value\n' >> "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
 assert_output_has "malformed"
+
+printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=relative/car-go-clean\n' \
+    > "$state_dir/upgrade-session"
+chmod 600 "$state_dir/upgrade-session"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+assert_output_has "malformed"
+assert_calls_lack "run --review"
+
+printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\nbinary_path=%s\n' \
+    "$manual_binary" "$manual_binary" \
+    > "$state_dir/upgrade-session"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+assert_output_has "malformed"
+assert_calls_lack "run --review"
+
+printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\n' \
+    "$fake_bin/car-go-clean" \
+    > "$state_dir/upgrade-session"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+assert_output_has "no longer exact"
+assert_calls_lack "run --review"
 
 # Exact v0.4.0, known methods, complete options, and supported OSes only.
 new_case argument-validation Darwin 0.2.0 stopped homebrew

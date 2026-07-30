@@ -23,6 +23,13 @@ Neither binary installation path enables or starts the daemon. Users opt in
 with `car-go-clean service install`, and restart an existing service after an
 upgrade with `car-go-clean service restart`.
 
+The separate v0.4 state-preserving helper upgrades existing v0.2/v0.3
+installations only through their current owner. Its `--method homebrew|shell`
+argument must match the visible command's verified origin; it is not a
+cross-method migration option. The helper persists the exact replacement
+binary path in its private two-phase session and never substitutes a later
+`PATH` resolution for config, preview, or reviewed execution.
+
 Cargo remains the source/developer install path for a checked-out repository:
 
 ```bash
