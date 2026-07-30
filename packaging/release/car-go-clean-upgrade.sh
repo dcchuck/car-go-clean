@@ -340,6 +340,41 @@ validate_resumed_binary() {
         die "expected car-go-clean 0.4.0 while resuming, found $resumed_version"
 }
 
+print_homebrew_rollback_block() {
+    echo "Copy and run this entire rollback block; it stops at the first failing command:" >&2
+    echo "# BEGIN car-go-clean exact Homebrew rollback" >&2
+    echo "if (" >&2
+    echo "    [ -n \"\${USER-}\" ] &&" >&2
+    echo "    rollback_tap=\"\$USER/car-go-clean-rollback\" &&" >&2
+    echo "    rollback_formula=\"\$rollback_tap/car-go-clean@$session_old_version\" &&" >&2
+    echo "    { brew tap | grep -Fqx -- \"\$rollback_tap\" || brew tap-new \"\$rollback_tap\"; } &&" >&2
+    echo "    brew extract --force --version=$session_old_version dcchuck/tap/car-go-clean \"\$rollback_tap\" &&" >&2
+    echo "    brew unlink car-go-clean &&" >&2
+    echo "    brew install \"\$rollback_formula\" &&" >&2
+    echo "    brew link --force --overwrite \"\$rollback_formula\" &&" >&2
+    echo "    rollback_version=\$(car-go-clean version) &&" >&2
+    if [ "$session_state" = active ]; then
+        echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
+        echo "    car-go-clean service start" >&2
+    else
+        echo "    [ \"\$rollback_version\" = $session_old_version ]" >&2
+    fi
+    echo "); then" >&2
+    echo "    echo \"Exact car-go-clean $session_old_version rollback validated.\"" >&2
+    echo "else" >&2
+    case "$session_state" in
+        active)
+            echo "    echo \"Rollback or service restoration failed; the chain stopped at the first failing command.\" >&2" >&2
+            ;;
+        stopped|absent)
+            echo "    echo \"Rollback failed; no service start was requested.\" >&2" >&2
+            ;;
+    esac
+    echo "    false" >&2
+    echo "fi" >&2
+    echo "# END car-go-clean exact Homebrew rollback" >&2
+}
+
 preview_recovery_guidance() {
     echo "The exact v0.4.0 binary is installed, but preview approval is still pending." >&2
     case "$session_state" in
@@ -359,11 +394,7 @@ preview_recovery_guidance() {
         case "$session_method" in
             homebrew)
                 echo "To roll the binary back to exact $session_old_version with Homebrew:" >&2
-                echo "  brew tap-new \"\$USER/car-go-clean-rollback\"" >&2
-                printf "  brew extract --version=%s dcchuck/tap/car-go-clean \"\$USER/car-go-clean-rollback\"\n" \
-                    "$session_old_version" >&2
-                printf "  brew install \"\$USER/car-go-clean-rollback/car-go-clean@%s\"\n" \
-                    "$session_old_version" >&2
+                print_homebrew_rollback_block
                 ;;
             shell)
                 rollback_installer=car-go-clean-installer-v$session_old_version.sh
@@ -373,11 +404,15 @@ preview_recovery_guidance() {
                 install_dir_expression="\$(dirname \"\$(command -v car-go-clean)\")"
                 printf '  sh %s --version %s --install-dir "%s"\n' \
                     "$rollback_installer" "$session_old_version" "$install_dir_expression" >&2
+                if [ "$session_state" = active ]; then
+                    echo "Only after a successful rollback, restore the prior state with:" >&2
+                    echo "  car-go-clean service start" >&2
+                fi
                 ;;
         esac
     fi
-    if [ "$session_state" = active ]; then
-        echo "Only after a successful preview/cleanup or rollback, restore the prior state with:" >&2
+    if [ "$session_state" = active ] && [ "$session_old_version" = absent ]; then
+        echo "Only after a successful preview/cleanup, restore the prior state with:" >&2
         echo "  car-go-clean service start" >&2
     fi
 }

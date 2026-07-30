@@ -34,6 +34,10 @@ cat > "$fake_bin/car-go-clean" <<'EOF'
 set -eu
 printf 'car-go-clean %s\n' "$*" >> "$CALL_LOG"
 version=$(cat "$VERSION_FILE")
+if [ "${BREW_ROLLBACK_FIXTURE-0}" = 1 ]; then
+    test "$(cat "$BREW_LINKED_FORMULA")" != unlinked
+    version=$(cat "$BREW_LINKED_VERSION_FILE")
+fi
 case "$*" in
     version)
         printf '%s\n' "$version"
@@ -42,7 +46,16 @@ case "$*" in
         state=$(cat "$SERVICE_STATE")
         printf 'Service\n  Platform: fixture\n  Binary: fixture\n  Definition: fixture\n  State: %s\n' "$state"
         ;;
-    "service stop"|"service start")
+    "service start")
+        if [ "${BREW_ROLLBACK_FIXTURE-0}" = 1 ]; then
+            test "$version" = "$ROLLBACK_EXPECTED_VERSION"
+            printf 'running\n' > "$SERVICE_STATE"
+            exit 0
+        fi
+        echo "upgrade helper called a v0.2/v0.3 lifecycle verb" >&2
+        exit 95
+        ;;
+    "service stop")
         echo "upgrade helper called a v0.2/v0.3 lifecycle verb" >&2
         exit 95
         ;;
@@ -142,19 +155,84 @@ cat > "$fake_bin/brew" <<'EOF'
 set -eu
 printf 'brew %s\n' "$*" >> "$CALL_LOG"
 case "$1" in
+    tap)
+        test "$#" -eq 1
+        cat "$BREW_TAPS_FILE"
+        ;;
+    tap-new)
+        test "$#" -eq 2
+        printf '%s\n' "$2" >> "$BREW_TAPS_FILE"
+        ;;
+    extract)
+        test "${BREW_ROLLBACK_FIXTURE-0}" = 1
+        test "$#" -eq 5
+        test "$2" = --force
+        case "$3" in
+            --version=*) extracted_version=${3#--version=} ;;
+            *) exit 64 ;;
+        esac
+        test "$4" = dcchuck/tap/car-go-clean
+        grep -Fqx -- "$5" "$BREW_TAPS_FILE"
+        printf '%s\n' "$extracted_version" > "$BREW_EXTRACTED_VERSION_FILE"
+        ;;
+    unlink)
+        test "${BREW_ROLLBACK_FIXTURE-0}" = 1
+        test "$#" -eq 2
+        test "$2" = car-go-clean
+        printf 'unlinked\n' > "$BREW_LINKED_FORMULA"
+        ;;
+    link)
+        test "${BREW_ROLLBACK_FIXTURE-0}" = 1
+        test "$#" -eq 4
+        test "$2" = --force
+        test "$3" = --overwrite
+        test "$4" = "$(cat "$BREW_INSTALLED_FORMULA_FILE")"
+        test "${BREW_LINK_FAIL-0}" != 1
+        printf '%s\n' "$4" > "$BREW_LINKED_FORMULA"
+        if [ "${BREW_LINK_WRONG_VERSION-0}" = 1 ]; then
+            printf '0.4.0\n' > "$BREW_LINKED_VERSION_FILE"
+        else
+            cat "$BREW_EXTRACTED_VERSION_FILE" > "$BREW_LINKED_VERSION_FILE"
+        fi
+        ;;
     update)
         test "${BREW_UPDATE_FAIL-0}" != 1
         ;;
     list)
         test "${BREW_INSTALLED-1}" = 1
         ;;
-    upgrade|install)
+    upgrade)
         test "${BREW_REPLACE_FAIL-0}" != 1
         if [ "${WRONG_NEW_VERSION-0}" = 1 ]; then
             printf '0.4.1\n' > "$VERSION_FILE"
+            printf '0.4.1\n' > "$BREW_LINKED_VERSION_FILE"
         else
             printf '0.4.0\n' > "$VERSION_FILE"
+            printf '0.4.0\n' > "$BREW_LINKED_VERSION_FILE"
         fi
+        printf 'car-go-clean\n' > "$BREW_LINKED_FORMULA"
+        ;;
+    install)
+        case "${2-}" in
+            */car-go-clean@*)
+                test "${BREW_ROLLBACK_FIXTURE-0}" = 1
+                test "$(cat "$BREW_LINKED_FORMULA")" = unlinked
+                extracted_version=$(cat "$BREW_EXTRACTED_VERSION_FILE")
+                test "$2" = "${USER}/car-go-clean-rollback/car-go-clean@$extracted_version"
+                printf '%s\n' "$2" > "$BREW_INSTALLED_FORMULA_FILE"
+                ;;
+            *)
+                test "${BREW_REPLACE_FAIL-0}" != 1
+                if [ "${WRONG_NEW_VERSION-0}" = 1 ]; then
+                    printf '0.4.1\n' > "$VERSION_FILE"
+                    printf '0.4.1\n' > "$BREW_LINKED_VERSION_FILE"
+                else
+                    printf '0.4.0\n' > "$VERSION_FILE"
+                    printf '0.4.0\n' > "$BREW_LINKED_VERSION_FILE"
+                fi
+                printf 'car-go-clean\n' > "$BREW_LINKED_FORMULA"
+                ;;
+        esac
         ;;
     *)
         exit 64
@@ -260,13 +338,24 @@ new_case() {
     executed_review="$current_case/executed-review"
     execute_marker="$current_case/execute-marker"
     restore_signal_marker="$current_case/restore-signal-marker"
+    brew_taps_file="$current_case/brew-taps"
+    brew_linked_formula="$current_case/brew-linked-formula"
+    brew_linked_version_file="$current_case/brew-linked-version"
+    brew_extracted_version_file="$current_case/brew-extracted-version"
+    brew_installed_formula_file="$current_case/brew-installed-formula"
     output_file="$current_case/output"
     mkdir -p "$home" "$state_dir"
     : > "$call_log"
     printf '%s\n' "$old_version" > "$version_file"
     printf '%s\n' "$old_state" > "$service_state"
+    printf 'dcchuck/tap\n' > "$brew_taps_file"
+    printf 'car-go-clean\n' > "$brew_linked_formula"
+    printf '%s\n' "$old_version" > "$brew_linked_version_file"
+    : > "$brew_extracted_version_file"
+    : > "$brew_installed_formula_file"
     rm -f "$executed_review"
 
+    USER=cgc-fixture
     TEST_PLATFORM=$platform
     VERSION_FILE=$version_file
     SERVICE_STATE=$service_state
@@ -282,6 +371,15 @@ new_case() {
     EXECUTE_FIFO=
     EXECUTE_MARKER=
     EXECUTE_SIGNAL=0
+    BREW_ROLLBACK_FIXTURE=0
+    BREW_TAPS_FILE=$brew_taps_file
+    BREW_LINKED_FORMULA=$brew_linked_formula
+    BREW_LINKED_VERSION_FILE=$brew_linked_version_file
+    BREW_EXTRACTED_VERSION_FILE=$brew_extracted_version_file
+    BREW_INSTALLED_FORMULA_FILE=$brew_installed_formula_file
+    BREW_LINK_FAIL=0
+    BREW_LINK_WRONG_VERSION=0
+    ROLLBACK_EXPECTED_VERSION=$old_version
     LEGACY_EXCLUDES=0
     BREW_INSTALLED=1
     BREW_UPDATE_FAIL=0
@@ -293,11 +391,15 @@ new_case() {
     RESTORE_FAIL=0
     RESTORE_SIGNAL=0
     RESTORE_SIGNAL_MARKER=$restore_signal_marker
-    export TEST_PLATFORM VERSION_FILE SERVICE_STATE CALL_LOG EXECUTED_REVIEW
+    export USER TEST_PLATFORM VERSION_FILE SERVICE_STATE CALL_LOG EXECUTED_REVIEW
     export CAR_GO_CLEAN_UPGRADE_STATE_DIR REVIEW_ID PREVIEW_EXIT PREVIEW_TEXT
     export CONFIG_EXIT EXECUTE_EXIT LEGACY_EXCLUDES BREW_INSTALLED
     export EXECUTE_ERROR RESTORE_FAIL
     export EXECUTE_FIFO EXECUTE_MARKER EXECUTE_SIGNAL
+    export BREW_ROLLBACK_FIXTURE BREW_TAPS_FILE BREW_LINKED_FORMULA
+    export BREW_LINKED_VERSION_FILE BREW_EXTRACTED_VERSION_FILE
+    export BREW_INSTALLED_FORMULA_FILE BREW_LINK_FAIL BREW_LINK_WRONG_VERSION
+    export ROLLBACK_EXPECTED_VERSION
     export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
     export BREW_UPDATE_FAIL BREW_REPLACE_FAIL SHELL_DOWNLOAD_FAIL
     export SHELL_REPLACE_FAIL WRONG_NEW_VERSION
@@ -361,6 +463,27 @@ assert_session_mode_600() {
         *) mode=$(stat -c '%a' "$session") ;;
     esac
     test "$mode" = 600
+}
+
+capture_homebrew_rollback() {
+    rollback_script="$current_case/homebrew-rollback.sh"
+    sed -n \
+        '/^# BEGIN car-go-clean exact Homebrew rollback$/,/^# END car-go-clean exact Homebrew rollback$/p' \
+        "$output_file" > "$rollback_script"
+    test "$(grep -c '^# BEGIN car-go-clean exact Homebrew rollback$' "$rollback_script")" -eq 1
+    test "$(grep -c '^# END car-go-clean exact Homebrew rollback$' "$rollback_script")" -eq 1
+}
+
+run_captured_homebrew_rollback() {
+    BREW_ROLLBACK_FIXTURE=1
+    export BREW_ROLLBACK_FIXTURE
+    rollback_output="$current_case/homebrew-rollback.out"
+    if PATH="$fake_bin:/usr/bin:/bin" HOME="$home" USER="$USER" \
+        sh "$rollback_script" > "$rollback_output" 2>&1; then
+        rollback_status=0
+    else
+        rollback_status=$?
+    fi
 }
 
 complete_upgrade() {
@@ -513,7 +636,7 @@ test "$(session_value old_version)" = 0.2.0
 test "$(session_value review_id)" = none
 test "$(cat "$service_state")" = stopped
 assert_output_has "$upgrade --version 0.4.0 --method homebrew"
-assert_output_has "brew extract --version=0.2.0"
+assert_output_has "brew extract --force --version=0.2.0"
 assert_output_has "car-go-clean service start"
 
 CONFIG_EXIT=0
@@ -545,6 +668,93 @@ run_upgrade --version 0.4.0 --method shell
 assert_status 0
 test "$(session_value phase)" = review_pending
 assert_calls_lack "curl "
+
+# Printed Homebrew rollback blocks are executable, exact, and state preserving.
+for fixture in \
+    rollback-v02-active:0.2.0:running:create \
+    rollback-v03-active:0.3.0:running:reuse \
+    rollback-v02-stopped:0.2.0:stopped:reuse \
+    rollback-v03-absent:0.3.0:'not installed':create
+do
+    old_ifs=$IFS
+    IFS=:
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" Darwin "$2" "$3" homebrew
+    tap_mode=$4
+    if [ "$tap_mode" = reuse ]; then
+        printf '%s/car-go-clean-rollback\n' "$USER" >> "$brew_taps_file"
+    fi
+    CONFIG_EXIT=1
+    export CONFIG_EXIT
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    capture_homebrew_rollback
+
+    : > "$call_log"
+    run_captured_homebrew_rollback
+    test "$rollback_status" -eq 0
+    test "$(cat "$brew_linked_version_file")" = "$2"
+    test "$(cat "$brew_linked_formula")" = \
+        "$USER/car-go-clean-rollback/car-go-clean@$2"
+    resolved_version=$(PATH="$fake_bin:/usr/bin:/bin" car-go-clean version)
+    test "$resolved_version" = "$2"
+    assert_calls_have "brew extract --force --version=$2 dcchuck/tap/car-go-clean $USER/car-go-clean-rollback"
+    assert_calls_have "brew unlink car-go-clean"
+    assert_calls_have "brew install $USER/car-go-clean-rollback/car-go-clean@$2"
+    assert_calls_have "brew link --force --overwrite $USER/car-go-clean-rollback/car-go-clean@$2"
+    case "$tap_mode" in
+        create) assert_calls_have "brew tap-new $USER/car-go-clean-rollback" ;;
+        reuse) assert_calls_lack "brew tap-new $USER/car-go-clean-rollback" ;;
+    esac
+    case "$3" in
+        running)
+            test "$(cat "$service_state")" = running
+            awk '
+                /^car-go-clean version$/ { validated = NR }
+                /^car-go-clean service start$/ {
+                    if (!validated || validated >= NR) exit 1
+                    started = 1
+                }
+                END { if (!started) exit 1 }
+            ' "$call_log"
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$3"
+            assert_calls_have "car-go-clean version"
+            assert_calls_lack "car-go-clean service start"
+            ;;
+    esac
+done
+
+# Link and exact-version failures short-circuit before active-service restart.
+for failure in link version
+do
+    case "$failure" in
+        link) old_version=0.2.0 ;;
+        version) old_version=0.3.0 ;;
+    esac
+    new_case "rollback-$failure-failure" Darwin "$old_version" running homebrew
+    CONFIG_EXIT=1
+    export CONFIG_EXIT
+    run_upgrade --version 0.4.0 --method homebrew
+    test "$run_status" -ne 0
+    capture_homebrew_rollback
+    case "$failure" in
+        link) BREW_LINK_FAIL=1 ;;
+        version) BREW_LINK_WRONG_VERSION=1 ;;
+    esac
+    export BREW_LINK_FAIL BREW_LINK_WRONG_VERSION
+    : > "$call_log"
+    run_captured_homebrew_rollback
+    test "$rollback_status" -ne 0
+    test "$(cat "$service_state")" = stopped
+    assert_calls_lack "car-go-clean service start"
+    case "$failure" in
+        link) assert_calls_lack "car-go-clean version" ;;
+        version) assert_calls_have "car-go-clean version" ;;
+    esac
+done
 
 new_case preview-failure Linux 0.3.0 running homebrew
 PREVIEW_EXIT=1
