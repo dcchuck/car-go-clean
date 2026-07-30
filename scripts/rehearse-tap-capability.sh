@@ -113,8 +113,13 @@ load_state() {
             die "tap cleanup state contains an invalid rehearsal branch"
             ;;
     esac
-    case "$state_branch_run_id:$state_branch_run_attempt" in
-        *[!0-9:]*|:*|*:)
+    case "$state_branch_run_id" in
+        ''|*[!0-9]*)
+            die "tap cleanup state contains an invalid rehearsal branch"
+            ;;
+    esac
+    case "$state_branch_run_attempt" in
+        ''|*[!0-9]*)
             die "tap cleanup state contains an invalid rehearsal branch"
             ;;
     esac

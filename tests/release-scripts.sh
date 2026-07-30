@@ -1013,30 +1013,42 @@ then
     exit 1
 fi
 corrupt_state="$tap_corrupt_branch/runner-temp/car-go-clean-tap-rehearsal-state"
-sed "s|^branch=.*|branch=rehearsal/car-go-clean-4242-3';echo-corrupt|" \
-    "$corrupt_state" > "$corrupt_state.corrupt"
-chmod 600 "$corrupt_state.corrupt"
-mv "$corrupt_state.corrupt" "$corrupt_state"
-corrupt_calls_before=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
-corrupt_cleanup_output="$tap_corrupt_branch/cleanup-output"
-if run_tap_cleanup_hook \
-    "$tap_corrupt_branch" \
-    > "$corrupt_cleanup_output" 2>&1
-then
-    echo "unexpected success: corrupt loaded rehearsal branch" >&2
-    exit 1
-fi
-corrupt_calls_after=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
-test "$corrupt_calls_before" -eq "$corrupt_calls_after"
-grep -Fq 'tap cleanup state contains an invalid rehearsal branch' \
-    "$corrupt_cleanup_output"
-test "$(cat "$tap_corrupt_branch/pr-state")" = open-draft
-test -n "$(
-    git --git-dir="$tap_corrupt_branch/origin.git" for-each-ref \
-        --format='%(refname)' refs/heads/rehearsal
-)"
-test -f "$corrupt_state"
-test -x "$tap_corrupt_branch/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+cp "$corrupt_state" "$corrupt_state.valid"
+corrupt_case=0
+for corrupt_branch in \
+    "rehearsal/car-go-clean-42:42-3" \
+    "rehearsal/car-go-clean-4242-3:3" \
+    "rehearsal/car-go-clean-4242-3-4" \
+    "rehearsal/car-go-clean--3" \
+    "rehearsal/car-go-clean-4242-" \
+    "rehearsal/car-go-clean-4242-3';echo-corrupt"
+do
+    corrupt_case=$((corrupt_case + 1))
+    sed "s|^branch=.*|branch=$corrupt_branch|" \
+        "$corrupt_state.valid" > "$corrupt_state.corrupt"
+    chmod 600 "$corrupt_state.corrupt"
+    mv "$corrupt_state.corrupt" "$corrupt_state"
+    corrupt_calls_before=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
+    corrupt_cleanup_output="$tap_corrupt_branch/cleanup-output-$corrupt_case"
+    if run_tap_cleanup_hook \
+        "$tap_corrupt_branch" \
+        > "$corrupt_cleanup_output" 2>&1
+    then
+        echo "unexpected success: corrupt loaded rehearsal branch" >&2
+        exit 1
+    fi
+    corrupt_calls_after=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
+    test "$corrupt_calls_before" -eq "$corrupt_calls_after"
+    grep -Fq 'tap cleanup state contains an invalid rehearsal branch' \
+        "$corrupt_cleanup_output"
+    test "$(cat "$tap_corrupt_branch/pr-state")" = open-draft
+    test -n "$(
+        git --git-dir="$tap_corrupt_branch/origin.git" for-each-ref \
+            --format='%(refname)' refs/heads/rehearsal
+    )"
+    test -f "$corrupt_state"
+    test -x "$tap_corrupt_branch/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+done
 
 tap_pr_head_mismatch="$work/tap-pr-head-mismatch"
 mkdir -p "$tap_pr_head_mismatch/runner-temp"
