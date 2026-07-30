@@ -14,6 +14,21 @@ printf %s "$HOMEBREW_TAP_TOKEN" | gh secret set HOMEBREW_TAP_TOKEN --repo dcchuc
 
 The release preflight fails before hosting if this secret is empty or absent.
 
+Configure both publication environments before tagging. The authenticated
+GitHub user must be the intended release approver and must have repository
+Administration write permission:
+
+```bash
+gh auth status
+scripts/configure-release-environments.sh dcchuck/car-go-clean
+```
+
+The configurator is restricted to this repository. It replaces
+`v040-prerelease` and `v040-stable` with one required user reviewer,
+`prevent_self_review: false`, a zero wait timer, and no deployment-branch
+policy, then reads both environments back and fails unless the exact reviewer
+configuration is present.
+
 Inspect any older open formula pull request in `dcchuck/homebrew-tap` before
 tagging. Explicitly merge, close, or supersede it according to the version
 that should remain installable; do not silently overwrite its branch or the
@@ -46,25 +61,42 @@ fourth component, whitespace, or path characters.
 The workflow first creates a GitHub draft containing four target archives
 (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`), a matching
-`.sha256` file for each archive, and provenance attestations. After that draft
-exists, one publisher uploads `car-go-clean-installer.sh`,
-`car-go-clean-upgrade.sh`, and `car-go-clean-shell-assets.sha256` while the tap
-publisher pushes the generated formula only to the deterministic
-`formula/car-go-clean-vX.Y.Z` branch. It opens or updates a formula-bump pull request
-and never pushes the tap's default branch.
+`.sha256` file for each archive, and the four cargo-dist global assets: 12
+files in total. The shell publisher then adds
+`car-go-clean-installer.sh`, `car-go-clean-upgrade.sh`, and
+`car-go-clean-shell-assets.sha256`. The authenticated draft verification gate
+requires that exact 15-file inventory, the tag commit, checksums,
+attestations, exact executable version and health, the actual installer, no
+implicit service, and a locally rendered formula.
 
 [release verification workflow](https://github.com/dcchuck/car-go-clean/blob/main/.github/workflows/release-verify.yml)
-downloads each archive from the authenticated draft, verifies its checksum,
-smoke-tests the binary, and audits the formula from that deterministic pull
-request branch. The announce job publishes the draft only after every archive
-and formula check succeeds. A failed check leaves the GitHub Release in
-draft state for investigation. The workflow does not publish to crates.io or
-enable any daemon.
+must succeed before the `v040-prerelease` environment asks for human approval.
+That approved job publishes the draft as a prerelease with `latest=false`.
+A rejected approval or draft-verification failure leaves the release in draft
+state.
+
+The public-asset smoke gate then starts fresh hosted macOS and Linux runners.
+It downloads all four archives and checksums plus the shell assets through
+unauthenticated, versioned public release URLs. Its token is read-only and
+covers source checkout plus public attestation API verification. Each native
+target verifies exact checksums, version and health, runs the real public
+installer, proves no service was installed, and renders the Homebrew formula
+locally from the public assets. macOS installs and tests that local formula.
+The tap still serves the previous stable version throughout this gate; no
+release formula branch or pull request exists yet.
+
+Only a successful public smoke reaches the second human approval in
+`v040-stable`. Approval promotes the same prerelease to stable/latest. Only
+after that promotion does the formula publisher create or update the
+deterministic `formula/car-go-clean-vX.Y.Z` branch and its manual pull request;
+it never pushes the tap's default branch. A public-smoke failure leaves the
+release as a non-latest prerelease and does not invoke the tap publisher. The
+workflow does not publish to crates.io or enable any daemon.
 
 ## Complete the Homebrew release
 
-After GitHub publishes the verified release, list all open formula pull
-requests:
+After stable/latest promotion creates or updates the manual tap pull request,
+list all open formula pull requests:
 
 ```sh
 gh pr list \

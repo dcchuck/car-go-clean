@@ -1,0 +1,192 @@
+name: Smoke public prerelease
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Public smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            expected_uname: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            expected_uname: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            expected_uname: aarch64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            expected_uname: x86_64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Verify public install paths
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          ASSET_DIR: ${{ runner.temp }}/public-release-assets
+          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-public-smoke
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$TAG" = "v$VERSION"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+
+          rm -rf "$ASSET_DIR" "$ISOLATED_ROOT"
+          mkdir -p \
+            "$ASSET_DIR" \
+            "$ISOLATED_ROOT/extracted" \
+            "$ISOLATED_ROOT/formula" \
+            "$ISOLATED_ROOT/home" \
+            "$ISOLATED_ROOT/installed/bin" \
+            "$ISOLATED_ROOT/projects" \
+            "$ISOLATED_ROOT/state"
+
+          targets='
+          aarch64-apple-darwin
+          x86_64-apple-darwin
+          aarch64-unknown-linux-musl
+          x86_64-unknown-linux-musl
+          '
+          for release_target in $targets
+          do
+            for asset in \
+              "car-go-clean-$release_target.tar.xz" \
+              "car-go-clean-$release_target.tar.xz.sha256"
+            do
+              curl --proto '=https' --tlsv1.2 -fsSLo "$ASSET_DIR/$asset" \
+                "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/$asset"
+            done
+          done
+          for asset in \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            car-go-clean-shell-assets.sha256
+          do
+            curl --proto '=https' --tlsv1.2 -fsSLo "$ASSET_DIR/$asset" \
+              "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/$asset"
+          done
+
+          scripts/verify-release-assets.sh "$TAG" "$ASSET_DIR" \
+            > "$RUNNER_TEMP/public-release-inventory.tsv"
+          awk '
+            NF {
+              if (NF != 2 || length($1) != 64 ||
+                  $1 !~ /^[0-9a-f]+$/ ||
+                  ($2 != "car-go-clean-installer.sh" &&
+                   $2 != "car-go-clean-upgrade.sh")) {
+                exit 1
+              }
+              print $2
+              count++
+            }
+            END {
+              if (count != 2) {
+                exit 1
+              }
+            }
+          ' "$ASSET_DIR/car-go-clean-shell-assets.sha256" |
+            LC_ALL=C sort > "$RUNNER_TEMP/shell-asset-names"
+          printf '%s\n' \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            > "$RUNNER_TEMP/expected-shell-asset-names"
+          cmp "$RUNNER_TEMP/expected-shell-asset-names" \
+            "$RUNNER_TEMP/shell-asset-names"
+          (
+            cd "$ASSET_DIR"
+            if command -v shasum >/dev/null 2>&1
+            then
+              shasum -a 256 -c car-go-clean-shell-assets.sha256
+            else
+              sha256sum -c car-go-clean-shell-assets.sha256
+            fi
+          )
+
+          archive="car-go-clean-$TARGET.tar.xz"
+          for attested_asset in \
+            "$archive" \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            car-go-clean-shell-assets.sha256
+          do
+            gh attestation verify "$ASSET_DIR/$attested_asset" \
+              --repo "$GITHUB_REPOSITORY"
+          done
+
+          tar -xJf "$ASSET_DIR/$archive" -C "$ISOLATED_ROOT/extracted"
+          binary=$(find "$ISOLATED_ROOT/extracted" -type f -name car-go-clean -perm -111)
+          test "$(printf '%s\n' "$binary" | awk 'NF {count++} END {print count + 0}')" -eq 1
+          version_output=$("$binary" version)
+          test "$version_output" = "$VERSION"
+          printf 'scan_dirs = ["%s"]\n' "$ISOLATED_ROOT/projects" \
+            > "$ISOLATED_ROOT/config.toml"
+          HOME="$ISOLATED_ROOT/home" \
+            XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
+            XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
+            "$binary" health --skip-cargo \
+              --config "$ISOLATED_ROOT/config.toml" \
+              --state-dir "$ISOLATED_ROOT/state"
+
+          (
+            cd "$ASSET_DIR"
+            HOME="$ISOLATED_ROOT/home" \
+              sh ./car-go-clean-installer.sh \
+                --version "$VERSION" \
+                --install-dir "$ISOLATED_ROOT/installed/bin"
+          )
+          test "$("$ISOLATED_ROOT/installed/bin/car-go-clean" version)" = "$VERSION"
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+          test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$HOME/.config/systemd/user/car-go-clean.service"
+
+          scripts/render-homebrew-formula.sh \
+            "$TAG" \
+            "$ASSET_DIR" \
+            "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          if test "$(uname -s)" = Darwin
+          then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            export HOMEBREW_NO_INSTALL_CLEANUP=1
+            cleanup() {
+              brew uninstall --force car-go-clean >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT HUP INT TERM
+            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            brew test car-go-clean
+            brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
+            test "$("$brew_binary" version)" = "$VERSION"
+          else
+            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          fi
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+          test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$HOME/.config/systemd/user/car-go-clean.service"

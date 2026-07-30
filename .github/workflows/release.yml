@@ -331,43 +331,80 @@ jobs:
       "contents": "write"
       "id-token": "write"
 
-  custom-publish-homebrew-formula:
-    needs:
-      - plan
-      - host
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    uses: ./.github/workflows/publish-homebrew-formula.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    # publish jobs get escalated permissions
-    permissions:
-      "contents": "read"
-
   custom-release-verify:
     needs:
       - plan
       - host
       - custom-publish-shell-installer
-      - custom-publish-homebrew-formula
-    if: ${{ always() && needs.host.result == 'success' && needs.custom-publish-shell-installer.result == 'success' && needs.custom-publish-homebrew-formula.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' && needs.custom-publish-shell-installer.result == 'success' }}
     uses: ./.github/workflows/release-verify.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     permissions:
       "contents": "write"
 
-  announce:
+  publish-prerelease:
     needs:
       - plan
-      - host
       - custom-release-verify
-    if: ${{ always() && needs.host.result == 'success' && needs.custom-release-verify.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.custom-release-verify.result == 'success' }}
+    environment: v040-prerelease
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
     permissions:
       "contents": "write"
     steps:
-      - name: Publish verified draft release
-        run: gh release edit "${{ needs.plan.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false
+      - id: metadata
+        name: Read approved release metadata
+        env:
+          PLAN: ${{ needs.plan.outputs.val }}
+        run: |
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          VERSION="${TAG#v}"
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+          printf 'tag=%s\nversion=%s\n' "$TAG" "$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Publish approved prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+
+  hosted-release-smoke:
+    needs:
+      - plan
+      - publish-prerelease
+    uses: ./.github/workflows/hosted-release-smoke.yml
+    with:
+      tag: ${{ needs.publish-prerelease.outputs.tag }}
+      version: ${{ needs.publish-prerelease.outputs.version }}
+    permissions:
+      "contents": "read"
+
+  promote-stable:
+    needs:
+      - plan
+      - hosted-release-smoke
+    if: ${{ always() && needs.plan.result == 'success' && needs.hosted-release-smoke.result == 'success' }}
+    environment: v040-stable
+    runs-on: ubuntu-24.04
+    permissions:
+      "contents": "write"
+    steps:
+      - name: Promote approved stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+
+  custom-publish-homebrew-formula:
+    needs:
+      - plan
+      - promote-stable
+    if: ${{ always() && needs.plan.result == 'success' && needs.promote-stable.result == 'success' }}
+    uses: ./.github/workflows/publish-homebrew-formula.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "contents": "read"

@@ -1,4 +1,4 @@
-name: Verify released artifacts
+name: Verify commit-bound draft
 
 on:
   workflow_call:
@@ -8,116 +8,197 @@ on:
         type: string
 
 permissions:
-  # Draft releases are visible to the workflow token only with write access.
+  # GitHub requires contents:write for workflow tokens to read draft releases.
   contents: write
 
 jobs:
+  inventory:
+    name: Verify draft identity and inventory
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Verify commit-bound draft inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -eu
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          RELEASE_JSON="$(
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,targetCommitish,assets
+          )"
+          test "$(jq -er '.tagName' <<< "$RELEASE_JSON")" = "$TAG"
+          test "$(jq -er '.isDraft' <<< "$RELEASE_JSON")" = true
+          test "$(jq -er '.isPrerelease' <<< "$RELEASE_JSON")" = false
+          TARGET="$(jq -er '.targetCommitish' <<< "$RELEASE_JSON")"
+          RESOLVED_TARGET="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$TARGET" --jq '.sha'
+          )"
+          test "$RESOLVED_TARGET" = "$GITHUB_SHA"
+
+          EXPECTED_ASSET_COUNT=15
+          cat > "$RUNNER_TEMP/expected-release-assets" <<'EOF'
+          car-go-clean-aarch64-apple-darwin.tar.xz
+          car-go-clean-aarch64-apple-darwin.tar.xz.sha256
+          car-go-clean-aarch64-unknown-linux-musl.tar.xz
+          car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256
+          car-go-clean-installer.sh
+          car-go-clean-shell-assets.sha256
+          car-go-clean-upgrade.sh
+          car-go-clean-x86_64-apple-darwin.tar.xz
+          car-go-clean-x86_64-apple-darwin.tar.xz.sha256
+          car-go-clean-x86_64-unknown-linux-musl.tar.xz
+          car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256
+          car-go-clean.rb
+          sha256.sum
+          source.tar.gz
+          source.tar.gz.sha256
+          EOF
+          sed 's/^          //' "$RUNNER_TEMP/expected-release-assets" |
+            LC_ALL=C sort > "$RUNNER_TEMP/expected-release-assets.sorted"
+          jq -er '.assets[].name' <<< "$RELEASE_JSON" |
+            LC_ALL=C sort > "$RUNNER_TEMP/actual-release-assets"
+          test "$(wc -l < "$RUNNER_TEMP/actual-release-assets" | tr -d ' ')" \
+            -eq "$EXPECTED_ASSET_COUNT"
+          cmp "$RUNNER_TEMP/expected-release-assets.sorted" \
+            "$RUNNER_TEMP/actual-release-assets"
+
   smoke:
-    name: Smoke test (${{ matrix.target }})
+    name: Authenticated draft smoke (${{ matrix.target }})
+    needs: inventory
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
+            expected_uname: arm64
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            expected_uname: x86_64
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            expected_uname: aarch64
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+            expected_uname: x86_64
     steps:
-      - name: Download and verify release archive
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Download authenticated draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ inputs.plan }}
+          ASSET_DIR: ${{ runner.temp }}/draft-release-assets
+        run: |
+          set -eu
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          mkdir -p "$ASSET_DIR"
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'car-go-clean-*.tar.xz' \
+            --pattern 'car-go-clean-*.tar.xz.sha256' \
+            --pattern 'car-go-clean-installer.sh' \
+            --pattern 'car-go-clean-upgrade.sh' \
+            --pattern 'car-go-clean-shell-assets.sha256' \
+            --dir "$ASSET_DIR"
+      - name: Verify authenticated draft install paths
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           PLAN: ${{ inputs.plan }}
           TARGET: ${{ matrix.target }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          ASSET_DIR: ${{ runner.temp }}/draft-release-assets
+          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-draft-smoke
         run: |
+          set -euo pipefail
           TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
-          ARCHIVE="car-go-clean-${TARGET}.tar.xz"
-          CHECKSUM_FILE="${ARCHIVE}.sha256"
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "$CHECKSUM_FILE" \
-            --pattern "$ARCHIVE"
-          EXPECTED_HASH="$(awk -v archive="$ARCHIVE" '
-            NF {
-              count++
-              if (count != 1 || NF != 2 || ($2 != archive && $2 != "*" archive)) {
-                exit 1
-              }
-              print $1
-            }
-            END {
-              if (count != 1) {
-                exit 1
-              }
-            }
-          ' "$CHECKSUM_FILE")"
-          test -n "$EXPECTED_HASH"
-          if [ "${RUNNER_OS}" = "macOS" ]; then
-            ACTUAL_HASH="$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')"
-          else
-            ACTUAL_HASH="$(sha256sum "$ARCHIVE" | awk '{ print $1 }')"
-          fi
-          test "$ACTUAL_HASH" = "$EXPECTED_HASH"
-          tar -xJf "$ARCHIVE"
-      - name: Smoke test executable
-        run: |
-          ./car-go-clean-${{ matrix.target }}/car-go-clean version
-          ./car-go-clean-${{ matrix.target }}/car-go-clean health --skip-cargo
+          VERSION="${TAG#v}"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          scripts/verify-release-assets.sh "$TAG" "$ASSET_DIR" \
+            > "$RUNNER_TEMP/draft-release-inventory.tsv"
 
-  formula:
-    name: Verify Homebrew formula
-    needs: smoke
-    runs-on: macos-14
-    steps:
-      - name: Clone public tap
-        env:
-          PLAN: ${{ inputs.plan }}
-        run: |
-          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
-          BRANCH="formula/car-go-clean-$TAG"
-          git clone --branch "$BRANCH" --single-branch https://github.com/dcchuck/homebrew-tap homebrew-tap
-      - name: Audit formula and release hashes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ inputs.plan }}
-        run: |
-          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
-          FORMULA="homebrew-tap/Formula/car-go-clean.rb"
-          grep -Fq "$TAG" "$FORMULA"
-          mkdir release-assets
-          for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
-            ARCHIVE="car-go-clean-${TARGET}.tar.xz"
-            gh release download "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "${ARCHIVE}.sha256" \
-              --dir release-assets
+          archive="car-go-clean-$TARGET.tar.xz"
+          for attested_asset in \
+            "$archive" \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            car-go-clean-shell-assets.sha256
+          do
+            gh attestation verify "$ASSET_DIR/$attested_asset" \
+              --repo "$GITHUB_REPOSITORY"
           done
-          TAP="dcchuck/tap"
-          brew tap --custom-remote "$TAP" "$PWD/homebrew-tap"
-          trap 'brew untap "$TAP"' EXIT
-          brew audit --strict "$TAP/car-go-clean"
-          cd homebrew-tap
-          FORMULA="Formula/car-go-clean.rb"
-          for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
-            ARCHIVE="car-go-clean-${TARGET}.tar.xz"
-            CHECKSUM="$(awk -v archive="$ARCHIVE" '
-              NF {
-                count++
-                if (count != 1 || NF != 2 || ($2 != archive && $2 != "*" archive)) {
-                  exit 1
-                }
-                print $1
-              }
-              END {
-                if (count != 1) {
-                  exit 1
-                }
-              }
-            ' "../release-assets/${ARCHIVE}.sha256")"
-            test -n "$CHECKSUM"
-            grep -Fq "$CHECKSUM" "$FORMULA"
-          done
+
+          rm -rf "$ISOLATED_ROOT"
+          mkdir -p \
+            "$ISOLATED_ROOT/extracted" \
+            "$ISOLATED_ROOT/formula" \
+            "$ISOLATED_ROOT/home" \
+            "$ISOLATED_ROOT/installed/bin" \
+            "$ISOLATED_ROOT/projects" \
+            "$ISOLATED_ROOT/state"
+          tar -xJf "$ASSET_DIR/$archive" -C "$ISOLATED_ROOT/extracted"
+          binary=$(find "$ISOLATED_ROOT/extracted" -type f -name car-go-clean -perm -111)
+          test "$(printf '%s\n' "$binary" | awk 'NF {count++} END {print count + 0}')" -eq 1
+          version_output=$("$binary" version)
+          test "$version_output" = "$VERSION"
+          printf 'scan_dirs = ["%s"]\n' "$ISOLATED_ROOT/projects" \
+            > "$ISOLATED_ROOT/config.toml"
+          HOME="$ISOLATED_ROOT/home" \
+            XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
+            XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
+            "$binary" health --skip-cargo \
+              --config "$ISOLATED_ROOT/config.toml" \
+              --state-dir "$ISOLATED_ROOT/state"
+
+          (
+            cd "$ASSET_DIR"
+            CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 \
+              HOME="$ISOLATED_ROOT/home" \
+              sh ./car-go-clean-installer.sh \
+                --version "$VERSION" \
+                --install-dir "$ISOLATED_ROOT/installed/bin" \
+                --download-base-url "file://$ASSET_DIR"
+          )
+          test "$("$ISOLATED_ROOT/installed/bin/car-go-clean" version)" = "$VERSION"
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+          test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$HOME/.config/systemd/user/car-go-clean.service"
+
+          scripts/render-homebrew-formula.sh \
+            "$TAG" \
+            "$ASSET_DIR" \
+            "$ISOLATED_ROOT/formula/car-go-clean.public.rb"
+          sed \
+            "s#https://github.com/dcchuck/car-go-clean/releases/download/$TAG#file://$ASSET_DIR#g" \
+            "$ISOLATED_ROOT/formula/car-go-clean.public.rb" \
+            > "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          if test "$(uname -s)" = Darwin
+          then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            export HOMEBREW_NO_INSTALL_CLEANUP=1
+            cleanup() {
+              brew uninstall --force car-go-clean >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT HUP INT TERM
+            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            brew test car-go-clean
+            brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
+            test "$("$brew_binary" version)" = "$VERSION"
+          else
+            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          fi
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+          test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$HOME/.config/systemd/user/car-go-clean.service"

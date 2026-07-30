@@ -8,6 +8,7 @@ asset_verifier="$repo_root/scripts/verify-release-assets.sh"
 formula_renderer="$repo_root/scripts/render-homebrew-formula.sh"
 tap_rehearsal="$repo_root/scripts/rehearse-tap-capability.sh"
 draft_upserter="$repo_root/scripts/upsert-draft-release.sh"
+environment_configurator="$repo_root/scripts/configure-release-environments.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
@@ -53,7 +54,8 @@ for script in \
     "$asset_verifier" \
     "$formula_renderer" \
     "$tap_rehearsal" \
-    "$draft_upserter"
+    "$draft_upserter" \
+    "$environment_configurator"
 do
     sh -n "$script"
 done
@@ -291,6 +293,169 @@ do
     test "$(grep -F -c "sha256 \"$hash\"" "$formula")" -eq 1
 done
 expect_failure "malformed formula tag" "$formula_renderer" 0.4.0 "$artifacts" "$work/bad.rb"
+
+environment_fake_bin="$work/environment-fake-bin"
+mkdir -p "$environment_fake_bin"
+cat > "$environment_fake_bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >> "$FAKE_ENV_LOG"
+test "$1" = api
+shift
+
+method=GET
+endpoint=
+input=
+while test "$#" -gt 0
+do
+    case "$1" in
+        --method) method=$2; shift 2 ;;
+        --input) input=$2; shift 2 ;;
+        --silent) shift ;;
+        -*) echo "unexpected fake gh option: $1" >&2; exit 2 ;;
+        *) test -z "$endpoint"; endpoint=$1; shift ;;
+    esac
+done
+
+case "$method:$endpoint" in
+    GET:user)
+        printf '%s\n' '{"id":4242,"login":"release-operator"}'
+        ;;
+    PUT:repos/dcchuck/car-go-clean/environments/v040-prerelease|\
+    PUT:repos/dcchuck/car-go-clean/environments/v040-stable)
+        test -f "$input"
+        environment=${endpoint##*/}
+        cp "$input" "$FAKE_ENV_STATE/$environment.put.json"
+        printf '%s\n' '{}'
+        ;;
+    GET:repos/dcchuck/car-go-clean/environments/v040-prerelease|\
+    GET:repos/dcchuck/car-go-clean/environments/v040-stable)
+        environment=${endpoint##*/}
+        case "${FAKE_ENV_READBACK:-exact}" in
+            exact)
+                jq -n --arg environment "$environment" '{
+                  name: $environment,
+                  protection_rules: [{
+                    type: "required_reviewers",
+                    prevent_self_review: false,
+                    reviewers: [{
+                      type: "User",
+                      reviewer: {id: 4242, login: "release-operator"}
+                    }]
+                  }],
+                  deployment_branch_policy: null
+                }'
+                ;;
+            self-review)
+                jq -n --arg environment "$environment" '{
+                  name: $environment,
+                  protection_rules: [{
+                    type: "required_reviewers",
+                    prevent_self_review: true,
+                    reviewers: [{
+                      type: "User",
+                      reviewer: {id: 4242, login: "release-operator"}
+                    }]
+                  }],
+                  deployment_branch_policy: null
+                }'
+                ;;
+            wrong-reviewer)
+                jq -n --arg environment "$environment" '{
+                  name: $environment,
+                  protection_rules: [{
+                    type: "required_reviewers",
+                    prevent_self_review: false,
+                    reviewers: [{
+                      type: "User",
+                      reviewer: {id: 99, login: "someone-else"}
+                    }]
+                  }],
+                  deployment_branch_policy: null
+                }'
+                ;;
+            extra-reviewer)
+                jq -n --arg environment "$environment" '{
+                  name: $environment,
+                  protection_rules: [{
+                    type: "required_reviewers",
+                    prevent_self_review: false,
+                    reviewers: [
+                      {
+                        type: "User",
+                        reviewer: {id: 4242, login: "release-operator"}
+                      },
+                      {
+                        type: "User",
+                        reviewer: {id: 99, login: "someone-else"}
+                      }
+                    ]
+                  }],
+                  deployment_branch_policy: null
+                }'
+                ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    *) echo "unexpected fake gh call: $method $endpoint" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$environment_fake_bin/gh"
+
+wrong_repository_state="$work/environment-wrong-repository"
+mkdir -p "$wrong_repository_state"
+: > "$wrong_repository_state/gh.log"
+expect_failure "environment configuration for another repository" \
+    env \
+        PATH="$environment_fake_bin:$PATH" \
+        FAKE_ENV_LOG="$wrong_repository_state/gh.log" \
+        FAKE_ENV_STATE="$wrong_repository_state" \
+        "$environment_configurator" dcchuck/car-go-cleen
+test ! -s "$wrong_repository_state/gh.log"
+
+environment_state="$work/environment-state"
+mkdir -p "$environment_state"
+env \
+    PATH="$environment_fake_bin:$PATH" \
+    FAKE_ENV_LOG="$environment_state/gh.log" \
+    FAKE_ENV_STATE="$environment_state" \
+    "$environment_configurator" dcchuck/car-go-clean
+for environment in v040-prerelease v040-stable
+do
+    jq -e '
+      (keys | sort) == [
+        "deployment_branch_policy",
+        "prevent_self_review",
+        "reviewers",
+        "wait_timer"
+      ] and
+      .wait_timer == 0 and
+      .prevent_self_review == false and
+      .reviewers == [{type: "User", id: 4242}] and
+      .deployment_branch_policy == null
+    ' "$environment_state/$environment.put.json" >/dev/null
+    test "$(grep -F -c \
+        "api --method PUT repos/dcchuck/car-go-clean/environments/$environment --input" \
+        "$environment_state/gh.log")" -eq 1
+    test "$(grep -F -c \
+        "api repos/dcchuck/car-go-clean/environments/$environment" \
+        "$environment_state/gh.log")" -eq 1
+done
+test "$(grep -F -c 'api user' "$environment_state/gh.log")" -eq 1
+
+for invalid_readback in self-review wrong-reviewer extra-reviewer
+do
+    invalid_state="$work/environment-$invalid_readback"
+    mkdir -p "$invalid_state"
+    expect_failure "environment readback $invalid_readback" \
+        env \
+            PATH="$environment_fake_bin:$PATH" \
+            FAKE_ENV_LOG="$invalid_state/gh.log" \
+            FAKE_ENV_STATE="$invalid_state" \
+            FAKE_ENV_READBACK="$invalid_readback" \
+            "$environment_configurator" dcchuck/car-go-clean
+done
 
 make_tap_origin() {
     fixture_root=$1
