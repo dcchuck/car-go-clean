@@ -177,3 +177,116 @@ car-go-clean status --refresh \
 
 Historical cache is not authority: `run --no-scan` still requires the matching
 policy and discovery generation and never bypasses any cleanup gate.
+
+## Fresh Tart release acceptance
+
+The executable release harness turns the checks above into a two-guest,
+pre-tag acceptance run. It is intentionally strict: it has no default VM
+images, does not accept tags, and does not download release artifacts. Supply
+one Apple Silicon macOS image and one Apple Silicon Linux image as complete
+immutable GHCR references:
+
+```sh
+export CAR_GO_CLEAN_TART_MACOS_IMAGE='ghcr.io/cirruslabs/macos-sequoia-base@sha256:<64-lowercase-hex>'
+export CAR_GO_CLEAN_TART_LINUX_IMAGE='ghcr.io/cirruslabs/ubuntu@sha256:<64-lowercase-hex>'
+export CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0
+export CAR_GO_CLEAN_ACCEPTANCE_SHA="$(git rev-parse HEAD)"
+```
+
+Replace each digest placeholder with the resolved digest for the image being
+accepted. A movable `:latest` or other tag is rejected even when Tart could
+resolve it. `CAR_GO_CLEAN_ACCEPTANCE_SHA` must be the exact 40-character Git
+commit whose artifacts are under test.
+
+Prepare one artifact directory copied from the exact-SHA rehearsal. It must
+contain `SHA256SUMS` with safe relative paths and hashes for every supplied
+file. For each guest architecture the acceptance steps require:
+
+```text
+car-go-clean-installer.sh
+car-go-clean-upgrade.sh
+car-go-clean-shell-assets.sha256
+car-go-clean.rb
+car-go-clean-<target>.tar.xz
+car-go-clean-<target>.tar.xz.sha256
+car-go-clean-v0.2.0-<target>
+car-go-clean-v0.3.0-<target>
+```
+
+Here `<target>` is `aarch64-apple-darwin` or
+`aarch64-unknown-linux-musl`. The two old-version files are executable,
+faithfully built fixtures from the exact v0.2.0 and v0.3.0 tags; include their
+hashes in `SHA256SUMS`. The formula is the exact locally rendered v0.4.0
+formula. In the guest copy, the harness replaces exactly the current target's
+v0.4.0 URL with the copied archive's `file://` URL and inserts an explicit
+`version "0.4.0"`. macOS installs and tests that formula; Linux checks its Ruby
+syntax while the shell installer is exercised on both guests.
+
+Run from the repository checkout:
+
+```sh
+scripts/release/tart-rehearsal.sh \
+  /absolute/path/to/rehearsal-artifacts \
+  /absolute/path/to/release-evidence/tart
+```
+
+The orchestrator verifies `SHA256SUMS` on the host and again inside each
+guest, explicitly pulls each immutable image, creates a fresh unique clone,
+and copies only the supplied artifacts plus `acceptance.sh`. The documented
+Tart images use the `admin` user and password; override
+`CAR_GO_CLEAN_TART_SSH_USER` or `CAR_GO_CLEAN_TART_SSH_PASSWORD` only for an
+equivalent private image.
+
+The guest run uses a guest-local work root and records one milestone for every
+required assertion: installer/formula, exact version and health, real Rust
+build, preserved dry run, exact review and recovered bytes, cached
+`--no-scan`, a formerly cached out-of-scope sentinel, Cargo exit `1`,
+incomplete exit `2`, complete exit `0`, strict config failures, migration and
+round trip, service lifecycle and retention, all v0.2/v0.3 ×
+active/stopped/absent upgrades, and macOS Library/privacy behavior. Service
+stop is completed in the pre-reboot phase. The host then issues an actual
+guest reboot and the post-reboot phase proves the service stayed disabled
+before start and uninstall.
+
+No acceptance failure deletes a VM. Sanitized transcripts and host-side
+launch/SSH/hash logs are copied to the evidence directory before the
+orchestrator returns. The evidence `source-map.tsv` binds each fresh clone to
+the exact image reference and digest.
+
+## Tart inventory and irreversible cleanup
+
+After evidence has been copied out, capture every local VM plus disk metrics:
+
+```sh
+scripts/release/tart-inventory.sh \
+  /absolute/path/to/tart-inventory.tsv \
+  /absolute/path/to/release-evidence/tart/source-map.tsv
+```
+
+Each non-comment row is:
+
+```text
+name<TAB>state<TAB>source_reference<TAB>source_digest
+```
+
+VMs not created by this rehearsal are printed as `UNKNOWN_SOURCE` and
+`UNKNOWN_DIGEST`. Treat those rows as unrecoverable unless you separately know
+their provenance. Comment rows record Tart storage bytes and host `df`
+capacity.
+
+Cleanup prints that exact concrete inventory before doing anything and is
+inert without the literal confirmation:
+
+```sh
+CAR_GO_CLEAN_TART_DELETE_ALL=YES \
+  scripts/release/tart-cleanup.sh \
+  /absolute/path/to/tart-inventory.tsv
+```
+
+It stops and deletes only the names in the file. A VM that appeared after
+inventory is not silently added to the deletion set; it causes the final
+empty-inventory check to fail. After exact-name deletion, the script runs
+cache-only `tart prune --entries caches --space-budget 0`—never
+`--entries vms`—then requires the full `tart list --format json` result to be
+empty and reports Tart bytes and host free space before and after. Deleted VMs
+and unexported changes inside them cannot be recovered.
