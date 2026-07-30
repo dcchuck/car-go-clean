@@ -3528,39 +3528,58 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
     );
 }
 
-fn create_authentic_v14_combined_failure(database: &Path) -> (i64, SystemTime) {
+const COMBINED_FAILURE_PATH: &str = "/combined-failure";
+const COMBINED_FAILURE_CARGO_AUDIT: &str = "cargo clean exited 7: cargo failed";
+
+fn create_authentic_v14_combined_failure_runs(
+    database: &Path,
+    events_per_run: &[usize],
+) -> (Vec<i64>, SystemTime) {
     let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(650);
-    let run_id = {
+    let run_ids = {
         let store = test_store(database);
-        let run_id = store.start_run(timestamp).unwrap();
-        store
-            .record_clean_event(&CleanEvent {
-                id: 0,
-                run_id,
-                ts: timestamp,
-                path: "/combined-failure".to_string(),
-                bytes_before: 1_000,
-                bytes_after: 1_000,
-                duration_ms: 5,
-                exit_code: Some(7),
-                stderr_excerpt: "cargo failed".to_string(),
-                outcome: CleanAttemptOutcome::CargoNonzero,
-                measurement_failed: true,
-            })
-            .unwrap();
-        store
-            .record_error(&ErrorRecord {
-                id: 0,
-                ts: timestamp,
-                category: "clean".to_string(),
-                path: Some("/combined-failure".to_string()),
-                message: "measure target after cargo clean: injected read failure".to_string(),
-            })
-            .unwrap();
-        store
-            .finish_run(run_id, timestamp + Duration::from_secs(1), 0, 0, 1)
-            .unwrap();
-        run_id
+        let mut run_ids = Vec::with_capacity(events_per_run.len());
+        for &event_count in events_per_run {
+            let run_id = store.start_run(timestamp).unwrap();
+            for _ in 0..event_count {
+                store
+                    .record_clean_event(&CleanEvent {
+                        id: 0,
+                        run_id,
+                        ts: timestamp,
+                        path: COMBINED_FAILURE_PATH.to_string(),
+                        bytes_before: 1_000,
+                        bytes_after: 1_000,
+                        duration_ms: 5,
+                        exit_code: Some(7),
+                        stderr_excerpt: "cargo failed".to_string(),
+                        outcome: CleanAttemptOutcome::CargoNonzero,
+                        measurement_failed: true,
+                    })
+                    .unwrap();
+                store
+                    .record_error(&ErrorRecord {
+                        id: 0,
+                        ts: timestamp,
+                        category: "clean".to_string(),
+                        path: Some(COMBINED_FAILURE_PATH.to_string()),
+                        message: "measure target after cargo clean: injected read failure"
+                            .to_string(),
+                    })
+                    .unwrap();
+            }
+            store
+                .finish_run(
+                    run_id,
+                    timestamp + Duration::from_secs(1),
+                    0,
+                    0,
+                    i64::try_from(event_count).unwrap(),
+                )
+                .unwrap();
+            run_ids.push(run_id);
+        }
+        run_ids
     };
     {
         let connection = rusqlite::Connection::open(database).unwrap();
@@ -3625,7 +3644,206 @@ fn create_authentic_v14_combined_failure(database: &Path) -> (i64, SystemTime) {
             )
             .unwrap();
     }
-    (run_id, timestamp)
+    (run_ids, timestamp)
+}
+
+fn create_authentic_v14_combined_failure(database: &Path) -> (i64, SystemTime) {
+    let (run_ids, timestamp) = create_authentic_v14_combined_failure_runs(database, &[1]);
+    (run_ids[0], timestamp)
+}
+
+fn exact_combined_failure_cargo_audit_count(database: &Path) -> i64 {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM errors
+            WHERE ts = 650
+              AND category = 'clean'
+              AND path = ?1
+              AND message = ?2
+            ",
+            [COMBINED_FAILURE_PATH, COMBINED_FAILURE_CARGO_AUDIT],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn combined_failure_run_error_counts(database: &Path, run_ids: &[i64]) -> Vec<i64> {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    run_ids
+        .iter()
+        .map(|run_id| {
+            connection
+                .query_row(
+                    "SELECT errors_count FROM runs WHERE id = ?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+fn insert_combined_failure_cargo_audits(database: &Path, count: usize) {
+    let mut connection = rusqlite::Connection::open(database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for _ in 0..count {
+        transaction
+            .execute(
+                "
+                INSERT INTO errors (ts, category, path, message)
+                VALUES (650, 'clean', ?1, ?2)
+                ",
+                [COMBINED_FAILURE_PATH, COMBINED_FAILURE_CARGO_AUDIT],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+fn set_combined_failure_run_error_counts(database: &Path, run_counts: &[(i64, i64)]) {
+    let mut connection = rusqlite::Connection::open(database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for &(run_id, errors_count) in run_counts {
+        transaction
+            .execute(
+                "UPDATE runs SET errors_count = ?1 WHERE id = ?2",
+                [errors_count, run_id],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct V14CombinedFailureState {
+    schema_version: i64,
+    clean_events_schema: String,
+    clean_events: Vec<(i64, i64, i64, String, Option<i32>, String)>,
+    errors: Vec<(i64, i64, String, Option<String>, String)>,
+    runs: Vec<(i64, i64, String)>,
+    has_v15_table: bool,
+}
+
+fn v14_combined_failure_state(database: &Path) -> V14CombinedFailureState {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let clean_events = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT id, run_id, ts, path, exit_code, attempt_outcome
+                FROM clean_events
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let errors = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT id, ts, category, path, message
+                FROM errors
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let runs = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT id, errors_count, typeof(errors_count)
+                FROM runs
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    V14CombinedFailureState {
+        schema_version: connection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        clean_events_schema: connection
+            .query_row(
+                "
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'clean_events'
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        clean_events,
+        errors,
+        runs,
+        has_v15_table: connection
+            .query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'clean_events_v15'
+                )
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+    }
+}
+
+fn assert_combined_failure_migration_fails_atomically(
+    database: &Path,
+    expected_message_parts: &[&str],
+) {
+    let before = v14_combined_failure_state(database);
+    let store = Store::open(database).unwrap();
+    let first_error = store.migrate().unwrap_err().to_string();
+    for expected in expected_message_parts {
+        assert!(first_error.contains(expected), "{first_error}");
+    }
+    let second_error = store.migrate().unwrap_err().to_string();
+    assert_eq!(second_error, first_error);
+    drop(store);
+    assert_eq!(v14_combined_failure_state(database), before);
 }
 
 #[test]
@@ -3729,6 +3947,192 @@ fn version_fourteen_combined_failure_repairs_the_missing_cargo_audit_and_run_cou
     store.migrate().unwrap();
     assert_eq!(store.last_run().unwrap().errors_count, 2);
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+}
+
+#[test]
+fn version_fourteen_same_run_collision_repairs_every_missing_cargo_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[2]);
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(exact_combined_failure_cargo_audit_count(&database), 2);
+    assert_eq!(
+        combined_failure_run_error_counts(&database, &run_ids),
+        vec![4]
+    );
+}
+
+#[test]
+fn version_fourteen_cross_run_collision_repairs_each_owning_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[1, 1]);
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(exact_combined_failure_cargo_audit_count(&database), 2);
+    assert_eq!(
+        combined_failure_run_error_counts(&database, &run_ids),
+        vec![2, 2]
+    );
+}
+
+#[test]
+fn version_fourteen_complete_combined_failure_collisions_preserve_audits_and_counts() {
+    for (label, events_per_run, expected_run_counts) in [
+        ("same-run", vec![2], vec![4]),
+        ("cross-run", vec![1, 1], vec![2, 2]),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!("{label}.db"));
+        let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &events_per_run);
+        insert_combined_failure_cargo_audits(&database, 2);
+        set_combined_failure_run_error_counts(
+            &database,
+            &run_ids
+                .iter()
+                .copied()
+                .zip(expected_run_counts.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+
+        let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(events.len(), 2, "{label}");
+        assert!(
+            events.iter().all(|event| {
+                event.outcome == CleanAttemptOutcome::CargoNonzero && event.measurement_failed
+            }),
+            "{label}"
+        );
+        assert_eq!(
+            exact_combined_failure_cargo_audit_count(&database),
+            2,
+            "{label}"
+        );
+        assert_eq!(
+            combined_failure_run_error_counts(&database, &run_ids),
+            expected_run_counts,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn version_fourteen_complete_combined_failure_preserves_legacy_non_event_error_slack() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[1]);
+    insert_combined_failure_cargo_audits(&database, 1);
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "
+                INSERT INTO errors (ts, category, path, message)
+                VALUES (649, 'clean', ?1, 'legacy command failure without event')
+                ",
+                [COMBINED_FAILURE_PATH],
+            )
+            .unwrap();
+    }
+    set_combined_failure_run_error_counts(&database, &[(run_ids[0], 3)]);
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(exact_combined_failure_cargo_audit_count(&database), 1);
+    assert_eq!(
+        combined_failure_run_error_counts(&database, &run_ids),
+        vec![3]
+    );
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 3);
+}
+
+#[test]
+fn version_fourteen_combined_failure_cardinality_rejects_partial_and_excess_audits_atomically() {
+    for cargo_audit_count in [1_usize, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory
+            .path()
+            .join(format!("cargo-audits-{cargo_audit_count}.db"));
+        let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[2]);
+        insert_combined_failure_cargo_audits(&database, cargo_audit_count);
+        set_combined_failure_run_error_counts(
+            &database,
+            &[(run_ids[0], 2 + i64::try_from(cargo_audit_count).unwrap())],
+        );
+
+        assert_combined_failure_migration_fails_atomically(
+            &database,
+            &[
+                "ambiguous combined clean failure audit",
+                "timestamp 650",
+                COMBINED_FAILURE_PATH,
+                "2 event(s)",
+                &format!("{cargo_audit_count} exact cargo audit(s)"),
+            ],
+        );
+    }
+}
+
+#[test]
+fn version_fourteen_complete_combined_failure_audits_require_run_lower_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[2]);
+    insert_combined_failure_cargo_audits(&database, 2);
+    set_combined_failure_run_error_counts(&database, &[(run_ids[0], 3)]);
+
+    assert_combined_failure_migration_fails_atomically(
+        &database,
+        &[
+            "incomplete combined clean failure run accounting",
+            &format!("run {}", run_ids[0]),
+            "projected 3 error(s)",
+            "lower bound 4",
+        ],
+    );
+}
+
+#[test]
+fn version_fourteen_combined_failure_repair_rejects_run_count_overflow_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let (run_ids, _) = create_authentic_v14_combined_failure_runs(&database, &[1]);
+    set_combined_failure_run_error_counts(&database, &[(run_ids[0], i64::MAX)]);
+
+    assert_combined_failure_migration_fails_atomically(
+        &database,
+        &[
+            "combined clean failure projected error count overflow",
+            &format!("run {}", run_ids[0]),
+        ],
+    );
 }
 
 #[test]

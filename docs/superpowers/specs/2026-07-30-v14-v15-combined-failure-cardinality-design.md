@@ -74,10 +74,12 @@ still rolls back all of those effects.
 
 ## Failure and retry behavior
 
-Partial, excess, missing-run, and lower-bound failures are deterministic and
-actionable. They leave schema version 14, the v14 event schema and rows, all
-audits, and all run counts unchanged. Retrying the same migration returns the
-same error.
+Partial, excess, missing-run, projected-count overflow, and lower-bound
+failures are deterministic and actionable. Every repair-owning run is loaded
+and its projected count is checked before mutation, preventing SQLite from
+promoting `i64::MAX + 1` to `REAL`. Failures leave schema version 14, the v14
+event schema and rows, all audits, and all run counts unchanged. Retrying the
+same migration returns the same error.
 
 After a successful migration, schema version 15 prevents the repair from
 running again. Repeated `migrate` calls therefore do not duplicate audits or
@@ -95,6 +97,8 @@ Authentic v14 fixtures exercise real SQLite state and the public migration:
   run counts remain unchanged;
 - partial (`0 < M < N`) and excess (`M > N`) groups fail twice with identical
   messages and no database mutation;
+- a repair that would overflow an owning run's integer count fails twice
+  without inserting an audit or changing the stored integer;
 - a complete historical group whose run also contains a legitimate non-event
   failure remains openable and preserves that count as slack;
 - the existing single-event repair, preservation, rollback, and idempotency

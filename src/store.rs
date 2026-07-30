@@ -4,7 +4,7 @@ use crate::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, S
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -2497,13 +2497,17 @@ struct LegacyCleanEvent {
     outcome: LegacyCleanAttemptOutcome,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LegacyCombinedCleanFailure {
     run_id: i64,
+    signature: LegacyCargoAuditSignature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LegacyCargoAuditSignature {
     timestamp: i64,
     path: String,
-    exit_code: i32,
-    stderr_excerpt: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3109,49 +3113,148 @@ fn migrate_independent_clean_attempt_results(tx: &Transaction<'_>) -> Result<()>
             ",
         )?;
         let rows = statement.query_map([], |row| {
+            let run_id = row.get(0)?;
+            let timestamp = row.get(1)?;
+            let path = row.get(2)?;
+            let exit_code = row.get::<_, i32>(3)?;
+            let stderr_excerpt = row.get::<_, String>(4)?;
+            let message = if stderr_excerpt.is_empty() {
+                format!("cargo clean exited {exit_code}")
+            } else {
+                format!("cargo clean exited {exit_code}: {stderr_excerpt}")
+            };
             Ok(LegacyCombinedCleanFailure {
-                run_id: row.get(0)?,
-                timestamp: row.get(1)?,
-                path: row.get(2)?,
-                exit_code: row.get(3)?,
-                stderr_excerpt: row.get(4)?,
+                run_id,
+                signature: LegacyCargoAuditSignature {
+                    timestamp,
+                    path,
+                    message,
+                },
             })
         })?;
         collect_rows(rows)?
     };
 
+    let mut failures_by_signature = BTreeMap::new();
     for failure in combined_failures {
-        let message = if failure.stderr_excerpt.is_empty() {
-            format!("cargo clean exited {}", failure.exit_code)
-        } else {
-            format!(
-                "cargo clean exited {}: {}",
-                failure.exit_code, failure.stderr_excerpt
-            )
-        };
-        let cargo_audit_exists = tx.query_row(
+        failures_by_signature
+            .entry(failure.signature.clone())
+            .or_insert_with(Vec::new)
+            .push(failure);
+    }
+
+    let mut planned_repairs = Vec::new();
+    let mut planned_repairs_by_run = BTreeMap::<i64, i64>::new();
+    let mut runs_requiring_lower_bound = BTreeSet::new();
+    for (signature, failures) in &failures_by_signature {
+        let event_count = i64::try_from(failures.len())
+            .context("combined clean failure event count exceeds SQLite range")?;
+        let audit_count = tx.query_row(
             "
-            SELECT EXISTS(
-                SELECT 1
-                FROM errors
-                WHERE ts = ?1
-                  AND category = 'clean'
-                  AND path = ?2
-                  AND message = ?3
-            )
+            SELECT COUNT(*)
+            FROM errors
+            WHERE ts = ?1
+              AND category = 'clean'
+              AND path = ?2
+              AND message = ?3
             ",
-            params![failure.timestamp, &failure.path, &message],
-            |row| row.get::<_, bool>(0),
+            params![signature.timestamp, &signature.path, &signature.message],
+            |row| row.get::<_, i64>(0),
         )?;
-        if cargo_audit_exists {
-            continue;
+
+        // Supported historical writers emitted each exact Cargo audit with
+        // its owning run-count increment. errors has no run_id, so only exact
+        // signature cardinality can distinguish fully missing from complete
+        // groups without inventing row ownership.
+        if audit_count == 0 {
+            for failure in failures {
+                let planned_for_run = planned_repairs_by_run.entry(failure.run_id).or_default();
+                *planned_for_run = planned_for_run.checked_add(1).with_context(|| {
+                    format!(
+                        "combined clean failure repair count overflow for run {}",
+                        failure.run_id
+                    )
+                })?;
+                planned_repairs.push(failure.clone());
+            }
+        } else if audit_count == event_count {
+            runs_requiring_lower_bound.extend(failures.iter().map(|failure| failure.run_id));
+        } else {
+            bail!(
+                "ambiguous combined clean failure audit at timestamp {} for {:?}: \
+                 found {event_count} event(s) and {audit_count} exact cargo audit(s); \
+                 expected zero audits for repair or one audit per event",
+                signature.timestamp,
+                signature.path
+            );
         }
+    }
+
+    // Validate every mutated run before inserting an audit. Complete groups
+    // additionally use the lower bound as defense in depth, not as an
+    // ownership reconstruction. Run counts may legitimately contain older
+    // failures without clean events, so preserve all slack above the
+    // independently represented minimum.
+    let mut runs_requiring_projection = runs_requiring_lower_bound.clone();
+    runs_requiring_projection.extend(planned_repairs_by_run.keys().copied());
+    for run_id in runs_requiring_projection {
+        let Some((stored_errors, lower_bound)) = tx
+            .query_row(
+                "
+                SELECT
+                    runs.errors_count,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN clean_events.attempt_outcome = 'success' THEN 0
+                            WHEN clean_events.attempt_outcome IN (
+                                'cargo_nonzero',
+                                'runner_failure'
+                            ) THEN 1
+                            WHEN clean_events.attempt_outcome = 'measurement_failure'
+                                 AND clean_events.exit_code = 0 THEN 1
+                            WHEN clean_events.attempt_outcome = 'measurement_failure' THEN 2
+                            ELSE 0
+                        END
+                    ), 0)
+                FROM runs
+                LEFT JOIN clean_events ON clean_events.run_id = runs.id
+                WHERE runs.id = ?1
+                GROUP BY runs.id
+                ",
+                [run_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            bail!("cannot reconcile combined clean failure for missing run {run_id}");
+        };
+        let planned_for_run = planned_repairs_by_run.get(&run_id).copied().unwrap_or(0);
+        let projected_errors = stored_errors
+            .checked_add(planned_for_run)
+            .with_context(|| {
+                format!("combined clean failure projected error count overflow for run {run_id}")
+            })?;
+        if runs_requiring_lower_bound.contains(&run_id) && projected_errors < lower_bound {
+            bail!(
+                "incomplete combined clean failure run accounting for run {run_id}: \
+                 projected {projected_errors} error(s) after {planned_for_run} repair(s), \
+                 below independent clean-event lower bound {lower_bound}; exact cargo audits \
+                 cannot be assigned because errors lack run IDs"
+            );
+        }
+    }
+
+    for failure in planned_repairs {
         tx.execute(
             "
             INSERT INTO errors (ts, category, path, message)
             VALUES (?1, 'clean', ?2, ?3)
             ",
-            params![failure.timestamp, failure.path, message],
+            params![
+                failure.signature.timestamp,
+                failure.signature.path,
+                failure.signature.message
+            ],
         )?;
         let updated = tx.execute(
             "
