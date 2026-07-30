@@ -34,24 +34,42 @@ validate_run_number() {
 
 write_state() {
     state_tmp="$state_file.tmp"
-    {
-        printf 'version=2\n'
-        printf 'repository=%s\n' "$state_repository"
-        printf 'default_branch=%s\n' "$state_default_branch"
-        printf 'parent_sha=%s\n' "$state_parent_sha"
-        printf 'branch=%s\n' "$state_branch"
-        printf 'local_commit_sha=%s\n' "$state_local_commit_sha"
-        printf 'expected_head_sha=%s\n' "$state_expected_head_sha"
-        printf 'branch_status=%s\n' "$state_branch_status"
-        printf 'pr_status=%s\n' "$state_pr_status"
+    if ! (
+        printf 'version=2\n' &&
+        printf 'repository=%s\n' "$state_repository" &&
+        printf 'default_branch=%s\n' "$state_default_branch" &&
+        printf 'parent_sha=%s\n' "$state_parent_sha" &&
+        printf 'branch=%s\n' "$state_branch" &&
+        printf 'local_commit_sha=%s\n' "$state_local_commit_sha" &&
+        printf 'expected_head_sha=%s\n' "$state_expected_head_sha" &&
+        printf 'branch_status=%s\n' "$state_branch_status" &&
+        printf 'pr_status=%s\n' "$state_pr_status" &&
         printf 'pr_number=%s\n' "$state_pr_number"
-    } > "$state_tmp"
-    chmod 600 "$state_tmp"
-    if ! mv "$state_tmp" "$state_file"
+    ) > "$state_tmp"
     then
-        rm -f "$state_tmp"
+        if ! rm -f "$state_tmp"
+        then
+            echo "could not remove failed tap state temporary file" >&2
+        fi
         return 1
     fi
+    if ! chmod 600 "$state_tmp"
+    then
+        if ! rm -f "$state_tmp"
+        then
+            echo "could not remove failed tap state temporary file" >&2
+        fi
+        return 1
+    fi
+    if ! mv "$state_tmp" "$state_file"
+    then
+        if ! rm -f "$state_tmp"
+        then
+            echo "could not remove failed tap state temporary file" >&2
+        fi
+        return 1
+    fi
+    return 0
 }
 
 load_state() {
@@ -79,8 +97,26 @@ load_state() {
             ;;
     esac
     case "$state_branch" in
-        rehearsal/car-go-clean-*-*) ;;
-        *) die "tap cleanup state contains an invalid rehearsal branch" ;;
+        rehearsal/car-go-clean-*)
+            state_branch_run=${state_branch#rehearsal/car-go-clean-}
+            ;;
+        *)
+            die "tap cleanup state contains an invalid rehearsal branch"
+            ;;
+    esac
+    case "$state_branch_run" in
+        *-*)
+            state_branch_run_id=${state_branch_run%%-*}
+            state_branch_run_attempt=${state_branch_run#*-}
+            ;;
+        *)
+            die "tap cleanup state contains an invalid rehearsal branch"
+            ;;
+    esac
+    case "$state_branch_run_id:$state_branch_run_attempt" in
+        *[!0-9:]*|:*|*:)
+            die "tap cleanup state contains an invalid rehearsal branch"
+            ;;
     esac
     for state_sha in \
         "$state_parent_sha" \
@@ -387,23 +423,38 @@ cleanup_loaded_state() {
 
     if test "$reconciled_branch" = owned
     then
-        # GitHub exposes no conditional delete for refs. Reconciliation narrows
-        # authority immediately before DELETE, but an API-check-to-write race
-        # remains and is an unavoidable residual TOCTOU at this boundary.
-        if ! gh api \
-            --method DELETE \
-            "repos/$state_repository/git/refs/heads/$state_branch" \
-            --silent
+        if ! reconcile_branch
         then
-            printf "Manual cleanup required after exact ownership verification: gh api --method DELETE '%s'\n" \
-                "repos/$state_repository/git/refs/heads/$state_branch" >&2
+            echo "tap rehearsal branch changed before deletion; cleanup is incomplete" >&2
             return 1
         fi
-        state_branch_status=absent
-        if ! write_state
+        if test "$reconciled_branch" = absent
         then
-            echo "branch was deleted but its checkpoint failed; retry the cleanup hook to reconcile it" >&2
-            return 1
+            state_branch_status=absent
+            if ! write_state
+            then
+                echo "absent branch checkpoint failed; retry the cleanup hook to reconcile it" >&2
+                return 1
+            fi
+        else
+            # GitHub exposes no conditional delete for refs. This exact-SHA
+            # reconciliation is immediately adjacent to DELETE, but an
+            # API-check-to-write race remains as residual TOCTOU.
+            if ! gh api \
+                --method DELETE \
+                "repos/$state_repository/git/refs/heads/$state_branch" \
+                --silent
+            then
+                printf "Manual cleanup required after exact ownership verification: gh api --method DELETE '%s'\n" \
+                    "repos/$state_repository/git/refs/heads/$state_branch" >&2
+                return 1
+            fi
+            state_branch_status=absent
+            if ! write_state
+            then
+                echo "branch was deleted but its checkpoint failed; retry the cleanup hook to reconcile it" >&2
+                return 1
+            fi
         fi
     fi
 

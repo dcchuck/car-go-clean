@@ -329,6 +329,7 @@ make_tap_workflow_commit() {
 tap_fake_bin="$work/tap-fake-bin"
 mkdir -p "$tap_fake_bin"
 real_git=$(command -v git)
+real_chmod=$(command -v chmod)
 real_mv=$(command -v mv)
 cat > "$tap_fake_bin/git" <<'EOF'
 #!/bin/sh
@@ -342,6 +343,12 @@ do
         is_push=1
     fi
 done
+
+if test "$is_push" -eq 1 &&
+   test -n "${FAKE_PUSH_ATTEMPT_MARKER:-}"
+then
+    : > "$FAKE_PUSH_ATTEMPT_MARKER"
+fi
 
 if test "$is_push" -eq 1 &&
    { test -n "${FAKE_PUSH_LOST_RESPONSE:-}" ||
@@ -368,6 +375,35 @@ fi
 exec "$REAL_GIT" "$@"
 EOF
 chmod +x "$tap_fake_bin/git"
+
+cat > "$tap_fake_bin/chmod" <<'EOF'
+#!/bin/sh
+set -eu
+
+if test "$#" -eq 2 &&
+   test "$2" = "$RUNNER_TEMP/car-go-clean-tap-rehearsal-state.tmp"
+then
+    count=0
+    if test -n "${FAKE_STATE_CHMOD_COUNT_FILE:-}" &&
+       test -f "$FAKE_STATE_CHMOD_COUNT_FILE"
+    then
+        count=$(cat "$FAKE_STATE_CHMOD_COUNT_FILE")
+    fi
+    count=$((count + 1))
+    if test -n "${FAKE_STATE_CHMOD_COUNT_FILE:-}"
+    then
+        printf '%s\n' "$count" > "$FAKE_STATE_CHMOD_COUNT_FILE"
+    fi
+    if test -n "${FAKE_FAIL_STATE_CHMOD_NUMBER:-}" &&
+       test "$count" -eq "$FAKE_FAIL_STATE_CHMOD_NUMBER"
+    then
+        exit 1
+    fi
+fi
+
+exec "$REAL_CHMOD" "$@"
+EOF
+chmod +x "$tap_fake_bin/chmod"
 
 cat > "$tap_fake_bin/mv" <<'EOF'
 #!/bin/sh
@@ -670,6 +706,16 @@ case "$method:$endpoint" in
         then
             : > "$FAKE_FAIL_NEXT_STATE_AFTER_CLOSE_MARKER"
         fi
+        if test -n "${FAKE_RETARGET_BRANCH_AFTER_CLOSE_SHA:-}"
+        then
+            git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
+                "$branch_ref" "$FAKE_RETARGET_BRANCH_AFTER_CLOSE_SHA"
+        fi
+        if test -n "${FAKE_REMOVE_BRANCH_AFTER_CLOSE:-}"
+        then
+            git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
+                -d "$branch_ref"
+        fi
         ;;
     DELETE:repos/dcchuck/homebrew-tap/git/refs/heads/*)
         git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
@@ -706,7 +752,9 @@ run_tap_rehearsal() {
         FAKE_PR_HEAD_SHA_FILE="$tap_case/pr-head-sha" \
         FAKE_DEFAULT_REF_CALLS="$tap_case/default-ref-calls" \
         FAKE_BRANCH_REF_CALLS="$tap_case/branch-ref-calls" \
+        FAKE_STATE_CHMOD_COUNT_FILE="$tap_case/state-chmod-count" \
         FAKE_STATE_WRITE_COUNT_FILE="$tap_case/state-write-count" \
+        REAL_CHMOD="$real_chmod" \
         REAL_GIT="$real_git" \
         REAL_MV="$real_mv" \
         "$@" \
@@ -731,7 +779,9 @@ run_tap_cleanup_hook() {
         FAKE_PR_HEAD_SHA_FILE="$tap_case/pr-head-sha" \
         FAKE_DEFAULT_REF_CALLS="$tap_case/default-ref-calls" \
         FAKE_BRANCH_REF_CALLS="$tap_case/branch-ref-calls" \
+        FAKE_STATE_CHMOD_COUNT_FILE="$tap_case/state-chmod-count" \
         FAKE_STATE_WRITE_COUNT_FILE="$tap_case/state-write-count" \
+        REAL_CHMOD="$real_chmod" \
         REAL_GIT="$real_git" \
         REAL_MV="$real_mv" \
         "$@" \
@@ -844,6 +894,63 @@ test -z "$(
 )"
 test ! -e "$tap_truncated_tree/pr-state"
 
+tap_state_generation_failure="$work/tap-state-generation-failure"
+mkdir -p "$tap_state_generation_failure/runner-temp"
+make_tap_origin "$tap_state_generation_failure"
+generation_fifo="$tap_state_generation_failure/runner-temp/car-go-clean-tap-rehearsal-state.tmp"
+mkfifo "$generation_fifo"
+(
+    exec 3< "$generation_fifo"
+    exec 3<&-
+) &
+generation_reader=$!
+state_generation_output="$tap_state_generation_failure/output"
+generation_status=0
+if run_tap_rehearsal \
+    "$tap_state_generation_failure" \
+    FAKE_PUSH_ATTEMPT_MARKER="$tap_state_generation_failure/push-attempted" \
+    > "$state_generation_output" 2>&1
+then
+    generation_status=0
+else
+    generation_status=$?
+fi
+kill "$generation_reader" 2>/dev/null || :
+wait "$generation_reader" || :
+if test "$generation_status" -eq 0
+then
+    echo "unexpected success: initial state record generation failure" >&2
+    exit 1
+fi
+test ! -e "$tap_state_generation_failure/push-attempted"
+test ! -e "$tap_state_generation_failure/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_state_generation_failure/runner-temp/car-go-clean-tap-rehearsal-state.tmp"
+test -z "$(
+    git --git-dir="$tap_state_generation_failure/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+
+tap_state_chmod_failure="$work/tap-state-chmod-failure"
+mkdir -p "$tap_state_chmod_failure/runner-temp"
+make_tap_origin "$tap_state_chmod_failure"
+state_chmod_output="$tap_state_chmod_failure/output"
+if run_tap_rehearsal \
+    "$tap_state_chmod_failure" \
+    FAKE_FAIL_STATE_CHMOD_NUMBER=1 \
+    FAKE_PUSH_ATTEMPT_MARKER="$tap_state_chmod_failure/push-attempted" \
+    > "$state_chmod_output" 2>&1
+then
+    echo "unexpected success: initial state chmod failure" >&2
+    exit 1
+fi
+test ! -e "$tap_state_chmod_failure/push-attempted"
+test ! -e "$tap_state_chmod_failure/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_state_chmod_failure/runner-temp/car-go-clean-tap-rehearsal-state.tmp"
+test -z "$(
+    git --git-dir="$tap_state_chmod_failure/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+
 tap_state_failure="$work/tap-state-failure"
 mkdir -p "$tap_state_failure/runner-temp"
 make_tap_origin "$tap_state_failure"
@@ -892,6 +999,44 @@ then
     echo "tap failure output exposed the token" >&2
     exit 1
 fi
+
+tap_corrupt_branch="$work/tap-corrupt-state-branch"
+mkdir -p "$tap_corrupt_branch/runner-temp"
+make_tap_origin "$tap_corrupt_branch"
+corrupt_setup_output="$tap_corrupt_branch/setup-output"
+if run_tap_rehearsal \
+    "$tap_corrupt_branch" \
+    FAIL_PR_VERIFY=1 \
+    > "$corrupt_setup_output" 2>&1
+then
+    echo "unexpected success: corrupt-state setup rehearsal" >&2
+    exit 1
+fi
+corrupt_state="$tap_corrupt_branch/runner-temp/car-go-clean-tap-rehearsal-state"
+sed "s|^branch=.*|branch=rehearsal/car-go-clean-4242-3';echo-corrupt|" \
+    "$corrupt_state" > "$corrupt_state.corrupt"
+chmod 600 "$corrupt_state.corrupt"
+mv "$corrupt_state.corrupt" "$corrupt_state"
+corrupt_calls_before=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
+corrupt_cleanup_output="$tap_corrupt_branch/cleanup-output"
+if run_tap_cleanup_hook \
+    "$tap_corrupt_branch" \
+    > "$corrupt_cleanup_output" 2>&1
+then
+    echo "unexpected success: corrupt loaded rehearsal branch" >&2
+    exit 1
+fi
+corrupt_calls_after=$(wc -l < "$tap_corrupt_branch/gh.log" | tr -d ' ')
+test "$corrupt_calls_before" -eq "$corrupt_calls_after"
+grep -Fq 'tap cleanup state contains an invalid rehearsal branch' \
+    "$corrupt_cleanup_output"
+test "$(cat "$tap_corrupt_branch/pr-state")" = open-draft
+test -n "$(
+    git --git-dir="$tap_corrupt_branch/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$corrupt_state"
+test -x "$tap_corrupt_branch/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
 
 tap_pr_head_mismatch="$work/tap-pr-head-mismatch"
 mkdir -p "$tap_pr_head_mismatch/runner-temp"
@@ -1027,6 +1172,58 @@ then
     exit 1
 fi
 
+tap_branch_retarget_after_close="$work/tap-branch-retarget-after-close"
+mkdir -p "$tap_branch_retarget_after_close/runner-temp"
+make_tap_origin "$tap_branch_retarget_after_close"
+retarget_after_close_sha=$(git \
+    --git-dir="$tap_branch_retarget_after_close/origin.git" \
+    rev-parse refs/heads/main)
+retarget_after_close_output="$tap_branch_retarget_after_close/output"
+if run_tap_rehearsal \
+    "$tap_branch_retarget_after_close" \
+    FAKE_RETARGET_BRANCH_AFTER_CLOSE_SHA="$retarget_after_close_sha" \
+    > "$retarget_after_close_output" 2>&1
+then
+    echo "unexpected success: rehearsal branch was retargeted after PR close" >&2
+    exit 1
+fi
+test "$(cat "$tap_branch_retarget_after_close/pr-state")" = closed
+test "$(git --git-dir="$tap_branch_retarget_after_close/origin.git" rev-parse \
+    refs/heads/rehearsal/car-go-clean-4242-3)" = "$retarget_after_close_sha"
+test -f "$tap_branch_retarget_after_close/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_branch_retarget_after_close/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+grep -Fq 'Manual inspection required' "$retarget_after_close_output"
+if grep -Fq \
+    'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_branch_retarget_after_close/gh.log"
+then
+    echo "branch retargeted after PR close was deleted" >&2
+    exit 1
+fi
+
+tap_branch_absent_after_close="$work/tap-branch-absent-after-close"
+mkdir -p "$tap_branch_absent_after_close/runner-temp"
+make_tap_origin "$tap_branch_absent_after_close"
+absent_after_close_output="$tap_branch_absent_after_close/output"
+run_tap_rehearsal \
+    "$tap_branch_absent_after_close" \
+    FAKE_REMOVE_BRANCH_AFTER_CLOSE=1 \
+    > "$absent_after_close_output" 2>&1
+test "$(cat "$tap_branch_absent_after_close/pr-state")" = closed
+test -z "$(
+    git --git-dir="$tap_branch_absent_after_close/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test ! -e "$tap_branch_absent_after_close/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_branch_absent_after_close/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+if grep -Fq \
+    'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_branch_absent_after_close/gh.log"
+then
+    echo "already absent rehearsal branch received a DELETE request" >&2
+    exit 1
+fi
+
 for lost_push_case in lost-response signal-after-success
 do
     tap_lost_push="$work/tap-push-$lost_push_case"
@@ -1150,6 +1347,48 @@ test "$(grep -F -c 'api --method PATCH repos/dcchuck/homebrew-tap/pulls/73' \
     "$tap_close_checkpoint/gh.log")" -eq 1
 test "$(grep -F -c 'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
     "$tap_close_checkpoint/gh.log")" -eq 1
+
+tap_close_chmod_checkpoint="$work/tap-close-chmod-checkpoint"
+mkdir -p "$tap_close_chmod_checkpoint/runner-temp"
+make_tap_origin "$tap_close_chmod_checkpoint"
+close_chmod_output="$tap_close_chmod_checkpoint/output"
+if run_tap_rehearsal \
+    "$tap_close_chmod_checkpoint" \
+    FAKE_FAIL_STATE_CHMOD_NUMBER=5 \
+    > "$close_chmod_output" 2>&1
+then
+    echo "unexpected success: state chmod checkpoint failed after closing PR" >&2
+    exit 1
+fi
+test "$(cat "$tap_close_chmod_checkpoint/pr-state")" = closed
+test -n "$(
+    git --git-dir="$tap_close_chmod_checkpoint/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state.tmp"
+test -x "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(file_mode "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state")" = 600
+if grep -Fq \
+    'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_close_chmod_checkpoint/gh.log"
+then
+    echo "failed PR-close checkpoint allowed branch deletion" >&2
+    exit 1
+fi
+run_tap_cleanup_hook \
+    "$tap_close_chmod_checkpoint" \
+    FAKE_FAIL_STATE_CHMOD_NUMBER=5
+test ! -e "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_close_chmod_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test -z "$(
+    git --git-dir="$tap_close_chmod_checkpoint/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test "$(grep -F -c 'api --method PATCH repos/dcchuck/homebrew-tap/pulls/73' \
+    "$tap_close_chmod_checkpoint/gh.log")" -eq 1
+test "$(grep -F -c 'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_close_chmod_checkpoint/gh.log")" -eq 1
 
 tap_delete_checkpoint="$work/tap-delete-checkpoint"
 mkdir -p "$tap_delete_checkpoint/runner-temp"
