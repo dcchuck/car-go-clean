@@ -92,8 +92,18 @@ session_temp=
 definition_temp=
 lock_held=false
 rollback_armed=false
+replacement_recovery_armed=false
 original_state=
 cgc_binary=
+session_version=
+session_method=
+session_old_version=
+session_state=
+session_phase=
+session_review=
+session_binary_path=
+session_old_binary_path=
+session_definition_backup_sha256=
 carriage_return=$(printf '\r')
 
 validate_line_value() {
@@ -111,6 +121,114 @@ validate_absolute_path_value() {
     case "$1" in
         /*) ;;
         *) return 1 ;;
+    esac
+}
+
+path_has_no_symlink_components() {
+    candidate_path=$1
+    validate_absolute_path_value "$candidate_path" || return 1
+    remaining_path=${candidate_path#/}
+    checked_path=
+    while [ -n "$remaining_path" ]; do
+        case "$remaining_path" in
+            */*)
+                path_component=${remaining_path%%/*}
+                remaining_path=${remaining_path#*/}
+                ;;
+            *)
+                path_component=$remaining_path
+                remaining_path=
+                ;;
+        esac
+        case "$path_component" in
+            ''|.|..) return 1 ;;
+        esac
+        checked_path=$checked_path/$path_component
+        [ ! -L "$checked_path" ] || return 1
+    done
+}
+
+portable_file_metadata() {
+    metadata_path=$1
+    metadata=$(stat -f '%u:%Lp:%d:%i:%z:%m' -- "$metadata_path" 2>/dev/null || :)
+    case "$metadata" in
+        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*)
+            printf '%s\n' "$metadata"
+            return 0
+            ;;
+    esac
+    metadata=$(stat -c '%u:%a:%d:%i:%s:%Y' -- "$metadata_path" 2>/dev/null || :)
+    case "$metadata" in
+        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*)
+            printf '%s\n' "$metadata"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+sha256_file() {
+    checksum_path=$1
+    case "$platform" in
+        Darwin)
+            checksum_output=$(shasum -a 256 "$checksum_path" 2>/dev/null) ||
+                return 1
+            ;;
+        Linux)
+            checksum_output=$(sha256sum "$checksum_path" 2>/dev/null) ||
+                return 1
+            ;;
+    esac
+    checksum=$(printf '%s\n' "$checksum_output" |
+        awk 'NR == 1 { value = $1 } END { if (NR != 1) exit 1; print value }') ||
+        return 1
+    case "$checksum" in
+        *[!0-9a-f]*|'') return 1 ;;
+    esac
+    [ "${#checksum}" -eq 64 ] || return 1
+    printf '%s\n' "$checksum"
+}
+
+validate_secure_state_dir() {
+    [ ! -L "$state_dir" ] && [ -d "$state_dir" ] ||
+        die "upgrade state path is not a secure directory: $state_dir"
+    path_has_no_symlink_components "$state_dir" ||
+        die "upgrade state directory must not contain a symlink component: $state_dir"
+    state_metadata=$(portable_file_metadata "$state_dir") ||
+        die "could not inspect upgrade state directory ownership and permissions"
+    state_owner=${state_metadata%%:*}
+    state_metadata_rest=${state_metadata#*:}
+    state_mode=${state_metadata_rest%%:*}
+    state_metadata_rest=${state_metadata_rest#*:}
+    state_device=${state_metadata_rest%%:*}
+    state_metadata_rest=${state_metadata_rest#*:}
+    state_inode=${state_metadata_rest%%:*}
+    state_metadata_rest=${state_metadata_rest#*:}
+    state_size=${state_metadata_rest%%:*}
+    state_mtime=${state_metadata_rest#*:}
+    [ "$state_owner:$state_mode:$state_device:$state_inode:$state_size:$state_mtime" = "$state_metadata" ] ||
+        die "could not inspect upgrade state directory ownership and permissions"
+    for metadata_field in "$state_owner" "$state_mode" "$state_device" \
+        "$state_inode" "$state_size" "$state_mtime"; do
+        case "$metadata_field" in
+            ''|*[!0-9]*)
+                die "could not inspect upgrade state directory ownership and permissions"
+                ;;
+            esac
+    done
+    current_uid=$(id -u) ||
+        die "could not determine the current user for upgrade state validation"
+    [ "$state_owner" = "$current_uid" ] ||
+        die "upgrade state directory must be owned by the current user: $state_dir"
+    case "$state_mode" in
+        0[0-7][0-7][0-7]) state_mode=${state_mode#0} ;;
+        [0-7][0-7][0-7]) ;;
+        *) die "upgrade state directory has unsupported permissions: $state_mode" ;;
+    esac
+    case "$state_mode" in
+        ?[2367]?|??[2367])
+            die "upgrade state directory must not be group/world-writable: $state_dir"
+            ;;
     esac
 }
 
@@ -244,16 +362,154 @@ service_is_active() {
     esac
 }
 
+service_enabled_state() {
+    case "$platform" in
+        Darwin)
+            uid=$(id -u) || return 1
+            disabled_services=$(launchctl print-disabled "gui/$uid" 2>/dev/null) ||
+                return 1
+            case "$disabled_services" in
+                *'"com.dcchuck.car-go-clean" => true'*)
+                    printf 'disabled\n'
+                    ;;
+                *)
+                    printf 'enabled\n'
+                    ;;
+            esac
+            ;;
+        Linux)
+            if enabled_output=$(systemctl --user is-enabled car-go-clean.service 2>/dev/null); then
+                [ "$enabled_output" = enabled ] || return 1
+                printf 'enabled\n'
+            else
+                [ "$enabled_output" = disabled ] || return 1
+                printf 'disabled\n'
+            fi
+            ;;
+    esac
+}
+
+enable_service_only() {
+    case "$platform" in
+        Darwin)
+            target=$(launchd_target) || return 1
+            launchctl enable "$target"
+            ;;
+        Linux)
+            systemctl --user enable car-go-clean.service
+            ;;
+    esac
+}
+
+disable_service_only() {
+    case "$platform" in
+        Darwin)
+            target=$(launchd_target) || return 1
+            launchctl disable "$target"
+            ;;
+        Linux)
+            systemctl --user disable car-go-clean.service
+            ;;
+    esac
+}
+
+start_service_only() {
+    case "$platform" in
+        Darwin)
+            uid=$(id -u) || return 1
+            target=$(launchd_target) || return 1
+            launchctl bootstrap "gui/$uid" \
+                "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist" &&
+                launchctl kickstart -k "$target"
+            ;;
+        Linux)
+            systemctl --user start car-go-clean.service
+            ;;
+    esac
+}
+
+stop_service_only() {
+    case "$platform" in
+        Darwin)
+            target=$(launchd_target) || return 1
+            launchctl bootout "$target"
+            ;;
+        Linux)
+            systemctl --user stop car-go-clean.service
+            ;;
+    esac
+}
+
+converge_final_service_state() {
+    enabled_state=$(service_enabled_state) || return 1
+    active_state=false
+    if service_is_active; then
+        active_state=true
+    fi
+
+    case "$session_state" in
+        active)
+            if [ "$enabled_state" = disabled ] && [ "$active_state" = false ]; then
+                restore_active_service || return 1
+            else
+                if [ "$enabled_state" = disabled ]; then
+                    enable_service_only || return 1
+                fi
+                if [ "$active_state" = false ]; then
+                    start_service_only || return 1
+                fi
+            fi
+            [ "$(service_enabled_state)" = enabled ] && service_is_active
+            ;;
+        stopped)
+            if [ "$enabled_state" = enabled ]; then
+                disable_service_only || return 1
+            fi
+            if [ "$active_state" = true ]; then
+                stop_service_only || return 1
+            fi
+            [ "$(service_enabled_state)" = disabled ] && ! service_is_active
+            ;;
+        absent)
+            return 0
+            ;;
+    esac
+}
+
+recover_exact_old_active_service() {
+    [ "$session_state" = active ] || return 1
+    resolved_old_binary=$(canonical_existing_binary "$session_old_binary_path") ||
+        return 1
+    [ "$resolved_old_binary" = "$session_old_binary_path" ] || return 1
+    recovered_old_version=$("$resolved_old_binary" version 2>&1) || return 1
+    [ "$recovered_old_version" = "$session_old_version" ] || return 1
+    restore_active_service &&
+        [ "$(service_enabled_state)" = enabled ] &&
+        service_is_active
+}
+
 on_exit() {
     status=$?
     trap - 0 HUP INT TERM
     set +e
     if [ "$status" -ne 0 ] &&
+        [ "$replacement_recovery_armed" = true ]; then
+        if recover_exact_old_active_service; then
+            echo "Upgrade replacement failed; exact car-go-clean $session_old_version was validated at $session_old_binary_path and the previously active service was restored." >&2
+            rm -f "$session_file" "$service_definition_backup"
+        else
+            disable_installed_service >/dev/null 2>&1 || :
+            replacement_recovery_guidance
+        fi
+    elif [ "$status" -ne 0 ] &&
         [ "$rollback_armed" = true ] &&
         [ "$original_state" = active ]; then
-        echo "Upgrade failed before exact v0.4.0 replacement; restoring the previously active service." >&2
-        if ! restore_active_service; then
-            echo "Automatic service rollback failed; start the existing service with its native manager." >&2
+        if recover_exact_old_active_service; then
+            echo "Upgrade failed before replacement; exact car-go-clean $session_old_version was validated at $session_old_binary_path and the previously active service was restored." >&2
+            rm -f "$session_file" "$service_definition_backup"
+        else
+            disable_installed_service >/dev/null 2>&1 || :
+            pre_replacement_recovery_guidance
         fi
     fi
     cleanup_temporary_files
@@ -266,12 +522,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 prepare_state_dir() {
-    if [ -L "$state_dir" ]; then
-        die "upgrade state directory must not be a symlink: $state_dir"
-    fi
+    path_has_no_symlink_components "$state_dir" ||
+        die "upgrade state directory must not contain a symlink component: $state_dir"
     umask 077
     mkdir -p "$state_dir"
-    [ -d "$state_dir" ] || die "upgrade state path is not a directory: $state_dir"
+    validate_secure_state_dir
 }
 
 acquire_session_lock() {
@@ -318,6 +573,8 @@ load_session() {
     session_phase=
     session_review=
     session_binary_path=
+    session_old_binary_path=
+    session_definition_backup_sha256=
     seen_format=false
     seen_version=false
     seen_method=false
@@ -326,6 +583,8 @@ load_session() {
     seen_phase=false
     seen_review=false
     seen_binary_path=false
+    seen_old_binary_path=false
+    seen_definition_backup_sha256=false
     malformed=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
@@ -369,6 +628,16 @@ load_session() {
                 seen_binary_path=true
                 session_binary_path=${line#binary_path=}
                 ;;
+            old_binary_path=*)
+                [ "$seen_old_binary_path" = false ] || malformed=true
+                seen_old_binary_path=true
+                session_old_binary_path=${line#old_binary_path=}
+                ;;
+            definition_backup_sha256=*)
+                [ "$seen_definition_backup_sha256" = false ] || malformed=true
+                session_definition_backup_sha256=${line#definition_backup_sha256=}
+                seen_definition_backup_sha256=true
+                ;;
             *)
                 malformed=true
                 ;;
@@ -383,9 +652,11 @@ load_session() {
         [ "$seen_state" = true ] &&
         [ "$seen_phase" = true ] &&
         [ "$seen_review" = true ] &&
-        [ "$seen_binary_path" = true ] ||
+        [ "$seen_binary_path" = true ] &&
+        [ "$seen_old_binary_path" = true ] &&
+        [ "$seen_definition_backup_sha256" = true ] ||
         die "upgrade session is malformed"
-    [ "$session_format" = 3 ] || die "upgrade session is malformed"
+    [ "$session_format" = 5 ] || die "upgrade session is malformed"
     [ "$session_version" = 0.4.0 ] || die "upgrade session is malformed"
     case "$session_method" in homebrew|shell) ;; *) die "upgrade session is malformed" ;; esac
     case "$session_old_version" in
@@ -393,17 +664,35 @@ load_session() {
         *) die "upgrade session is malformed" ;;
     esac
     case "$session_state" in active|stopped|absent) ;; *) die "upgrade session is malformed" ;; esac
-    validate_absolute_path_value "$session_binary_path" ||
+    case "$session_state:$session_definition_backup_sha256" in
+        absent:none) ;;
+        active:*|stopped:*)
+            case "$session_definition_backup_sha256" in
+                *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
+            esac
+            [ "${#session_definition_backup_sha256}" -eq 64 ] ||
+                die "upgrade session is malformed"
+            ;;
+        *)
+            die "upgrade session is malformed"
+            ;;
+    esac
+    validate_absolute_path_value "$session_old_binary_path" ||
         die "upgrade session is malformed"
-    resolved_session_binary=$(canonical_existing_binary "$session_binary_path") ||
-        die "upgrade session binary path is unavailable or unsafe"
-    [ "$resolved_session_binary" = "$session_binary_path" ] ||
-        die "upgrade session binary path is no longer exact"
     case "$session_phase" in
+        replacement_attempt)
+            [ "$session_binary_path" = unresolved ] ||
+                die "upgrade session is malformed"
+            [ "$session_review" = none ] || die "upgrade session is malformed"
+            ;;
         replacement_pending|definition_pending|preview_pending)
+            validate_absolute_path_value "$session_binary_path" ||
+                die "upgrade session is malformed"
             [ "$session_review" = none ] || die "upgrade session is malformed"
             ;;
         review_pending|executing|executed)
+            validate_absolute_path_value "$session_binary_path" ||
+                die "upgrade session is malformed"
             case "$session_review" in
                 ''|*[!0-9]*) die "upgrade session is malformed" ;;
                 *) [ "$session_review" -gt 0 ] || die "upgrade session is malformed" ;;
@@ -413,6 +702,12 @@ load_session() {
             die "upgrade session is malformed"
             ;;
     esac
+    if [ "$session_phase" != replacement_attempt ]; then
+        resolved_session_binary=$(canonical_existing_binary "$session_binary_path") ||
+            die "upgrade session binary path is unavailable or unsafe"
+        [ "$resolved_session_binary" = "$session_binary_path" ] ||
+            die "upgrade session binary path is no longer exact"
+    fi
 }
 
 write_session() {
@@ -424,7 +719,7 @@ write_session() {
     chmod 600 "$session_temp" ||
         die "could not secure upgrade session"
     if ! {
-        printf 'format=3\n'
+        printf 'format=5\n'
         printf 'version=%s\n' "$session_version"
         printf 'method=%s\n' "$session_method"
         printf 'old_version=%s\n' "$session_old_version"
@@ -432,6 +727,8 @@ write_session() {
         printf 'phase=%s\n' "$next_phase"
         printf 'review_id=%s\n' "$next_review"
         printf 'binary_path=%s\n' "$session_binary_path"
+        printf 'old_binary_path=%s\n' "$session_old_binary_path"
+        printf 'definition_backup_sha256=%s\n' "$session_definition_backup_sha256"
     } > "$session_temp"; then
         die "could not write upgrade session"
     fi
@@ -454,6 +751,87 @@ validate_resumed_binary() {
     fi
 }
 
+# shellcheck disable=SC2016 # These helpers are emitted for the operator's rollback shell.
+print_secure_definition_restore_helpers() {
+    echo 'secure_restore_no_symlink_components() (' >&2
+    echo '    secure_candidate=$1' >&2
+    echo '    case "$secure_candidate" in /*) ;; *) exit 1 ;; esac' >&2
+    echo '    secure_remaining=${secure_candidate#/}' >&2
+    echo '    secure_checked=' >&2
+    echo '    while [ -n "$secure_remaining" ]; do' >&2
+    echo '        case "$secure_remaining" in' >&2
+    echo '            */*) secure_component=${secure_remaining%%/*}; secure_remaining=${secure_remaining#*/} ;;' >&2
+    echo '            *) secure_component=$secure_remaining; secure_remaining= ;;' >&2
+    echo '        esac' >&2
+    echo '        case "$secure_component" in ""|"."|"..") exit 1 ;; esac' >&2
+    echo '        secure_checked=$secure_checked/$secure_component' >&2
+    echo '        [ ! -L "$secure_checked" ] || exit 1' >&2
+    echo '    done' >&2
+    echo ')' >&2
+    echo 'secure_restore_metadata() (' >&2
+    echo '    secure_path=$1' >&2
+    echo '    secure_restore_no_symlink_components "$secure_path" || exit 1' >&2
+    echo '    [ ! -L "$secure_path" ] && [ -f "$secure_path" ] || exit 1' >&2
+    echo '    secure_metadata=$(stat -f "%u:%Lp:%d:%i:%z:%m" -- "$secure_path" 2>/dev/null || :)' >&2
+    echo '    case "$secure_metadata" in' >&2
+    echo '        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*) ;;' >&2
+    echo '        *) secure_metadata=$(stat -c "%u:%a:%d:%i:%s:%Y" -- "$secure_path" 2>/dev/null) || exit 1 ;;' >&2
+    echo '    esac' >&2
+    echo '    secure_old_ifs=$IFS' >&2
+    echo '    IFS=:' >&2
+    echo '    set -f' >&2
+    echo '    set -- $secure_metadata' >&2
+    echo '    IFS=$secure_old_ifs' >&2
+    echo '    [ "$#" -eq 6 ] || exit 1' >&2
+    echo '    for secure_field do' >&2
+    echo '        case "$secure_field" in ""|*[!0-9]*) exit 1 ;; esac' >&2
+    echo '    done' >&2
+    echo '    [ "$1" = "$(id -u)" ] || exit 1' >&2
+    echo '    case "$2" in 600|0600) ;; *) exit 1 ;; esac' >&2
+    printf '%s\n' '    printf "%s\n" "$secure_metadata"' >&2
+    echo ')' >&2
+    echo 'secure_restore_sha256() (' >&2
+    echo '    secure_path=$1' >&2
+    echo '    if command -v shasum >/dev/null 2>&1; then' >&2
+    echo '        secure_checksum_output=$(shasum -a 256 "$secure_path") || exit 1' >&2
+    echo '    elif command -v sha256sum >/dev/null 2>&1; then' >&2
+    echo '        secure_checksum_output=$(sha256sum "$secure_path") || exit 1' >&2
+    echo '    else' >&2
+    echo '        exit 1' >&2
+    echo '    fi' >&2
+    echo '    set -f' >&2
+    echo '    set -- $secure_checksum_output' >&2
+    echo '    [ "$#" -ge 2 ] || exit 1' >&2
+    echo '    secure_checksum=$1' >&2
+    echo '    case "$secure_checksum" in ""|*[!0-9a-f]*) exit 1 ;; esac' >&2
+    echo '    [ "${#secure_checksum}" -eq 64 ] || exit 1' >&2
+    printf '%s\n' '    printf "%s\n" "$secure_checksum"' >&2
+    echo ')' >&2
+    echo 'secure_restore_saved_definition() (' >&2
+    echo '    secure_backup=$1' >&2
+    echo '    secure_definition=$2' >&2
+    echo '    secure_expected_checksum=$3' >&2
+    echo '    secure_before_metadata=$(secure_restore_metadata "$secure_backup") || exit 1' >&2
+    echo '    [ "$(secure_restore_sha256 "$secure_backup")" = "$secure_expected_checksum" ] || exit 1' >&2
+    echo '    secure_definition_parent=$(CDPATH="" cd -P "$(dirname "$secure_definition")" 2>/dev/null && pwd -P) || exit 1' >&2
+    echo '    secure_definition=$secure_definition_parent/$(basename "$secure_definition")' >&2
+    echo '    secure_temp=$(mktemp "$secure_definition_parent/.car-go-clean-service-restore.XXXXXX") || exit 1' >&2
+    echo '    if chmod 600 "$secure_temp" &&' >&2
+    echo '        cp "$secure_backup" "$secure_temp" &&' >&2
+    echo '        [ "$(secure_restore_metadata "$secure_backup")" = "$secure_before_metadata" ] &&' >&2
+    echo '        [ "$(secure_restore_sha256 "$secure_backup")" = "$secure_expected_checksum" ] &&' >&2
+    echo '        secure_restore_metadata "$secure_temp" >/dev/null &&' >&2
+    echo '        cmp -s "$secure_backup" "$secure_temp" &&' >&2
+    echo '        [ "$(secure_restore_metadata "$secure_backup")" = "$secure_before_metadata" ] &&' >&2
+    echo '        [ "$(secure_restore_sha256 "$secure_temp")" = "$secure_expected_checksum" ] &&' >&2
+    echo '        mv -f "$secure_temp" "$secure_definition"; then' >&2
+    echo '        exit 0' >&2
+    echo '    fi' >&2
+    echo '    rm -f "$secure_temp"' >&2
+    echo '    exit 1' >&2
+    echo ')' >&2
+}
+
 # shellcheck disable=SC2016 # The rollback block must expand these expressions when the operator runs it.
 print_homebrew_rollback_block() {
     rollback_definition=$(installed_service_definition)
@@ -461,6 +839,24 @@ print_homebrew_rollback_block() {
     rollback_definition_word=$(quote_shell_word "$rollback_definition")
     echo "Copy and run this entire rollback block; it stops at the first failing command:" >&2
     echo "# BEGIN car-go-clean exact Homebrew rollback" >&2
+    print_secure_definition_restore_helpers
+    echo 'canonical_rollback_binary() (' >&2
+    echo '    rollback_candidate=$1' >&2
+    echo '    case "$rollback_candidate" in /*) ;; *) exit 1 ;; esac' >&2
+    echo '    rollback_links=0' >&2
+    echo '    while :; do' >&2
+    echo '        rollback_parent=$(CDPATH="" cd -P "$(dirname "$rollback_candidate")" 2>/dev/null && pwd -P) || exit 1' >&2
+    echo '        rollback_candidate=$rollback_parent/$(basename "$rollback_candidate")' >&2
+    echo '        [ -L "$rollback_candidate" ] || break' >&2
+    echo '        rollback_links=$((rollback_links + 1))' >&2
+    echo '        [ "$rollback_links" -le 40 ] || exit 1' >&2
+    echo '        rollback_target=$(readlink "$rollback_candidate") || exit 1' >&2
+    echo '        case "$rollback_target" in /*) ;; *) rollback_target=$(dirname "$rollback_candidate")/$rollback_target ;; esac' >&2
+    echo '        rollback_candidate=$rollback_target' >&2
+    echo '    done' >&2
+    echo '    [ -f "$rollback_candidate" ] && [ -x "$rollback_candidate" ] || exit 1' >&2
+    printf '%s\n' '    printf "%s\n" "$rollback_candidate"' >&2
+    echo ')' >&2
     echo "if (" >&2
     echo "    [ -n \"\${USER-}\" ] &&" >&2
     echo "    rollback_tap=\"\$USER/car-go-clean-rollback\" &&" >&2
@@ -470,11 +866,15 @@ print_homebrew_rollback_block() {
     echo "    brew unlink car-go-clean &&" >&2
     echo "    brew install \"\$rollback_formula\" &&" >&2
     echo "    brew link --force --overwrite \"\$rollback_formula\" &&" >&2
-    echo "    rollback_version=\$(car-go-clean version) &&" >&2
+    echo "    rollback_prefix=\$(brew --prefix \"\$rollback_formula\") &&" >&2
+    echo '    rollback_binary=$(canonical_rollback_binary "$rollback_prefix/bin/car-go-clean") &&' >&2
+    echo '    visible_binary=$(command -v car-go-clean) &&' >&2
+    echo '    visible_binary=$(canonical_rollback_binary "$visible_binary") &&' >&2
+    echo '    [ "$visible_binary" = "$rollback_binary" ] &&' >&2
+    echo '    rollback_version=$("$rollback_binary" version) &&' >&2
     echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
     if [ "$session_state" != absent ]; then
-        echo "    [ -f $rollback_backup_word ] &&" >&2
-        echo "    cp $rollback_backup_word $rollback_definition_word &&" >&2
+        echo "    secure_restore_saved_definition $rollback_backup_word $rollback_definition_word $session_definition_backup_sha256 &&" >&2
         if [ "$platform" = Linux ]; then
             echo "    systemctl --user daemon-reload &&" >&2
         fi
@@ -526,15 +926,20 @@ print_native_restore_guidance() {
 # shellcheck disable=SC2016 # The rollback block must expand these expressions when the operator runs it.
 print_shell_rollback_block() {
     rollback_installer=car-go-clean-installer-v$session_old_version.sh
-    rollback_install_dir=$(dirname "$session_binary_path")
+    rollback_binary_path=$session_binary_path
+    if [ "$rollback_binary_path" = unresolved ]; then
+        rollback_binary_path=$session_old_binary_path
+    fi
+    rollback_install_dir=$(dirname "$rollback_binary_path")
     rollback_definition=$(installed_service_definition)
     rollback_installer_word=$(quote_shell_word "$rollback_installer")
     rollback_install_dir_word=$(quote_shell_word "$rollback_install_dir")
-    rollback_binary_word=$(quote_shell_word "$session_binary_path")
+    rollback_binary_word=$(quote_shell_word "$rollback_binary_path")
     rollback_backup_word=$(quote_shell_word "$service_definition_backup")
     rollback_definition_word=$(quote_shell_word "$rollback_definition")
     echo "Copy and run this entire rollback block; it stops at the first failing command:" >&2
     echo "# BEGIN car-go-clean exact shell rollback" >&2
+    print_secure_definition_restore_helpers
     echo "if (" >&2
     printf '    curl --proto '\''=https'\'' --tlsv1.2 -fsSL -o %s https://github.com/dcchuck/car-go-clean/releases/download/v%s/car-go-clean-installer.sh &&\n' \
         "$rollback_installer_word" "$session_old_version" >&2
@@ -543,8 +948,7 @@ print_shell_rollback_block() {
     echo "    rollback_version=\$($rollback_binary_word version) &&" >&2
     echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
     if [ "$session_state" != absent ]; then
-        echo "    [ -f $rollback_backup_word ] &&" >&2
-        echo "    cp $rollback_backup_word $rollback_definition_word &&" >&2
+        echo "    secure_restore_saved_definition $rollback_backup_word $rollback_definition_word $session_definition_backup_sha256 &&" >&2
         if [ "$platform" = Linux ]; then
             echo "    systemctl --user daemon-reload &&" >&2
         fi
@@ -605,6 +1009,26 @@ replacement_recovery_guidance() {
                 ;;
         esac
     fi
+}
+
+pre_replacement_recovery_guidance() {
+    echo "The upgrade stopped before a durable replacement attempt, and the recorded car-go-clean $session_old_version binary could not be validated for automatic restart." >&2
+    echo "The originally active service remains persistently disabled and stopped." >&2
+    if [ -f "$session_file" ] && [ ! -L "$session_file" ]; then
+        echo "Recovery state is retained at $session_file." >&2
+    else
+        echo "The preserved service definition remains at $service_definition_backup." >&2
+    fi
+    case "$session_method" in
+        homebrew)
+            echo "To restore exact car-go-clean $session_old_version with Homebrew:" >&2
+            print_homebrew_rollback_block
+            ;;
+        shell)
+            echo "To restore exact car-go-clean $session_old_version with the release installer:" >&2
+            print_shell_rollback_block
+            ;;
+    esac
 }
 
 preview_recovery_guidance() {
@@ -741,11 +1165,9 @@ refresh_definition_phase() {
 }
 
 finalize_executed_session() {
-    if [ "$session_state" = active ] && ! service_is_active; then
-        if ! restore_active_service; then
-            restoration_recovery_guidance
-            return 1
-        fi
+    if ! converge_final_service_state; then
+        restoration_recovery_guidance
+        return 1
     fi
     if ! rm -f "$service_definition_backup"; then
         echo "Reviewed execution completed, but the obsolete service-definition backup could not be cleared." >&2
@@ -800,6 +1222,10 @@ if [ -e "$session_file" ] || [ -L "$session_file" ]; then
         die "session version does not match requested version"
     [ "$session_method" = "$method" ] ||
         die "session method does not match requested method"
+    if [ "$session_phase" = replacement_attempt ]; then
+        replacement_recovery_guidance
+        exit 1
+    fi
     if ! validate_resumed_binary; then
         replacement_recovery_guidance
         exit 1
@@ -913,22 +1339,35 @@ case "$state_values" in
     *) die "could not parse v0.2/v0.3 service status output" ;;
 esac
 
+session_version=$version
+session_method=$method
+session_old_version=$old_version
+session_state=$original_state
+session_binary_path=unresolved
+session_old_binary_path=$old_binary
+
 if [ "$original_state" != absent ]; then
     backup_installed_service_definition ||
         die "could not preserve the installed service definition before replacement"
+    session_definition_backup_sha256=$(sha256_file "$service_definition_backup") ||
+        die "could not fingerprint the preserved service definition"
     if [ "$original_state" = active ]; then
         rollback_armed=true
     fi
     disable_installed_service
 else
     rm -f "$service_definition_backup"
+    session_definition_backup_sha256=none
 fi
+
+write_session replacement_attempt none
+rollback_armed=false
+replacement_recovery_armed=true
 
 case "$method" in
         homebrew)
         brew update
         brew upgrade dcchuck/tap/car-go-clean
-        rollback_armed=false
         hash -r 2>/dev/null || :
         new_binary=$(installed_homebrew_binary) ||
             die "could not resolve the exact upgraded Homebrew binary"
@@ -978,7 +1417,6 @@ case "$method" in
         [ "$actual_hash" = "$expected_hash" ] ||
             die "shell-installer checksum verification failed"
         sh "$installer" --version "$version" --install-dir "$install_dir"
-        rollback_armed=false
         new_binary=$(canonical_existing_binary "$old_binary") ||
             die "shell installer did not replace the validated car-go-clean target"
         [ "$new_binary" = "$old_binary" ] ||
@@ -986,12 +1424,9 @@ case "$method" in
         ;;
 esac
 
-session_version=$version
-session_method=$method
-session_old_version=$old_version
-session_state=$original_state
 session_binary_path=$new_binary
 write_session replacement_pending none
+replacement_recovery_armed=false
 if ! validate_resumed_binary; then
     replacement_recovery_guidance
     exit 1

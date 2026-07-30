@@ -964,6 +964,20 @@ esac
 }
 
 #[test]
+fn owner_tour_divergence_recovery_stops_and_refreshes_before_opt_in_install() {
+    let tour = include_str!("../docs/v0.4-owner-tour.md");
+    assert!(tour.contains(
+        "| Service environment divergence | Shell and installed definition resolve protected roots differently. | Review the installed and current roots, run `service stop`, then `service refresh`; use `service install` only when enabling and starting is intentional. |"
+    ));
+    assert!(tour.contains(
+        "car-go-clean service stop\ncar-go-clean service refresh\ncar-go-clean service start"
+    ));
+    assert!(!tour.contains(
+        "| Service environment divergence | Shell and installed definition resolve protected roots differently. | Review the roots, then `service install` to recapture. |"
+    ));
+}
+
+#[test]
 fn documented_config_migration_changes_only_the_legacy_key() {
     let work = tempdir().unwrap();
     let home = work.path().join("home");

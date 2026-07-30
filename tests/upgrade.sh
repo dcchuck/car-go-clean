@@ -4,6 +4,7 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 upgrade="$root/packaging/release/car-go-clean-upgrade.sh"
 work_dir=$(mktemp -d)
+work_dir=$(CDPATH='' cd -P "$work_dir" && pwd -P)
 fake_bin="$work_dir/bin"
 case_root="$work_dir/cases"
 car_go_clean_fixture="$work_dir/car-go-clean-fixture"
@@ -145,6 +146,14 @@ case "$1" in
     print)
         test "$(cat "$SERVICE_STATE")" = running
         ;;
+    print-disabled)
+        test "$#" -eq 2
+        if [ -e "$SERVICE_ENABLED" ]; then
+            printf 'disabled services = {\n    "com.dcchuck.car-go-clean" => false\n}\n'
+        else
+            printf 'disabled services = {\n    "com.dcchuck.car-go-clean" => true\n}\n'
+        fi
+        ;;
     *)
         exit 64
         ;;
@@ -165,6 +174,30 @@ case "$*" in
         : > "$SERVICE_ENABLED"
         printf 'running\n' > "$SERVICE_STATE"
         ;;
+    "--user enable car-go-clean.service")
+        test "${RESTORE_FAIL-0}" != 1
+        : > "$SERVICE_ENABLED"
+        ;;
+    "--user disable car-go-clean.service")
+        rm -f "$SERVICE_ENABLED"
+        ;;
+    "--user start car-go-clean.service")
+        test "${RESTORE_FAIL-0}" != 1
+        printf 'running\n' > "$SERVICE_STATE"
+        ;;
+    "--user stop car-go-clean.service")
+        printf 'stopped\n' > "$SERVICE_STATE"
+        ;;
+    "--user is-enabled car-go-clean.service")
+        if [ -e "$SERVICE_ENABLED" ]; then
+            printf 'enabled\n'
+        else
+            printf 'disabled\n'
+            exit 1
+        fi
+        ;;
+    "--user daemon-reload")
+        ;;
     "--user is-active --quiet car-go-clean.service")
         test "$(cat "$SERVICE_STATE")" = running
         ;;
@@ -181,9 +214,24 @@ printf 'brew %s\n' "$*" >> "$CALL_LOG"
 case "$1" in
     --prefix)
         test "$#" -eq 2
-        test "$2" = car-go-clean
-        test "${BREW_INSTALLED-1}" = 1
-        printf '%s\n' "$BREW_PREFIX"
+        case "$2" in
+            car-go-clean)
+                test "${BREW_INSTALLED-1}" = 1
+                if [ "${BREW_RESOLVE_FAIL_AFTER_SUCCESS-0}" = 1 ] &&
+                    [ "$(cat "$VERSION_FILE")" = 0.4.0 ]; then
+                    exit 73
+                fi
+                printf '%s\n' "$BREW_PREFIX"
+                ;;
+            "$USER"/car-go-clean-rollback/car-go-clean@*)
+                test "${BREW_ROLLBACK_FIXTURE-0}" = 1
+                test "$2" = "$(cat "$BREW_INSTALLED_FORMULA_FILE")"
+                printf '%s\n' "$BREW_ROLLBACK_PREFIX"
+                ;;
+            *)
+                exit 64
+                ;;
+        esac
         ;;
     tap)
         test "$#" -eq 1
@@ -224,6 +272,8 @@ case "$1" in
         else
             cat "$BREW_EXTRACTED_VERSION_FILE" > "$BREW_LINKED_VERSION_FILE"
         fi
+        rm -f "$VISIBLE_CGC_PATH"
+        ln -s "$BREW_ROLLBACK_PREFIX/bin/car-go-clean" "$VISIBLE_CGC_PATH"
         ;;
     update)
         test "${BREW_UPDATE_FAIL-0}" != 1
@@ -232,6 +282,12 @@ case "$1" in
         test "${BREW_INSTALLED-1}" = 1
         ;;
     upgrade)
+        if [ "${BREW_PARTIAL_REPLACE_FAIL-0}" = 1 ]; then
+            printf '0.4.0\n' > "$VERSION_FILE"
+            printf '0.4.0\n' > "$BREW_LINKED_VERSION_FILE"
+            printf 'car-go-clean\n' > "$BREW_LINKED_FORMULA"
+            exit 74
+        fi
         test "${BREW_REPLACE_FAIL-0}" != 1
         if [ "${WRONG_NEW_VERSION-0}" = 1 ]; then
             printf '0.4.1\n' > "$VERSION_FILE"
@@ -252,6 +308,12 @@ case "$1" in
                 printf '%s\n' "$2" > "$BREW_INSTALLED_FORMULA_FILE"
                 ;;
             *)
+                if [ "${BREW_PARTIAL_REPLACE_FAIL-0}" = 1 ]; then
+                    printf '0.4.0\n' > "$VERSION_FILE"
+                    printf '0.4.0\n' > "$BREW_LINKED_VERSION_FILE"
+                    printf 'car-go-clean\n' > "$BREW_LINKED_FORMULA"
+                    exit 74
+                fi
                 test "${BREW_REPLACE_FAIL-0}" != 1
                 if [ "${WRONG_NEW_VERSION-0}" = 1 ]; then
                     printf '0.4.1\n' > "$VERSION_FILE"
@@ -295,11 +357,37 @@ case "$url" in
 #!/bin/sh
 set -eu
 printf 'installer %s\n' "$*" >> "$CALL_LOG"
+install_dir=
+requested_version=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --version)
+            requested_version=$2
+            shift 2
+            ;;
+        --install-dir)
+            install_dir=$2
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+test -n "$requested_version"
+if [ "${SHELL_PARTIAL_REPLACE_FAIL-0}" = 1 ]; then
+    printf '0.4.0\n' > "$VERSION_FILE"
+    exit 75
+fi
 test "${SHELL_REPLACE_FAIL-0}" != 1
-if [ "${WRONG_NEW_VERSION-0}" = 1 ]; then
+if [ "${WRONG_NEW_VERSION-0}" = 1 ] && [ "$requested_version" = 0.4.0 ]; then
     printf '0.4.1\n' > "$VERSION_FILE"
 else
-    printf '0.4.0\n' > "$VERSION_FILE"
+    printf '%s\n' "$requested_version" > "$VERSION_FILE"
+fi
+if [ "${SHELL_RESOLVE_FAIL_AFTER_SUCCESS-0}" = 1 ]; then
+    test -n "$install_dir"
+    chmod -x "$install_dir/car-go-clean"
 fi
 INSTALLER
         ;;
@@ -319,7 +407,14 @@ set -eu
 for argument do
     file=$argument
 done
-printf 'fixture-sha256  %s\n' "$file"
+case "$file" in
+    */car-go-clean-installer.sh)
+        printf 'fixture-sha256  %s\n' "$file"
+        ;;
+    *)
+        exec /usr/bin/shasum -a 256 "$file"
+        ;;
+esac
 EOF
 
 cat > "$fake_bin/sha256sum" <<'EOF'
@@ -328,26 +423,83 @@ set -eu
 for argument do
     file=$argument
 done
-printf 'fixture-sha256  %s\n' "$file"
+case "$file" in
+    */car-go-clean-installer.sh)
+        printf 'fixture-sha256  %s\n' "$file"
+        ;;
+    *)
+        exec /usr/bin/shasum -a 256 "$file"
+        ;;
+esac
 EOF
 
 cat > "$fake_bin/stat" <<'EOF'
 #!/bin/sh
 set -eu
+
+metadata_for() {
+    metadata_path=$1
+    metadata=$(/usr/bin/stat -f '%u:%Lp:%d:%i:%z:%m' "$metadata_path" 2>/dev/null || :)
+    case "$metadata" in
+        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*) ;;
+        *)
+            metadata=$(/usr/bin/stat -c '%u:%a:%d:%i:%s:%Y' "$metadata_path")
+            ;;
+    esac
+    if [ -n "${STAT_OWNER_OVERRIDE_PATH-}" ] &&
+        [ "$metadata_path" = "$STAT_OWNER_OVERRIDE_PATH" ]; then
+        metadata=${STAT_OWNER_OVERRIDE-999}:${metadata#*:}
+    fi
+    printf '%s\n' "$metadata"
+}
+
+mode_for() {
+    mode_path=$1
+    mode=$(/usr/bin/stat -f '%Lp' "$mode_path" 2>/dev/null || :)
+    case "$mode" in
+        [0-7][0-7][0-7]) ;;
+        *) mode=$(/usr/bin/stat -c '%a' "$mode_path") ;;
+    esac
+    printf '%s\n' "$mode"
+}
+
+for argument do
+    stat_path=$argument
+done
+
 if [ "${GNU_STAT_FIXTURE-0}" = 1 ]; then
     case "$1" in
         -f)
             printf 'GNU filesystem status output\n'
             ;;
         -c)
-            printf '600\n'
+            case "$2" in
+                %a) mode_for "$stat_path" ;;
+                '%u:%a:%d:%i:%s:%Y') metadata_for "$stat_path" ;;
+                *) exit 64 ;;
+            esac
             ;;
         *)
             exit 64
             ;;
     esac
+elif [ "${2-}" = '%u:%Lp:%d:%i:%z:%m' ] ||
+    [ "${2-}" = '%u:%a:%d:%i:%s:%Y' ]; then
+    metadata_for "$stat_path"
 else
     exec /usr/bin/stat "$@"
+fi
+EOF
+
+cat > "$fake_bin/cp" <<'EOF'
+#!/bin/sh
+set -eu
+/bin/cp "$@"
+if [ "${BACKUP_RACE-0}" = 1 ] &&
+    [ "${1-}" = "${SERVICE_DEFINITION_BACKUP-}" ]; then
+    mv "$1" "$1.raced"
+    printf '%s\n' '# attacker-replaced-service-definition' > "$1"
+    chmod 600 "$1"
 fi
 EOF
 
@@ -386,7 +538,9 @@ new_case() {
     output_file="$current_case/output"
     binary_path_log="$current_case/binary-paths"
     brew_prefix="$current_case/brew-prefix"
-    mkdir -p "$home" "$state_dir" "$brew_prefix/bin" "$(dirname "$service_definition")"
+    brew_rollback_prefix="$current_case/brew-rollback-prefix"
+    mkdir -p "$home" "$state_dir" "$brew_prefix/bin" \
+        "$brew_rollback_prefix/bin" "$(dirname "$service_definition")"
     : > "$call_log"
     : > "$binary_path_log"
     printf '%s\n' "$old_version" > "$version_file"
@@ -407,6 +561,8 @@ new_case() {
     rm -f "$executed_review"
     cp "$car_go_clean_fixture" "$brew_prefix/bin/car-go-clean"
     chmod +x "$brew_prefix/bin/car-go-clean"
+    cp "$car_go_clean_fixture" "$brew_rollback_prefix/bin/car-go-clean"
+    chmod +x "$brew_rollback_prefix/bin/car-go-clean"
     rm -f "$fake_bin/car-go-clean"
     case "$method" in
         homebrew)
@@ -437,12 +593,15 @@ new_case() {
     EXECUTE_MARKER=
     EXECUTE_SIGNAL=0
     BREW_ROLLBACK_FIXTURE=0
+    ROLLBACK_SHADOW_DIR=
     BREW_TAPS_FILE=$brew_taps_file
     BREW_LINKED_FORMULA=$brew_linked_formula
     BREW_LINKED_VERSION_FILE=$brew_linked_version_file
     BREW_EXTRACTED_VERSION_FILE=$brew_extracted_version_file
     BREW_INSTALLED_FORMULA_FILE=$brew_installed_formula_file
     BREW_PREFIX=$brew_prefix
+    BREW_ROLLBACK_PREFIX=$brew_rollback_prefix
+    VISIBLE_CGC_PATH=$fake_bin/car-go-clean
     BINARY_PATH_LOG=$binary_path_log
     BREW_LINK_FAIL=0
     BREW_LINK_WRONG_VERSION=0
@@ -451,13 +610,21 @@ new_case() {
     BREW_INSTALLED=1
     BREW_UPDATE_FAIL=0
     BREW_REPLACE_FAIL=0
+    BREW_PARTIAL_REPLACE_FAIL=0
+    BREW_RESOLVE_FAIL_AFTER_SUCCESS=0
     SHELL_DOWNLOAD_FAIL=0
     SHELL_REPLACE_FAIL=0
+    SHELL_PARTIAL_REPLACE_FAIL=0
+    SHELL_RESOLVE_FAIL_AFTER_SUCCESS=0
     WRONG_NEW_VERSION=0
     GNU_STAT_FIXTURE=0
+    STAT_OWNER_OVERRIDE_PATH=
+    STAT_OWNER_OVERRIDE=
     RESTORE_FAIL=0
     RESTORE_SIGNAL=0
     RESTORE_SIGNAL_MARKER=$restore_signal_marker
+    BACKUP_RACE=0
+    SERVICE_DEFINITION_BACKUP=$service_definition_backup
     CARGO_HOME=$current_case/manager-roots/cargo
     COLIMA_HOME=$current_case/manager-roots/colima
     mkdir -p "$CARGO_HOME" "$COLIMA_HOME"
@@ -468,20 +635,31 @@ new_case() {
     export EXECUTE_ERROR RESTORE_FAIL
     export EXECUTE_FIFO EXECUTE_MARKER EXECUTE_SIGNAL
     export BREW_ROLLBACK_FIXTURE BREW_TAPS_FILE BREW_LINKED_FORMULA
+    export ROLLBACK_SHADOW_DIR
     export BREW_LINKED_VERSION_FILE BREW_EXTRACTED_VERSION_FILE
     export BREW_INSTALLED_FORMULA_FILE BREW_LINK_FAIL BREW_LINK_WRONG_VERSION
-    export BREW_PREFIX BINARY_PATH_LOG
+    export BREW_PREFIX BREW_ROLLBACK_PREFIX VISIBLE_CGC_PATH BINARY_PATH_LOG
     export ROLLBACK_EXPECTED_VERSION
     export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
+    export BACKUP_RACE SERVICE_DEFINITION_BACKUP
     export BREW_UPDATE_FAIL BREW_REPLACE_FAIL SHELL_DOWNLOAD_FAIL
-    export SHELL_REPLACE_FAIL WRONG_NEW_VERSION
+    export BREW_PARTIAL_REPLACE_FAIL BREW_RESOLVE_FAIL_AFTER_SUCCESS
+    export SHELL_REPLACE_FAIL SHELL_PARTIAL_REPLACE_FAIL
+    export SHELL_RESOLVE_FAIL_AFTER_SUCCESS WRONG_NEW_VERSION
     export GNU_STAT_FIXTURE
+    export STAT_OWNER_OVERRIDE_PATH STAT_OWNER_OVERRIDE
 }
 
 session_value() {
     field=$1
     awk -F= -v field="$field" '$1 == field { print substr($0, length(field) + 2) }' \
         "$state_dir/upgrade-session"
+}
+
+canonical_fixture_path() {
+    fixture_path=$1
+    fixture_parent=$(CDPATH='' cd -P "$(dirname "$fixture_path")" && pwd -P)
+    printf '%s/%s\n' "$fixture_parent" "$(basename "$fixture_path")"
 }
 
 run_upgrade() {
@@ -567,8 +745,34 @@ run_captured_homebrew_rollback() {
     BREW_ROLLBACK_FIXTURE=1
     export BREW_ROLLBACK_FIXTURE
     rollback_output="$current_case/homebrew-rollback.out"
-    if PATH="$fake_bin:/usr/bin:/bin" HOME="$home" USER="$USER" \
+    rollback_path=$fake_bin:/usr/bin:/bin
+    if [ -n "${ROLLBACK_SHADOW_DIR-}" ]; then
+        rollback_path=$ROLLBACK_SHADOW_DIR:$rollback_path
+    fi
+    if PATH="$rollback_path" HOME="$home" USER="$USER" \
         sh "$rollback_script" > "$rollback_output" 2>&1; then
+        rollback_status=0
+    else
+        rollback_status=$?
+    fi
+}
+
+capture_shell_rollback() {
+    rollback_script="$current_case/shell-rollback.sh"
+    sed -n \
+        '/^# BEGIN car-go-clean exact shell rollback$/,/^# END car-go-clean exact shell rollback$/p' \
+        "$output_file" > "$rollback_script"
+    test "$(grep -c '^# BEGIN car-go-clean exact shell rollback$' "$rollback_script")" -eq 1
+    test "$(grep -c '^# END car-go-clean exact shell rollback$' "$rollback_script")" -eq 1
+}
+
+run_captured_shell_rollback() {
+    rollback_output="$current_case/shell-rollback.out"
+    if (
+        CDPATH='' cd "$current_case"
+        PATH="$fake_bin:/usr/bin:/bin" HOME="$home" USER="$USER" \
+            sh "$rollback_script"
+    ) > "$rollback_output" 2>&1; then
         rollback_status=0
     else
         rollback_status=$?
@@ -727,9 +931,56 @@ run_upgrade_outcome_matrix_cell() {
     esac
 }
 
+# The upgrade state boundary rejects symlink traversal and directories that are
+# not exclusively controlled by the current user before touching the service.
+new_case state-symlink-ancestor Darwin 0.2.0 running homebrew
+mkdir -p "$current_case/real-state-parent"
+ln -s "$current_case/real-state-parent" "$current_case/linked-state-parent"
+state_dir=$current_case/linked-state-parent/state
+service_definition_backup=$state_dir/upgrade-service-definition
+CAR_GO_CLEAN_UPGRADE_STATE_DIR=$state_dir
+export CAR_GO_CLEAN_UPGRADE_STATE_DIR
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+assert_output_has "symlink"
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+assert_calls_lack "launchctl bootout"
+
+new_case state-final-symlink Linux 0.3.0 running shell
+rmdir "$state_dir"
+mkdir -p "$current_case/real-state"
+ln -s "$current_case/real-state" "$state_dir"
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+assert_output_has "symlink"
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+assert_calls_lack "systemctl --user disable --now car-go-clean.service"
+
+new_case state-group-writable Darwin 0.2.0 running homebrew
+chmod 0770 "$state_dir"
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+assert_output_has "group/world-writable"
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+assert_calls_lack "launchctl bootout"
+
+new_case state-wrong-owner Linux 0.3.0 running shell
+STAT_OWNER_OVERRIDE_PATH=$state_dir
+STAT_OWNER_OVERRIDE=777
+export STAT_OWNER_OVERRIDE_PATH STAT_OWNER_OVERRIDE
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+assert_output_has "owned by the current user"
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+assert_calls_lack "systemctl --user disable --now car-go-clean.service"
+
 # Every supported platform/version/original-service-state combination exercises
-# preview success, reviewed/no-work, and preview failure against each execute
-# result. Failure preview cells deliberately prove phase two does not run.
+# successful/no-work previews against every execute result. A failed preview has
+# one behaviorally distinct cell because reviewed execution is never attempted.
 matrix_cells=0
 for matrix_platform in Darwin Linux
 do
@@ -739,7 +990,11 @@ do
         do
             for matrix_preview in 0 2 1
             do
-                for matrix_execute in 0 2 1
+                case "$matrix_preview" in
+                    0|2) matrix_execute_outcomes='0 2 1' ;;
+                    1) matrix_execute_outcomes=0 ;;
+                esac
+                for matrix_execute in $matrix_execute_outcomes
                 do
                     run_upgrade_outcome_matrix_cell "$matrix_platform" "$matrix_version" \
                         "$matrix_state" "$matrix_preview" "$matrix_execute"
@@ -751,8 +1006,8 @@ do
 done
 
 # Coverage gate: 2 platforms × 2 versions × 3 service states ×
-# 3 preview outcomes × 3 execute outcomes.
-test "$matrix_cells" -eq 108
+# ((2 successful preview outcomes × 3 execute outcomes) + 1 failed preview).
+test "$matrix_cells" -eq 84
 
 # Upgrade method follows the owner of the visible command and rejects ambiguity
 # before stopping a service or replacing a binary.
@@ -931,6 +1186,74 @@ test "$(cat "$service_state")" = running
 assert_calls_have "launchctl bootout"
 assert_calls_have "launchctl bootstrap"
 
+# Once replacement can have mutated the installation, failures must retain
+# recovery state and must never restart an unvalidated binary.
+new_case brew-partial-replacement Darwin 0.2.0 running homebrew
+BREW_PARTIAL_REPLACE_FAIL=1
+export BREW_PARTIAL_REPLACE_FAIL
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = replacement_attempt
+test "$(session_value binary_path)" = unresolved
+test "$(session_value old_binary_path)" = \
+    "$(canonical_fixture_path "$brew_prefix/bin/car-go-clean")"
+assert_output_has "The originally active service remains persistently disabled and stopped."
+assert_output_has "rollback"
+assert_calls_lack "launchctl enable"
+assert_calls_lack "launchctl bootstrap"
+
+new_case brew-post-success-resolution Linux 0.3.0 running homebrew
+BREW_RESOLVE_FAIL_AFTER_SUCCESS=1
+export BREW_RESOLVE_FAIL_AFTER_SUCCESS
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = replacement_attempt
+test "$(session_value binary_path)" = unresolved
+test "$(session_value old_binary_path)" = \
+    "$(canonical_fixture_path "$brew_prefix/bin/car-go-clean")"
+assert_output_has "The originally active service remains persistently disabled and stopped."
+assert_output_has "rollback"
+assert_calls_lack "systemctl --user enable"
+
+new_case shell-partial-replacement Darwin 0.2.0 running shell
+SHELL_PARTIAL_REPLACE_FAIL=1
+export SHELL_PARTIAL_REPLACE_FAIL
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = replacement_attempt
+test "$(session_value binary_path)" = unresolved
+test "$(session_value old_binary_path)" = \
+    "$(canonical_fixture_path "$fake_bin/car-go-clean")"
+assert_output_has "The originally active service remains persistently disabled and stopped."
+assert_output_has "rollback"
+assert_calls_lack "launchctl enable"
+assert_calls_lack "launchctl bootstrap"
+
+new_case shell-post-success-resolution Linux 0.3.0 running shell
+SHELL_RESOLVE_FAIL_AFTER_SUCCESS=1
+export SHELL_RESOLVE_FAIL_AFTER_SUCCESS
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = replacement_attempt
+test "$(session_value binary_path)" = unresolved
+test "$(session_value old_binary_path)" = \
+    "$(canonical_fixture_path "$fake_bin/car-go-clean")"
+assert_output_has "The originally active service remains persistently disabled and stopped."
+assert_output_has "rollback"
+assert_calls_lack "systemctl --user enable"
+
 new_case wrong-replacement-version Linux 0.3.0 running homebrew
 WRONG_NEW_VERSION=1
 export WRONG_NEW_VERSION
@@ -1059,6 +1382,10 @@ do
     assert_calls_have "brew unlink car-go-clean"
     assert_calls_have "brew install $USER/car-go-clean-rollback/car-go-clean@$2"
     assert_calls_have "brew link --force --overwrite $USER/car-go-clean-rollback/car-go-clean@$2"
+    assert_calls_have "brew --prefix $USER/car-go-clean-rollback/car-go-clean@$2"
+    grep -Fqx \
+        "$(canonical_fixture_path "$brew_rollback_prefix/bin/car-go-clean")" \
+        "$binary_path_log"
     case "$tap_mode" in
         create) assert_calls_have "brew tap-new $USER/car-go-clean-rollback" ;;
         reuse) assert_calls_lack "brew tap-new $USER/car-go-clean-rollback" ;;
@@ -1083,6 +1410,147 @@ do
             assert_calls_lack "launchctl enable"
             ;;
     esac
+done
+
+# A PATH shadow that reports the requested old version is still not the exact
+# binary installed and linked from the rollback formula.
+new_case rollback-path-shadow Darwin 0.3.0 running homebrew
+CONFIG_EXIT=1
+export CONFIG_EXIT
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+capture_homebrew_rollback
+ROLLBACK_SHADOW_DIR=$current_case/shadow-bin
+mkdir -p "$ROLLBACK_SHADOW_DIR"
+cp "$car_go_clean_fixture" "$ROLLBACK_SHADOW_DIR/car-go-clean"
+chmod +x "$ROLLBACK_SHADOW_DIR/car-go-clean"
+export ROLLBACK_SHADOW_DIR
+: > "$call_log"
+run_captured_homebrew_rollback
+test "$rollback_status" -ne 0
+test "$(cat "$service_state")" = stopped
+assert_calls_have "brew --prefix $USER/car-go-clean-rollback/car-go-clean@0.3.0"
+assert_calls_lack "launchctl enable"
+
+# Homebrew rollback is also executable through the complementary Linux manager.
+new_case rollback-homebrew-linux-active Linux 0.3.0 running homebrew
+CONFIG_EXIT=1
+export CONFIG_EXIT
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+capture_homebrew_rollback
+: > "$call_log"
+run_captured_homebrew_rollback
+test "$rollback_status" -eq 0
+test "$(cat "$service_state")" = running
+test "$(cat "$brew_linked_version_file")" = 0.3.0
+grep -F '# legacy-car-go-clean-service-definition' "$service_definition" >/dev/null
+assert_calls_have "systemctl --user daemon-reload"
+assert_calls_have "systemctl --user enable --now car-go-clean.service"
+assert_calls_lack "car-go-clean service start"
+
+# Printed shell rollback blocks execute for every prior service state on Linux,
+# plus an active Darwin service, without relying on old lifecycle verbs.
+for fixture in \
+    rollback-shell-v02-linux-active:Linux:0.2.0:running \
+    rollback-shell-v03-linux-stopped:Linux:0.3.0:stopped \
+    rollback-shell-v03-linux-absent:Linux:0.3.0:'not installed' \
+    rollback-shell-v02-darwin-active:Darwin:0.2.0:running
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" "$3" "$4" shell
+    CONFIG_EXIT=1
+    export CONFIG_EXIT
+    run_upgrade --version 0.4.0 --method shell
+    test "$run_status" -ne 0
+    capture_shell_rollback
+
+    : > "$call_log"
+    : > "$binary_path_log"
+    run_captured_shell_rollback
+    test "$rollback_status" -eq 0
+    test "$(cat "$version_file")" = "$3"
+    grep -Fqx "$(canonical_fixture_path "$fake_bin/car-go-clean")" \
+        "$binary_path_log"
+    assert_calls_have "installer --version $3 --install-dir $(dirname "$(canonical_fixture_path "$fake_bin/car-go-clean")")"
+    assert_calls_lack "car-go-clean service start"
+    assert_calls_lack "car-go-clean service stop"
+    if [ "$4" != "not installed" ]; then
+        grep -F '# legacy-car-go-clean-service-definition' \
+            "$service_definition" >/dev/null
+    fi
+    case "$4" in
+        running)
+            test "$(cat "$service_state")" = running
+            case "$2" in
+                Darwin) assert_calls_have "launchctl bootstrap" ;;
+                Linux) assert_calls_have "systemctl --user enable --now car-go-clean.service" ;;
+            esac
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$4"
+            assert_calls_lack "launchctl enable"
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+            ;;
+    esac
+done
+
+# Rollback restoration treats the saved definition as untrusted input. Symlinks,
+# broad permissions, replacement, and a copy-time race must all fail stopped.
+for fixture in \
+    rollback-backup-symlink:Darwin:0.2.0:homebrew:symlink \
+    rollback-backup-mode:Linux:0.3.0:shell:mode \
+    rollback-backup-replacement:Linux:0.2.0:homebrew:replacement \
+    rollback-backup-race:Darwin:0.3.0:shell:race
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" "$3" running "$4"
+    CONFIG_EXIT=1
+    export CONFIG_EXIT
+    run_upgrade --version 0.4.0 --method "$4"
+    test "$run_status" -ne 0
+    case "$4" in
+        homebrew) capture_homebrew_rollback ;;
+        shell) capture_shell_rollback ;;
+    esac
+
+    case "$5" in
+        symlink)
+            mv "$service_definition_backup" "$service_definition_backup.safe"
+            ln -s "$service_definition_backup.safe" "$service_definition_backup"
+            ;;
+        mode)
+            chmod 0644 "$service_definition_backup"
+            ;;
+        replacement)
+            printf '%s\n' '# attacker-replaced-service-definition' \
+                > "$service_definition_backup"
+            chmod 0600 "$service_definition_backup"
+            ;;
+        race)
+            BACKUP_RACE=1
+            export BACKUP_RACE
+            ;;
+    esac
+
+    : > "$call_log"
+    case "$4" in
+        homebrew) run_captured_homebrew_rollback ;;
+        shell) run_captured_shell_rollback ;;
+    esac
+    test "$rollback_status" -ne 0
+    test "$(cat "$service_state")" = stopped
+    grep -F "Rollback or service restoration failed" "$rollback_output" >/dev/null
+    assert_calls_lack "launchctl enable"
+    assert_calls_lack "systemctl --user enable --now car-go-clean.service"
 done
 
 # Link and exact-version failures short-circuit before active-service restart.
@@ -1208,6 +1676,68 @@ assert_calls_lack "run --review"
 assert_calls_have "launchctl bootstrap"
 test ! -e "$state_dir/upgrade-session"
 
+# Finalization converges persistent enablement and current activity
+# independently before deleting recovery state.
+new_case finalize-active-enabled-inactive Darwin 0.2.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+: > "$service_enabled"
+printf 'stopped\n' > "$service_state"
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test -e "$service_enabled"
+test "$(cat "$service_state")" = running
+assert_calls_lack "launchctl enable"
+assert_calls_have "launchctl bootstrap"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+
+new_case finalize-active-disabled-active Linux 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+rm -f "$service_enabled"
+printf 'running\n' > "$service_state"
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test -e "$service_enabled"
+test "$(cat "$service_state")" = running
+assert_calls_have "systemctl --user enable car-go-clean.service"
+assert_calls_lack "systemctl --user start car-go-clean.service"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+
+new_case finalize-stopped-enabled-inactive Darwin 0.2.0 stopped homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+: > "$service_enabled"
+printf 'stopped\n' > "$service_state"
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test ! -e "$service_enabled"
+test "$(cat "$service_state")" = stopped
+assert_calls_have "launchctl disable"
+assert_calls_lack "launchctl bootout"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+
+new_case finalize-stopped-disabled-active Linux 0.3.0 stopped homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+rm -f "$service_enabled"
+printf 'running\n' > "$service_state"
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test ! -e "$service_enabled"
+test "$(cat "$service_state")" = stopped
+assert_calls_have "systemctl --user stop car-go-clean.service"
+assert_calls_lack "systemctl --user disable car-go-clean.service"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+
 # A signal after reviewed execution leaves `executing`; resume never reruns it.
 new_case execute-signal Linux 0.3.0 running homebrew
 run_upgrade --version 0.4.0 --method homebrew
@@ -1316,8 +1846,9 @@ assert_output_has "symlink"
 rm "$state_dir/upgrade-session"
 
 manual_binary=$(CDPATH='' cd -P "$brew_prefix/bin" && pwd -P)/car-go-clean
-printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\n' \
-    "$manual_binary" \
+manual_digest=0000000000000000000000000000000000000000000000000000000000000000
+printf 'format=5\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\nold_binary_path=%s\ndefinition_backup_sha256=%s\n' \
+    "$manual_binary" "$manual_binary" "$manual_digest" \
     > "$state_dir/upgrade-session"
 chmod 644 "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
@@ -1330,7 +1861,8 @@ run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
 assert_output_has "malformed"
 
-printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=relative/car-go-clean\n' \
+printf 'format=5\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=relative/car-go-clean\nold_binary_path=%s\ndefinition_backup_sha256=%s\n' \
+    "$manual_binary" "$manual_digest" \
     > "$state_dir/upgrade-session"
 chmod 600 "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
@@ -1338,16 +1870,16 @@ test "$run_status" -ne 0
 assert_output_has "malformed"
 assert_calls_lack "run --review"
 
-printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\nbinary_path=%s\n' \
-    "$manual_binary" "$manual_binary" \
+printf 'format=5\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\nbinary_path=%s\nold_binary_path=%s\ndefinition_backup_sha256=%s\n' \
+    "$manual_binary" "$manual_binary" "$manual_binary" "$manual_digest" \
     > "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
 assert_output_has "malformed"
 assert_calls_lack "run --review"
 
-printf 'format=3\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\n' \
-    "$fake_bin/car-go-clean" \
+printf 'format=5\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\nbinary_path=%s\nold_binary_path=%s\ndefinition_backup_sha256=%s\n' \
+    "$fake_bin/car-go-clean" "$manual_binary" "$manual_digest" \
     > "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0

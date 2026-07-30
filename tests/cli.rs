@@ -896,6 +896,34 @@ fn service_diagnostics_expose_installed_roots_with_service_definition_provenance
             && root["provenance"] == "service_definition"
     }));
 
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home)
+            .env("PATH", &path);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        command
+            .assert()
+            .code(2)
+            .stdout(contains("Review the installed and current protected roots"))
+            .stdout(contains("`car-go-clean service stop`"))
+            .stdout(contains("`car-go-clean service refresh`"))
+            .stdout(contains(
+                "`car-go-clean service install` only when enabling and starting is intentional",
+            ))
+            .stdout(
+                contains("run `car-go-clean service install` to recapture the current environment")
+                    .not(),
+            );
+    }
+
     Command::cargo_bin("car-go-clean")
         .unwrap()
         .args(["service", "status"])
@@ -904,7 +932,17 @@ fn service_diagnostics_expose_installed_roots_with_service_definition_provenance
         .assert()
         .success()
         .stdout(contains("Installed service protected roots"))
-        .stdout(contains("/service/cargo (cargo, service_definition)"));
+        .stdout(contains("/service/cargo (cargo, service_definition)"))
+        .stdout(contains("Review the installed and current protected roots"))
+        .stdout(contains("`car-go-clean service stop`"))
+        .stdout(contains("`car-go-clean service refresh`"))
+        .stdout(contains(
+            "`car-go-clean service install` only when enabling and starting is intentional",
+        ))
+        .stdout(
+            contains("run `car-go-clean service install` to recapture the current environment")
+                .not(),
+        );
 }
 
 #[test]

@@ -646,11 +646,15 @@ fn service(command: ServiceCommands) -> Result<()> {
             .unwrap_or("<unknown>"),
     );
     if environment_divergence == Some(true) {
-        println!(
-            "  Warning: protected-root inputs differ; run `car-go-clean service install` to recapture the current environment."
-        );
+        print_service_environment_divergence_guidance("  ");
     }
     Ok(())
+}
+
+fn print_service_environment_divergence_guidance(indent: &str) {
+    println!(
+        "{indent}Warning: protected-root inputs differ. Review the installed and current protected roots, then run `car-go-clean service stop` followed by `car-go-clean service refresh` to recapture while leaving the service disabled/stopped. Use `car-go-clean service install` only when enabling and starting is intentional."
+    );
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1199,9 +1203,7 @@ fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics
             .unwrap_or("<unknown>"),
     );
     if diagnostics.service_environment_divergence == Some(true) {
-        println!(
-            "    Warning: protected-root inputs differ; run `car-go-clean service install` to recapture the current environment."
-        );
+        print_service_environment_divergence_guidance("    ");
     }
     if let Some(warning) = &diagnostics.service.warning {
         print_row("Service warning", warning.kind);
