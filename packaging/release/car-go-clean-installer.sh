@@ -4,11 +4,13 @@ set -eu
 version=latest
 version_requested=false
 install_dir="$HOME/.local/bin"
+download_base_url=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version) version=${2:?missing version}; version_requested=true; shift 2 ;;
         --install-dir) install_dir=${2:?missing install directory}; shift 2 ;;
-        *) echo "usage: $0 [--version X.Y.Z] [--install-dir PATH]" >&2; exit 2 ;;
+        --download-base-url) download_base_url=${2:?missing download base URL}; shift 2 ;;
+        *) echo "usage: $0 [--version X.Y.Z] [--install-dir PATH] [--download-base-url URL]" >&2; exit 2 ;;
     esac
 done
 
@@ -39,6 +41,35 @@ if [ "$version_requested" = true ]; then
     esac
 fi
 
+if [ -n "$download_base_url" ]; then
+    if [ "$version_requested" != true ]; then
+        echo "--download-base-url requires an explicit --version" >&2
+        exit 2
+    fi
+    case "$download_base_url" in
+        https://?*) ;;
+        *)
+            # CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL is a test-only escape hatch
+            # for loopback HTTP and absolute file-backed rehearsal servers.
+            if [ "${CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL-}" != 1 ]; then
+                echo "--download-base-url must use https" >&2
+                exit 2
+            fi
+            case "$download_base_url" in
+                http://127.0.0.1|http://127.0.0.1:*|http://127.0.0.1/*|\
+                http://localhost|http://localhost:*|http://localhost/*|\
+                "http://[::1]"|"http://[::1]":*|"http://[::1]"/*|\
+                file:///*) ;;
+                *)
+                    echo "insecure test download URL must use loopback HTTP or an absolute file URL" >&2
+                    exit 2
+                    ;;
+            esac
+            ;;
+    esac
+    download_base_url=${download_base_url%/}
+fi
+
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64) target=aarch64-apple-darwin ;;
     Darwin:x86_64) target=x86_64-apple-darwin ;;
@@ -58,12 +89,27 @@ esac
 
 archive_name="car-go-clean-$target.tar.xz"
 checksum_name="$archive_name.sha256"
-base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"
+if [ -n "$download_base_url" ]; then
+    base_url=$download_base_url
+else
+    base_url="https://github.com/dcchuck/car-go-clean/releases/download/$tag"
+fi
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-curl --proto '=https' --tlsv1.2 -fsSL -o "$work_dir/$archive_name" "$base_url/$archive_name"
-curl --proto '=https' --tlsv1.2 -fsSL -o "$work_dir/$checksum_name" "$base_url/$checksum_name"
+download_release_file() {
+    destination=$1
+    url=$2
+    case "$url" in
+        https://*) curl --proto '=https' --tlsv1.2 -fsSL -o "$destination" "$url" ;;
+        http://*) curl --proto '=http' -fsSL -o "$destination" "$url" ;;
+        file://*) curl --proto '=file' -fsSL -o "$destination" "$url" ;;
+        *) echo "unsupported download URL: $url" >&2; exit 1 ;;
+    esac
+}
+
+download_release_file "$work_dir/$archive_name" "$base_url/$archive_name"
+download_release_file "$work_dir/$checksum_name" "$base_url/$checksum_name"
 
 expected_hash=$(awk -v file="$archive_name" '
     NF {

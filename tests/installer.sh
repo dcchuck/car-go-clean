@@ -113,6 +113,81 @@ run_installer() {
     "$installer" "$@"
 }
 
+: > "$curl_log"
+if run_installer \
+    --download-base-url https://artifacts.example.invalid/releases/v0.2.0 \
+    --install-dir "$work_dir/missing-version-install"
+then
+    echo "download base URL accepted without an explicit version" >&2
+    exit 1
+fi
+test ! -s "$curl_log"
+
+: > "$curl_log"
+if run_installer \
+    --version 0.2.0 \
+    --download-base-url http://127.0.0.1:8000 \
+    --install-dir "$work_dir/insecure-without-opt-in"
+then
+    echo "insecure download base URL accepted without the test-only opt-in" >&2
+    exit 1
+fi
+test ! -s "$curl_log"
+
+: > "$curl_log"
+override_dir="$work_dir/override-install"
+run_installer \
+    --version 0.2.0 \
+    --download-base-url https://artifacts.example.invalid/releases/v0.2.0 \
+    --install-dir "$override_dir"
+cmp "$fixture_dir/car-go-clean" "$override_dir/car-go-clean"
+test "$(cat "$curl_log")" = "https://artifacts.example.invalid/releases/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://artifacts.example.invalid/releases/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+: > "$curl_log"
+loopback_dir="$work_dir/loopback-install"
+CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+    --version 0.2.0 \
+    --download-base-url http://127.0.0.1:8000 \
+    --install-dir "$loopback_dir"
+cmp "$fixture_dir/car-go-clean" "$loopback_dir/car-go-clean"
+test "$(cat "$curl_log")" = "http://127.0.0.1:8000/car-go-clean-aarch64-apple-darwin.tar.xz http://127.0.0.1:8000/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+: > "$curl_log"
+if CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 run_installer \
+    --version 0.2.0 \
+    --download-base-url http://artifacts.example.invalid/releases/v0.2.0 \
+    --install-dir "$work_dir/non-loopback-install"
+then
+    echo "non-loopback insecure URL accepted with the test-only opt-in" >&2
+    exit 1
+fi
+test ! -s "$curl_log"
+
+file_artifacts="$work_dir/file-artifacts"
+file_bin="$work_dir/file-bin"
+file_install="$work_dir/file-install"
+file_archive=car-go-clean-aarch64-apple-darwin.tar.xz
+mkdir -p "$file_artifacts" "$file_bin"
+cp "$fixture_archive" "$file_artifacts/$file_archive"
+file_hash=$(shasum -a 256 "$file_artifacts/$file_archive" | awk '{ print $1 }')
+printf '%s  %s\n' "$file_hash" "$file_archive" > "$file_artifacts/$file_archive.sha256"
+cp "$fake_bin/uname" "$file_bin/uname"
+chmod +x "$file_bin/uname"
+if ! CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 \
+    PATH="$file_bin:/usr/bin:/bin" \
+    HOME="$work_dir/home" \
+    TEST_UNAME_S=Darwin \
+    TEST_UNAME_M=arm64 \
+    "$installer" \
+        --version 0.2.0 \
+        --download-base-url "file://$file_artifacts" \
+        --install-dir "$file_install"
+then
+    echo "absolute file-backed rehearsal URL was not usable" >&2
+    exit 1
+fi
+cmp "$fixture_dir/car-go-clean" "$file_install/car-go-clean"
+
 for malformed_version in \
     1 \
     1.2 \

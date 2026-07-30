@@ -1,11 +1,11 @@
 CARGO ?= cargo
 
-.PHONY: build test test-installer test-upgrade test-release-notes test-msrv fmt clippy clean
+.PHONY: build test test-installer test-upgrade test-release-notes test-release-scripts test-msrv fmt clippy clean
 
 build:
 	$(CARGO) build
 
-test: test-installer test-upgrade test-release-notes test-msrv
+test: test-installer test-upgrade test-release-notes test-release-scripts test-msrv
 	$(CARGO) test
 
 test-installer:
@@ -16,6 +16,9 @@ test-upgrade:
 
 test-release-notes:
 	sh tests/release-notes.sh
+
+test-release-scripts:
+	sh tests/release-scripts.sh
 
 test-msrv:
 	sh tests/msrv.sh
