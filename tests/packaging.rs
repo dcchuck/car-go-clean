@@ -45,6 +45,31 @@ fn uses_action<'a>(steps: &'a [Yaml], action: &str) -> Vec<&'a Yaml> {
         .collect()
 }
 
+fn collect_uses(document: &Yaml) -> Vec<&str> {
+    fn visit<'a>(node: &'a Yaml, uses: &mut Vec<&'a str>) {
+        match node {
+            Yaml::Array(entries) => {
+                for entry in entries {
+                    visit(entry, uses);
+                }
+            }
+            Yaml::Hash(entries) => {
+                for (key, value) in entries {
+                    if key.as_str() == Some("uses") {
+                        uses.push(value.as_str().expect("uses value must be a string"));
+                    }
+                    visit(value, uses);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut uses = Vec::new();
+    visit(document, &mut uses);
+    uses
+}
+
 #[test]
 fn systemd_service_keeps_the_embedded_binary_placeholder() {
     let service = repo_file("packaging/systemd/car-go-clean.service");
@@ -1253,8 +1278,8 @@ fn release_workflow_is_tag_only_and_uses_dist() {
     assert!(workflow.contains("Enforce annotated vX.Y.Z release tag"));
     assert!(workflow.contains("\n  release-preflight:\n"));
     assert!(workflow.contains("HOMEBREW_TAP_TOKEN is required"));
-    assert!(workflow.contains("gh release create"));
-    assert!(workflow.contains("--draft"));
+    assert!(workflow.contains("scripts/upsert-draft-release.sh"));
+    assert!(!workflow.contains("gh release create"));
     assert!(!workflow.contains("\n  publish-homebrew-formula:\n"));
     assert!(workflow.contains("\n  custom-publish-homebrew-formula:\n"));
     assert!(workflow.contains("\n  custom-release-verify:\n"));
@@ -1302,22 +1327,22 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
             })
         })
         .expect("host job does not compose reviewed release notes");
-    let create = steps
+    let upsert = steps
         .iter()
         .enumerate()
         .find(|(_, step)| {
             run_command(step).is_some_and(|run| {
                 run.lines()
                     .map(str::trim)
-                    .any(|line| line.starts_with("gh release create "))
+                    .any(|line| line.starts_with("scripts/upsert-draft-release.sh "))
             })
         })
-        .expect("host job does not create a release");
+        .expect("host job does not upsert a commit-bound draft");
 
-    assert!(compose.0 < create.0);
+    assert!(compose.0 < upsert.0);
     assert!(compose.1["env"]["ANNOUNCEMENT_BODY"].as_str().is_some());
-    assert!(create.1["env"]["ANNOUNCEMENT_BODY"].is_badvalue());
-    assert!(run_command(create.1)
+    assert!(upsert.1["env"]["ANNOUNCEMENT_BODY"].is_badvalue());
+    assert!(run_command(upsert.1)
         .unwrap()
         .split_whitespace()
         .any(|word| word == "\"$RUNNER_TEMP/notes.txt\""));
@@ -1359,6 +1384,46 @@ fn ci_runs_release_note_validation_after_installer_validation() {
         YamlLoader::load_from_str(&repo_file(".github/release-build-setup.yml")).unwrap();
     let release_steps = release_setup[0].as_vec().unwrap();
     step_running(release_steps, "make test-upgrade");
+
+    let release = workflow(".github/workflows/release.yml");
+    let generated_release_steps = workflow_steps(&release, "build-local-artifacts");
+    step_running(generated_release_steps, "make test-upgrade");
+}
+
+#[test]
+fn release_publication_workflows_pin_actions_and_use_verified_dist() {
+    let allowed_actions = BTreeSet::from([
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
+        "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c",
+    ]);
+
+    for path in [
+        ".github/workflows/release.yml",
+        ".github/workflows/publish-shell-installer.yml",
+        ".github/workflows/publish-homebrew-formula.yml",
+    ] {
+        let document = workflow(path);
+        for action in collect_uses(&document) {
+            if action.starts_with("./") {
+                continue;
+            }
+            assert!(
+                allowed_actions.contains(action),
+                "{path} uses unapproved action ref {action}"
+            );
+        }
+    }
+
+    let release = workflow(".github/workflows/release.yml");
+    let plan_steps = workflow_steps(&release, "plan");
+    assert_eq!(
+        run_command(named_step(plan_steps, "Install verified dist")),
+        Some("scripts/install-cargo-dist.sh")
+    );
+    assert!(!repo_file(".github/workflows/release.yml").contains("cargo-dist-installer.sh | sh"));
 }
 
 #[cfg(unix)]
@@ -1439,7 +1504,27 @@ fn shell_release_assets_are_staged_hashed_attested_and_uploaded_as_one_inventory
     let gh = fake_bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" > \"$GH_LOG\"\n",
+        "#!/bin/sh\n\
+         set -eu\n\
+         printf '%s\\n' \"$*\" >> \"$GH_LOG\"\n\
+         case \"$1 $2\" in\n\
+           'release view')\n\
+             jq -n --arg sha \"$EXPECTED_SHA\" '{\n\
+               tagName: \"v0.4.0\",\n\
+               isDraft: true,\n\
+               targetCommitish: $sha,\n\
+               assets: [\n\
+                 {name: \"keep-me.txt\", id: 1},\n\
+                 {name: \"car-go-clean-installer.sh\", id: 2}\n\
+               ]\n\
+             }'\n\
+             ;;\n\
+           'api repos/dcchuck/car-go-clean/commits/0123456789abcdef0123456789abcdef01234567')\n\
+             printf '%s\\n' \"$EXPECTED_SHA\"\n\
+             ;;\n\
+           'release delete-asset'|'release upload') ;;\n\
+           *) printf 'unexpected gh command: %s\\n' \"$*\" >&2; exit 2 ;;\n\
+         esac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1453,6 +1538,9 @@ fn shell_release_assets_are_staged_hashed_attested_and_uploaded_as_one_inventory
         .env("PATH", std::env::join_paths(path).unwrap())
         .env("TAG", "v0.4.0")
         .env("GH_LOG", &gh_log)
+        .env("GITHUB_REPOSITORY", "dcchuck/car-go-clean")
+        .env("RELEASE_COMMIT", "0123456789abcdef0123456789abcdef01234567")
+        .env("EXPECTED_SHA", "0123456789abcdef0123456789abcdef01234567")
         .output()
         .unwrap();
     assert!(
@@ -1460,10 +1548,18 @@ fn shell_release_assets_are_staged_hashed_attested_and_uploaded_as_one_inventory
         "asset upload failed: {}",
         String::from_utf8_lossy(&upload_output.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(gh_log).unwrap(),
-        "release upload v0.4.0 car-go-clean-installer.sh car-go-clean-upgrade.sh car-go-clean-shell-assets.sha256 --clobber\n"
-    );
+    let gh_calls = fs::read_to_string(gh_log).unwrap();
+    assert!(gh_calls.contains(
+        "release delete-asset v0.4.0 car-go-clean-installer.sh \
+         --repo dcchuck/car-go-clean --yes\n"
+    ));
+    assert!(!gh_calls.contains("delete-asset v0.4.0 keep-me.txt"));
+    assert!(!gh_calls.contains("--clobber"));
+    assert!(gh_calls.contains(
+        "release upload v0.4.0 car-go-clean-installer.sh \
+         car-go-clean-upgrade.sh car-go-clean-shell-assets.sha256 \
+         --repo dcchuck/car-go-clean\n"
+    ));
 }
 
 #[test]
@@ -1497,7 +1593,7 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(formula.contains("gh pr edit"));
     assert!(formula.contains("contents: read"));
     assert!(formula.contains("git push --set-upstream origin \"HEAD:refs/heads/$BRANCH\""));
-    assert!(formula.contains("packaging/release/homebrew/car-go-clean.rb.in"));
+    assert!(formula.contains("scripts/render-homebrew-formula.sh"));
 
     let formula_template = repo_file("packaging/release/homebrew/car-go-clean.rb.in");
     assert!(formula_template.contains("on_macos do"));
@@ -1541,4 +1637,283 @@ fn homebrew_formula_render_fails_before_output_when_checksums_are_missing() {
             .exists(),
         "formula output was created after checksum validation failed"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn formula_release_branch_must_be_formula_only_and_based_on_current_tap_main() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let publish = workflow(".github/workflows/publish-homebrew-formula.yml");
+    let steps = workflow_steps(&publish, "publish-homebrew-formula");
+    let commit_step = named_step(steps, "Commit formula on the release branch");
+    let run = run_command(commit_step).unwrap();
+    let branch = "formula/car-go-clean-v0.4.0";
+
+    for (case, unrelated_diff, advance_main, should_succeed) in [
+        ("matching", false, false, true),
+        ("unrelated-diff", true, false, false),
+        ("wrong-main", false, true, false),
+    ] {
+        let work = tempdir().unwrap();
+        let origin = work.path().join("origin.git");
+        let source = work.path().join("source");
+        let checkout = work.path().join("homebrew-tap");
+        let generated = work.path().join("generated-formula");
+        let fake_bin = work.path().join("bin");
+        let github_env = work.path().join("github-env");
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&generated).unwrap();
+        fs::create_dir_all(&fake_bin).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet", "--bare"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        for (key, value) in [
+            ("user.name", "Formula Test"),
+            ("user.email", "formula-test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            assert!(Command::new("git")
+                .args(["-C"])
+                .arg(&source)
+                .args(["config", key, value])
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(source.join("README.md"), "tap fixture\n").unwrap();
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["commit", "--quiet", "-m", "seed tap"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["remote", "add", "origin"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["push", "--quiet", "--set-upstream", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg(format!("--git-dir={}", origin.display()))
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["switch", "--quiet", "--create", branch])
+            .status()
+            .unwrap()
+            .success());
+        fs::create_dir_all(source.join("Formula")).unwrap();
+        fs::write(
+            source.join("Formula/car-go-clean.rb"),
+            "class CarGoClean < Formula\nend\n",
+        )
+        .unwrap();
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["add", "Formula/car-go-clean.rb"])
+            .status()
+            .unwrap()
+            .success());
+        if unrelated_diff {
+            fs::write(source.join("UNRELATED.md"), "must not ship\n").unwrap();
+            assert!(Command::new("git")
+                .args(["-C"])
+                .arg(&source)
+                .args(["add", "UNRELATED.md"])
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["commit", "--quiet", "-m", "existing formula branch"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["push", "--quiet", "--set-upstream", "origin", branch])
+            .status()
+            .unwrap()
+            .success());
+        let branch_before = String::from_utf8(
+            Command::new("git")
+                .arg(format!("--git-dir={}", origin.display()))
+                .args(["rev-parse", &format!("refs/heads/{branch}")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["switch", "--quiet", "main"])
+            .status()
+            .unwrap()
+            .success());
+        if advance_main {
+            fs::write(source.join("main-advanced"), "new tap main\n").unwrap();
+            assert!(Command::new("git")
+                .args(["-C"])
+                .arg(&source)
+                .args(["add", "main-advanced"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args(["-C"])
+                .arg(&source)
+                .args(["commit", "--quiet", "-m", "advance tap main"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args(["-C"])
+                .arg(&source)
+                .args(["push", "--quiet", "origin", "main"])
+                .status()
+                .unwrap()
+                .success());
+        }
+        let main_sha = String::from_utf8(
+            Command::new("git")
+                .arg(format!("--git-dir={}", origin.display()))
+                .args(["rev-parse", "refs/heads/main"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let main_sha = main_sha.trim();
+
+        assert!(Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg(&origin)
+            .arg(&checkout)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(
+            generated.join("car-go-clean.rb"),
+            "class CarGoClean < Formula\n  desc \"updated\"\nend\n",
+        )
+        .unwrap();
+        let gh = fake_bin.join("gh");
+        write_executable(
+            &gh,
+            "#!/bin/sh\n\
+             set -eu\n\
+             case \"$1 $2\" in\n\
+               'repo view') printf '%s\\n' main ;;\n\
+               'api repos/dcchuck/homebrew-tap/git/ref/heads/main') printf '%s\\n' \"$TAP_MAIN_SHA\" ;;\n\
+               *) printf 'unexpected gh command: %s\\n' \"$*\" >&2; exit 2 ;;\n\
+             esac\n",
+        );
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = vec![fake_bin.clone()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let output = Command::new("bash")
+            .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", run])
+            .current_dir(&checkout)
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("TAP_REPOSITORY", "dcchuck/homebrew-tap")
+            .env("TAP_MAIN_SHA", main_sha)
+            .env("BRANCH", branch)
+            .env("VERSION", "0.4.0")
+            .env("GITHUB_ENV", &github_env)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.success(),
+            should_succeed,
+            "case {case} had unexpected status; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let branch_after = String::from_utf8(
+            Command::new("git")
+                .arg(format!("--git-dir={}", origin.display()))
+                .args(["rev-parse", &format!("refs/heads/{branch}")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        if should_succeed {
+            let changed = Command::new("git")
+                .arg(format!("--git-dir={}", origin.display()))
+                .args([
+                    "diff",
+                    "--name-only",
+                    &format!("refs/heads/main...refs/heads/{branch}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(changed.status.success());
+            assert_eq!(
+                String::from_utf8(changed.stdout).unwrap(),
+                "Formula/car-go-clean.rb\n"
+            );
+            let merge_base = Command::new("git")
+                .arg(format!("--git-dir={}", origin.display()))
+                .args([
+                    "merge-base",
+                    "refs/heads/main",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(merge_base.status.success());
+            assert_eq!(
+                String::from_utf8(merge_base.stdout).unwrap().trim(),
+                main_sha
+            );
+        } else {
+            assert_eq!(
+                branch_after, branch_before,
+                "rejected case {case} mutated the remote formula branch"
+            );
+        }
+    }
 }

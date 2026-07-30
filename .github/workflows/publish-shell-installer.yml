@@ -17,7 +17,7 @@ jobs:
         run: |
           TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
           printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Stage shell release assets
@@ -29,7 +29,7 @@ jobs:
             car-go-clean-upgrade.sh \
             > car-go-clean-shell-assets.sha256
       - name: Attest shell release assets
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
             car-go-clean-installer.sh
@@ -38,4 +38,50 @@ jobs:
       - name: Upload shell release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$TAG" car-go-clean-installer.sh car-go-clean-upgrade.sh car-go-clean-shell-assets.sha256 --clobber
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          RELEASE_JSON="$(
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,targetCommitish,assets
+          )"
+          test "$(printf '%s\n' "$RELEASE_JSON" | jq -er '.tagName')" = "$TAG"
+          test "$(printf '%s\n' "$RELEASE_JSON" | jq -er '.isDraft')" = true
+          TARGET="$(
+            printf '%s\n' "$RELEASE_JSON" |
+              jq -er '.targetCommitish'
+          )"
+          RESOLVED_TARGET="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$TARGET" --jq '.sha'
+          )"
+          test "$RESOLVED_TARGET" = "$RELEASE_COMMIT"
+
+          for ASSET in \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            car-go-clean-shell-assets.sha256
+          do
+            COUNT="$(
+              printf '%s\n' "$RELEASE_JSON" |
+                jq --arg name "$ASSET" \
+                  '[.assets[] | select(.name == $name)] | length'
+            )"
+            case "$COUNT" in
+              0) ;;
+              1)
+                gh release delete-asset "$TAG" "$ASSET" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --yes
+                ;;
+              *)
+                echo "duplicate shell release asset: $ASSET" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          gh release upload "$TAG" \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            car-go-clean-shell-assets.sha256 \
+            --repo "$GITHUB_REPOSITORY"

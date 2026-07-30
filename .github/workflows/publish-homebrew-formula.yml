@@ -31,55 +31,23 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: test -n "$HOMEBREW_TAP_TOKEN"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Download release checksums
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-*
           path: dist-artifacts
           merge-multiple: true
       - name: Render standards-compliant formula
         run: |
-          checksum_for() {
-            archive="$1"
-            checksum_paths="$(find dist-artifacts -type f -name "${archive}.sha256" -print)"
-            test "$(printf '%s\n' "$checksum_paths" | awk 'NF { count++ } END { print count + 0 }')" -eq 1
-            awk -v archive="$archive" '
-              NF {
-                count++
-                if (count != 1 || NF != 2 || ($2 != archive && $2 != "*" archive)) {
-                  exit 1
-                }
-                print $1
-              }
-              END {
-                if (count != 1) {
-                  exit 1
-                }
-              }
-            ' "$checksum_paths"
-          }
-          AARCH64_APPLE_SHA256="$(checksum_for car-go-clean-aarch64-apple-darwin.tar.xz)"
-          export AARCH64_APPLE_SHA256
-          X86_64_APPLE_SHA256="$(checksum_for car-go-clean-x86_64-apple-darwin.tar.xz)"
-          export X86_64_APPLE_SHA256
-          AARCH64_LINUX_SHA256="$(checksum_for car-go-clean-aarch64-unknown-linux-musl.tar.xz)"
-          export AARCH64_LINUX_SHA256
-          X86_64_LINUX_SHA256="$(checksum_for car-go-clean-x86_64-unknown-linux-musl.tar.xz)"
-          export X86_64_LINUX_SHA256
-          export TAG
           mkdir -p generated-formula
-          perl -pe '
-            s/__TAG__/$ENV{TAG}/g;
-            s/__AARCH64_APPLE_SHA256__/$ENV{AARCH64_APPLE_SHA256}/g;
-            s/__X86_64_APPLE_SHA256__/$ENV{X86_64_APPLE_SHA256}/g;
-            s/__AARCH64_LINUX_SHA256__/$ENV{AARCH64_LINUX_SHA256}/g;
-            s/__X86_64_LINUX_SHA256__/$ENV{X86_64_LINUX_SHA256}/g;
-          ' packaging/release/homebrew/car-go-clean.rb.in > generated-formula/car-go-clean.rb
-          ! rg '__[A-Z0-9_]+__' generated-formula/car-go-clean.rb
-      - uses: actions/checkout@v6
+          scripts/render-homebrew-formula.sh \
+            "$TAG" \
+            dist-artifacts \
+            generated-formula/car-go-clean.rb
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: dcchuck/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -92,10 +60,27 @@ jobs:
           DEFAULT_BRANCH="$(gh repo view "$TAP_REPOSITORY" --json defaultBranchRef --jq '.defaultBranchRef.name')"
           test -n "$DEFAULT_BRANCH"
           test "$BRANCH" != "$DEFAULT_BRANCH"
+          TAP_MAIN_SHA="$(
+            gh api \
+              "repos/$TAP_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" \
+              --jq '.object.sha'
+          )"
+          printf '%s\n' "$TAP_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$'
           git fetch origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          test "$(git rev-parse "origin/$DEFAULT_BRANCH")" = "$TAP_MAIN_SHA"
           if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
             git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git switch --create "$BRANCH" --track "origin/$BRANCH"
+            test "$(git merge-base HEAD "origin/$DEFAULT_BRANCH")" = "$TAP_MAIN_SHA"
+            EXISTING_DIFF="$(git diff --name-only "origin/$DEFAULT_BRANCH...HEAD")"
+            case "$EXISTING_DIFF" in
+              ''|Formula/car-go-clean.rb) ;;
+              *)
+                echo "existing release branch contains unrelated changes:" >&2
+                printf '%s\n' "$EXISTING_DIFF" >&2
+                exit 1
+                ;;
+            esac
           else
             git switch --create "$BRANCH" "origin/$DEFAULT_BRANCH"
           fi
@@ -107,6 +92,25 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "car-go-clean $VERSION"
           fi
+          test "$(git merge-base HEAD "origin/$DEFAULT_BRANCH")" = "$TAP_MAIN_SHA"
+          FINAL_DIFF="$(git diff --name-only "origin/$DEFAULT_BRANCH...HEAD")"
+          case "$FINAL_DIFF" in
+            ''|Formula/car-go-clean.rb) ;;
+            *)
+              echo "release branch contains unrelated changes:" >&2
+              printf '%s\n' "$FINAL_DIFF" >&2
+              exit 1
+              ;;
+          esac
+          test "$(
+            gh api \
+              "repos/$TAP_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" \
+              --jq '.object.sha'
+          )" = "$TAP_MAIN_SHA"
+          test "$(
+            git ls-remote origin "refs/heads/$DEFAULT_BRANCH" |
+              awk 'NR == 1 { print $1 }'
+          )" = "$TAP_MAIN_SHA"
           git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
           printf 'DEFAULT_BRANCH=%s\n' "$DEFAULT_BRANCH" >> "$GITHUB_ENV"
       - name: Open or update formula pull request
