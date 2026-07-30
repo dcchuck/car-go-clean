@@ -6,18 +6,22 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - name: Install dist
-        shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.95.0"
+      - name: Install verified dist
+        run: scripts/install-cargo-dist.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check Clippy
@@ -30,6 +34,8 @@ jobs:
         run: make test-upgrade
       - name: Check release notes
         run: make test-release-notes
+      - name: Check shared release scripts
+        run: make test-release-scripts
       - name: Plan release artifacts
         run: |
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "car-go-clean").version')"

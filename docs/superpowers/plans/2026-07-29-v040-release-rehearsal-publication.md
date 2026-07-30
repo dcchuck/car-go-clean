@@ -31,10 +31,14 @@ Use these exact pins in every changed workflow:
 actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
 actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-actions/attest@36051bcae73b7c2a8a6945a48cbf80953c6baa35 # v4
-actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
 dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
 ```
+
+The attestation entries above are commit objects, not movable tag refs or annotated-tag
+objects. Preflight resolution replaced the original stale `actions/attest` value and
+peeled the original `actions/attest-build-provenance` tag object before workflow use.
 
 ---
 

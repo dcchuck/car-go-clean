@@ -1,0 +1,673 @@
+name: Rehearse release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact 40-character commit on main
+        required: true
+        type: string
+      version:
+        description: Exact X.Y.Z version
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate exact release inputs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch main and release tags
+        run: |
+          git fetch --force origin main:refs/remotes/origin/main
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+      - name: Validate exact SHA and version
+        run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.95.0"
+      - name: Install verified cargo-dist
+        run: scripts/install-cargo-dist.sh
+      - name: Plan exact release
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-plan"
+          dist plan \
+            --tag "v${{ inputs.version }}" \
+            --output-format=json \
+            > "$RUNNER_TEMP/rehearsal-plan/dist-plan.json"
+      - name: Write validation evidence
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
+          if command -v dist >/dev/null 2>&1
+          then
+            cargo_dist_version=$(dist --version)
+          else
+            cargo_dist_version=unavailable
+          fi
+          jq -n \
+            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg runner_os "${{ runner.os }}" \
+            --arg runner_arch "${{ runner.arch }}" \
+            --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg cargo_dist_version "$cargo_dist_version" \
+            '{
+              format_version: 1,
+              phase: "validate",
+              exact_sha: $exact_sha,
+              version: $version,
+              runner: {os: $runner_os, architecture: $runner_arch},
+              cargo_dist_version: $cargo_dist_version,
+              outcomes: {checkout: $checkout},
+              action_pins: {
+                checkout: "d23441a48e516b6c34aea4fa41551a30e30af803",
+                upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                rust_toolchain: "2c7215f132e9ebf062739d9130488b56d53c060c"
+              }
+            }' > "$RUNNER_TEMP/rehearsal-evidence/validate.json"
+      - name: Upload exact release plan
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-plan-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/rehearsal-plan
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-evidence-validate-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build target archives
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            expected_uname: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            expected_uname: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            expected_uname: aarch64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            expected_uname: x86_64
+    steps:
+      - id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch main and release tags
+        run: |
+          git fetch --force origin main:refs/remotes/origin/main
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+      - name: Revalidate exact checkout
+        run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+      - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - id: install_dist
+        name: Install verified cargo-dist
+        run: scripts/install-cargo-dist.sh
+      - id: build_target
+        name: Build and verify target archive
+        run: |
+          actual_arch=$(uname -m)
+          test "$actual_arch" = "${{ matrix.expected_uname }}" || {
+            echo "runner architecture $actual_arch does not match target ${{ matrix.target }}" >&2
+            exit 1
+          }
+
+          dist build \
+            --tag "v${{ inputs.version }}" \
+            --artifacts=local \
+            --target=${{ matrix.target }} \
+            --print=linkage \
+            --output-format=json \
+            > "$RUNNER_TEMP/${{ matrix.target }}-dist-manifest.json"
+
+          archive="car-go-clean-${{ matrix.target }}.tar.xz"
+          checksum="$archive.sha256"
+          test -f "target/distrib/$archive"
+          test -f "target/distrib/$checksum"
+          (
+            cd target/distrib
+            if command -v shasum >/dev/null 2>&1
+            then
+              shasum -a 256 -c "$checksum"
+            else
+              sha256sum -c "$checksum"
+            fi
+          )
+
+          mkdir -p "$RUNNER_TEMP/rehearsal-artifacts"
+          cp "target/distrib/$archive" "$RUNNER_TEMP/rehearsal-artifacts/"
+          cp "target/distrib/$checksum" "$RUNNER_TEMP/rehearsal-artifacts/"
+          cp "$RUNNER_TEMP/${{ matrix.target }}-dist-manifest.json" \
+            "$RUNNER_TEMP/rehearsal-artifacts/rehearsal-${{ inputs.commit_sha }}-${{ matrix.target }}-dist-manifest.json"
+      - name: Attest target archive
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ runner.temp }}/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz
+      - name: Upload target archive and manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-build-${{ inputs.commit_sha }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/rehearsal-artifacts
+          if-no-files-found: error
+          retention-days: 14
+      - name: Write target build evidence
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
+          BUILD_OUTCOME: ${{ steps.build_target.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
+          archive="$RUNNER_TEMP/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz"
+          if test -f "$archive"
+          then
+            if command -v shasum >/dev/null 2>&1
+            then
+              archive_hash=$(shasum -a 256 "$archive" | awk '{print $1}')
+            else
+              archive_hash=$(sha256sum "$archive" | awk '{print $1}')
+            fi
+          else
+            archive_hash=unavailable
+          fi
+          if command -v dist >/dev/null 2>&1
+          then
+            cargo_dist_version=$(dist --version)
+          else
+            cargo_dist_version=unavailable
+          fi
+          jq -n \
+            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg target "${{ matrix.target }}" \
+            --arg requested_runner "${{ matrix.runner }}" \
+            --arg runner_os "${{ runner.os }}" \
+            --arg runner_arch "${{ runner.arch }}" \
+            --arg uname_arch "$(uname -m)" \
+            --arg archive_hash "$archive_hash" \
+            --arg cargo_dist_version "$cargo_dist_version" \
+            --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg install_dist "$INSTALL_DIST_OUTCOME" \
+            --arg build "$BUILD_OUTCOME" \
+            '{
+              format_version: 1,
+              phase: "build",
+              exact_sha: $exact_sha,
+              version: $version,
+              target: $target,
+              runner: {
+                requested: $requested_runner,
+                os: $runner_os,
+                architecture: $runner_arch,
+                uname: $uname_arch
+              },
+              archive_sha256: $archive_hash,
+              cargo_dist_version: $cargo_dist_version,
+              outcomes: {
+                checkout: $checkout,
+                install_cargo_dist: $install_dist,
+                build: $build
+              },
+              action_pins: {
+                checkout: "d23441a48e516b6c34aea4fa41551a30e30af803",
+                upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                attest_build_provenance: "e8998f949152b193b063cb0ec769d69d929409be",
+                rust_toolchain: "2c7215f132e9ebf062739d9130488b56d53c060c"
+              }
+            }' > "$RUNNER_TEMP/rehearsal-evidence/build-${{ matrix.target }}.json"
+      - name: Upload target evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-evidence-build-${{ inputs.commit_sha }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: Smoke actual install paths
+    needs:
+      - validate
+      - build
+    if: ${{ always() }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            expected_uname: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            expected_uname: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            expected_uname: aarch64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            expected_uname: x86_64
+    steps:
+      - id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+      - id: download
+        name: Download all target archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-rehearsal-build-${{ inputs.commit_sha }}-*
+          path: ${{ runner.temp }}/rehearsal-artifacts
+          merge-multiple: true
+      - id: smoke_paths
+        name: Smoke actual installer and formula
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          ARTIFACT_DIR: ${{ runner.temp }}/rehearsal-artifacts
+          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-smoke
+        run: |
+          set -eu
+          actual_arch=$(uname -m)
+          test "$actual_arch" = "$EXPECTED_UNAME" || {
+            echo "runner architecture $actual_arch does not match target $TARGET" >&2
+            exit 1
+          }
+
+          scripts/verify-release-assets.sh "v$VERSION" "$ARTIFACT_DIR" \
+            > "$RUNNER_TEMP/release-inventory.tsv"
+          archive="$ARTIFACT_DIR/car-go-clean-$TARGET.tar.xz"
+          archive_hash=$(awk -F '	' -v archive="car-go-clean-$TARGET.tar.xz" \
+            '$1 == archive {print $2}' "$RUNNER_TEMP/release-inventory.tsv")
+          test -n "$archive_hash"
+
+          rm -rf "$ISOLATED_ROOT"
+          mkdir -p \
+            "$ISOLATED_ROOT/home" \
+            "$ISOLATED_ROOT/projects" \
+            "$ISOLATED_ROOT/state" \
+            "$ISOLATED_ROOT/extracted" \
+            "$ISOLATED_ROOT/installed/bin" \
+            "$ISOLATED_ROOT/server/dcchuck/car-go-clean/releases/download/v$VERSION" \
+            "$ISOLATED_ROOT/formula"
+          tar -xJf "$archive" -C "$ISOLATED_ROOT/extracted"
+          binary=$(find "$ISOLATED_ROOT/extracted" -type f -name car-go-clean -perm -111)
+          test "$(printf '%s\n' "$binary" | awk 'NF {count++} END {print count + 0}')" -eq 1
+          version_output=$("$binary" version)
+          test "$version_output" = "$VERSION"
+
+          printf 'scan_dirs = ["%s"]\n' "$ISOLATED_ROOT/projects" \
+            > "$ISOLATED_ROOT/config.toml"
+          HOME="$ISOLATED_ROOT/home" \
+            XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
+            XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
+            "$binary" scan \
+              --config "$ISOLATED_ROOT/config.toml" \
+              --state-dir "$ISOLATED_ROOT/state"
+          HOME="$ISOLATED_ROOT/home" \
+            XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
+            XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
+            "$binary" health --skip-cargo \
+              --config "$ISOLATED_ROOT/config.toml" \
+              --state-dir "$ISOLATED_ROOT/state"
+
+          cp "$ARTIFACT_DIR"/car-go-clean-*.tar.xz \
+            "$ISOLATED_ROOT/server/dcchuck/car-go-clean/releases/download/v$VERSION/"
+          cp "$ARTIFACT_DIR"/car-go-clean-*.tar.xz.sha256 \
+            "$ISOLATED_ROOT/server/dcchuck/car-go-clean/releases/download/v$VERSION/"
+          python3 -m http.server 8765 \
+            --bind 127.0.0.1 \
+            --directory "$ISOLATED_ROOT/server" \
+            > "$RUNNER_TEMP/rehearsal-http.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" >/dev/null 2>&1 || true
+            if test "$(uname -s)" = Darwin && command -v brew >/dev/null 2>&1
+            then
+              HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --force car-go-clean \
+                >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT HUP INT TERM
+          attempts=0
+          until curl --proto '=http' -fsS \
+            "http://127.0.0.1:8765/dcchuck/car-go-clean/releases/download/v$VERSION/car-go-clean-$TARGET.tar.xz" \
+            >/dev/null
+          do
+            attempts=$((attempts + 1))
+            test "$attempts" -lt 30
+            sleep 1
+          done
+
+          CAR_GO_CLEAN_ALLOW_INSECURE_TEST_URL=1 \
+            HOME="$ISOLATED_ROOT/home" \
+            sh packaging/release/car-go-clean-installer.sh \
+              --version "$VERSION" \
+              --install-dir "$ISOLATED_ROOT/installed/bin" \
+              --download-base-url \
+                "http://127.0.0.1:8765/dcchuck/car-go-clean/releases/download/v$VERSION"
+          test "$("$ISOLATED_ROOT/installed/bin/car-go-clean" version)" = "$VERSION"
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+
+          scripts/render-homebrew-formula.sh \
+            "v$VERSION" \
+            "$ARTIFACT_DIR" \
+            "$ISOLATED_ROOT/formula/car-go-clean.release.rb"
+          sed 's#https://github.com/#http://127.0.0.1:8765/#g' \
+            "$ISOLATED_ROOT/formula/car-go-clean.release.rb" \
+            > "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          if test "$(uname -s)" = Darwin
+          then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            export HOMEBREW_NO_INSTALL_CLEANUP=1
+            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            brew test car-go-clean
+            brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
+            test "$("$brew_binary" version)" = "$VERSION"
+          else
+            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+          fi
+          test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
+          test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+          test ! -e "$HOME/.config/systemd/user/car-go-clean.service"
+      - name: Write target smoke evidence
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke_paths.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
+          archive="$RUNNER_TEMP/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz"
+          if test -f "$archive"
+          then
+            if command -v shasum >/dev/null 2>&1
+            then
+              archive_hash=$(shasum -a 256 "$archive" | awk '{print $1}')
+            else
+              archive_hash=$(sha256sum "$archive" | awk '{print $1}')
+            fi
+          else
+            archive_hash=unavailable
+          fi
+          jq -n \
+            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg target "${{ matrix.target }}" \
+            --arg requested_runner "${{ matrix.runner }}" \
+            --arg runner_os "${{ runner.os }}" \
+            --arg runner_arch "${{ runner.arch }}" \
+            --arg uname_arch "$(uname -m)" \
+            --arg archive_hash "$archive_hash" \
+            --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg download "$DOWNLOAD_OUTCOME" \
+            --arg smoke "$SMOKE_OUTCOME" \
+            '{
+              format_version: 1,
+              phase: "smoke",
+              exact_sha: $exact_sha,
+              version: $version,
+              target: $target,
+              runner: {
+                requested: $requested_runner,
+                os: $runner_os,
+                architecture: $runner_arch,
+                uname: $uname_arch
+              },
+              archive_sha256: $archive_hash,
+              cargo_dist_version: "not-used",
+              outcomes: {
+                checkout: $checkout,
+                artifact_download: $download,
+                installer_and_formula: $smoke
+              },
+              action_pins: {
+                checkout: "d23441a48e516b6c34aea4fa41551a30e30af803",
+                download_artifact: "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+              }
+            }' > "$RUNNER_TEMP/rehearsal-evidence/smoke-${{ matrix.target }}.json"
+      - name: Upload target evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-evidence-smoke-${{ inputs.commit_sha }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  runner-resolution:
+    name: Verify hosted runner resolution
+    needs:
+      - build
+      - smoke
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - id: resolve
+        name: Verify resolved runner labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            > "$RUNNER_TEMP/rehearsal-jobs.json"
+
+          intel_jobs=$(jq \
+            '[.jobs[] | select((.labels // []) | index("macos-15-intel"))]' \
+            "$RUNNER_TEMP/rehearsal-jobs.json")
+          intel_job_count=$(printf '%s\n' "$intel_jobs" | jq 'length')
+          resolved_count=$(printf '%s\n' "$intel_jobs" | jq \
+            '[.[] | select((.runner_name // "") != "")] | length')
+          successful_count=$(printf '%s\n' "$intel_jobs" | jq \
+            '[.[] | select(.conclusion == "success")] | length')
+
+          resolution=verified
+          coverage_statement="x86_64 macOS native archive/checksum and install-path coverage verified"
+          resolution_exit=0
+          if test "$intel_job_count" -ne 2 ||
+             test "$resolved_count" -ne 2 ||
+             test "$successful_count" -ne 2
+          then
+            resolution=unavailable
+            x86_build=$(printf '%s\n' "$intel_jobs" | jq \
+              '[.[] | select(.name | startswith("Build target archives")) | select(.conclusion == "success")] | length')
+            if test "$x86_build" -eq 1
+            then
+              coverage_statement="x86_64 macOS archive/checksum coverage only; native Intel install path unavailable"
+            else
+              coverage_statement="x86_64 macOS native archive/checksum and install-path coverage unavailable"
+            fi
+            resolution_exit=1
+          fi
+
+          jq -n \
+            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg resolution "$resolution" \
+            --arg coverage_statement "$coverage_statement" \
+            --argjson requested_jobs "$intel_job_count" \
+            --argjson resolved_jobs "$resolved_count" \
+            --argjson successful_jobs "$successful_count" \
+            '{
+              format_version: 1,
+              phase: "runner-resolution",
+              exact_sha: $exact_sha,
+              version: $version,
+              requested_label: "macos-15-intel",
+              resolution: $resolution,
+              coverage_statement: $coverage_statement,
+              requested_jobs: $requested_jobs,
+              resolved_jobs: $resolved_jobs,
+              successful_jobs: $successful_jobs
+            }' > "$RUNNER_TEMP/rehearsal-evidence/runner-resolution.json"
+          exit "$resolution_exit"
+      - name: Upload runner-resolution evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-evidence-runner-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  tap-capability:
+    name: Rehearse public tap capability
+    needs: runner-resolution
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+      - id: capability
+        name: Rehearse tap capability
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: dcchuck/homebrew-tap
+        run: |
+          test -x scripts/rehearse-tap-capability.sh || {
+            echo "Task 3 tap-capability implementation is required before dispatch" >&2
+            exit 1
+          }
+          scripts/rehearse-tap-capability.sh
+      - name: Cleanup tap rehearsal
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cleanup_hook="$RUNNER_TEMP/car-go-clean-tap-rehearsal-cleanup.sh"
+          if test -x "$cleanup_hook"
+          then
+            "$cleanup_hook"
+          else
+            echo "No deferred cleanup hook remains; the guarded Task 3 script owns trap cleanup."
+          fi
+      - name: Write tap-capability evidence
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          CAPABILITY_OUTCOME: ${{ steps.capability.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
+          jq -n \
+            --arg exact_sha "${{ inputs.commit_sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg capability "$CAPABILITY_OUTCOME" \
+            '{
+              format_version: 1,
+              phase: "tap-capability",
+              exact_sha: $exact_sha,
+              version: $version,
+              repository: "dcchuck/homebrew-tap",
+              outcomes: {
+                checkout: $checkout,
+                capability: $capability
+              }
+            }' > "$RUNNER_TEMP/rehearsal-evidence/tap-capability.json"
+      - name: Upload tap-capability evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-evidence-tap-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/rehearsal-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate-evidence:
+    name: Aggregate sanitized rehearsal evidence
+    needs:
+      - validate
+      - build
+      - smoke
+      - runner-resolution
+      - tap-capability
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - name: Download per-job evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-rehearsal-evidence-*-${{ inputs.commit_sha }}*
+          path: evidence
+          merge-multiple: true
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-rehearsal-plan-${{ inputs.commit_sha }}
+          path: evidence/plan
+      - name: Verify sanitized evidence inventory
+        run: |
+          test "$(find evidence -type f -name '*.json' | awk 'END {print NR + 0}')" -ge 11
+          if rg -n '/Users/|/home/runner|HOMEBREW_TAP_TOKEN|gh[ps]_' evidence
+          then
+            echo "rehearsal evidence contains a forbidden home path or token marker" >&2
+            exit 1
+          fi
+          find evidence -type f -print | LC_ALL=C sort
+      - name: Upload release rehearsal evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-rehearsal-${{ inputs.commit_sha }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30

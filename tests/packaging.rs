@@ -38,6 +38,13 @@ fn named_step<'a>(steps: &'a [Yaml], name: &str) -> &'a Yaml {
         .unwrap_or_else(|| panic!("workflow does not contain step `{name}`"))
 }
 
+fn uses_action<'a>(steps: &'a [Yaml], action: &str) -> Vec<&'a Yaml> {
+    steps
+        .iter()
+        .filter(|step| step["uses"].as_str() == Some(action))
+        .collect()
+}
+
 #[test]
 fn systemd_service_keeps_the_embedded_binary_placeholder() {
     let service = repo_file("packaging/systemd/car-go-clean.service");
@@ -512,6 +519,291 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
         assert!(dist.contains(value), "missing {value}");
     }
     assert!(!dist.contains("post-announce-jobs"));
+}
+
+#[test]
+fn rehearse_release_dispatch_is_exact_sha_bound_and_uses_only_pinned_actions() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+    let dispatch = &rehearsal["on"]["workflow_dispatch"];
+    for input in ["commit_sha", "version"] {
+        assert_eq!(dispatch["inputs"][input]["required"].as_bool(), Some(true));
+        assert_eq!(dispatch["inputs"][input]["type"].as_str(), Some("string"));
+    }
+    assert!(
+        rehearsal["permissions"]
+            .as_hash()
+            .is_some_and(|permissions| permissions.is_empty()),
+        "workflow-level permissions must be empty"
+    );
+
+    let expected_permissions = [
+        ("validate", [("contents", "read")].as_slice()),
+        (
+            "build",
+            [
+                ("attestations", "write"),
+                ("contents", "read"),
+                ("id-token", "write"),
+            ]
+            .as_slice(),
+        ),
+        ("smoke", [("contents", "read")].as_slice()),
+        ("runner-resolution", [("actions", "read")].as_slice()),
+        ("tap-capability", [("contents", "read")].as_slice()),
+        ("aggregate-evidence", [("actions", "read")].as_slice()),
+    ];
+    for (job, expected) in expected_permissions {
+        let permissions = rehearsal["jobs"][job]["permissions"]
+            .as_hash()
+            .unwrap_or_else(|| panic!("{job} must declare job-scoped permissions"));
+        let actual = permissions
+            .iter()
+            .map(|(key, value)| (key.as_str().unwrap(), value.as_str().unwrap()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected.iter().copied().collect());
+    }
+
+    let exact_actions = [
+        (
+            "actions/checkout",
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        ),
+        (
+            "actions/upload-artifact",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        ),
+        (
+            "actions/download-artifact",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        ),
+        (
+            "actions/attest-build-provenance",
+            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+        ),
+        (
+            "dtolnay/rust-toolchain",
+            "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c",
+        ),
+    ];
+    let mut seen = BTreeSet::new();
+    for (_, job) in rehearsal["jobs"].as_hash().unwrap() {
+        for step in job["steps"].as_vec().unwrap() {
+            let Some(action) = step["uses"].as_str() else {
+                continue;
+            };
+            let (owner, expected) = exact_actions
+                .iter()
+                .find(|(owner, _)| action.starts_with(&format!("{owner}@")))
+                .unwrap_or_else(|| panic!("unexpected unpinned action `{action}`"));
+            assert_eq!(action, *expected, "{owner} is not immutably pinned");
+            let revision = action.rsplit_once('@').unwrap().1;
+            assert_eq!(revision.len(), 40, "{owner} is not pinned to a commit");
+            assert!(
+                revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{owner} pin is not a hexadecimal commit"
+            );
+            seen.insert(*owner);
+        }
+    }
+    assert_eq!(
+        seen,
+        exact_actions
+            .iter()
+            .map(|(owner, _)| *owner)
+            .collect::<BTreeSet<_>>()
+    );
+
+    for job in ["validate", "build", "smoke", "tap-capability"] {
+        let checkout = uses_action(
+            workflow_steps(&rehearsal, job),
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        );
+        assert_eq!(checkout.len(), 1, "{job} must check out exactly once");
+        assert_eq!(
+            checkout[0]["with"]["ref"].as_str(),
+            Some("${{ inputs.commit_sha }}")
+        );
+        assert_eq!(
+            checkout[0]["with"]["persist-credentials"].as_bool(),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+    let expected = BTreeSet::from([
+        ("aarch64-apple-darwin", "macos-14", "arm64"),
+        ("x86_64-apple-darwin", "macos-15-intel", "x86_64"),
+        ("aarch64-unknown-linux-musl", "ubuntu-24.04-arm", "aarch64"),
+        ("x86_64-unknown-linux-musl", "ubuntu-24.04", "x86_64"),
+    ]);
+
+    for job in ["build", "smoke"] {
+        assert_eq!(
+            rehearsal["jobs"][job]["runs-on"].as_str(),
+            Some("${{ matrix.runner }}")
+        );
+        let include = rehearsal["jobs"][job]["strategy"]["matrix"]["include"]
+            .as_vec()
+            .unwrap();
+        let actual = include
+            .iter()
+            .map(|entry| {
+                (
+                    entry["target"].as_str().unwrap(),
+                    entry["runner"].as_str().unwrap(),
+                    entry["expected_uname"].as_str().unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "{job} matrix drifted");
+    }
+
+    let build_steps = workflow_steps(&rehearsal, "build");
+    let build = named_step(build_steps, "Build and verify target archive");
+    let build_run = run_command(build).unwrap();
+    for fragment in [
+        "uname -m",
+        "matrix.expected_uname",
+        "dist build",
+        "--artifacts=local",
+        "--target=${{ matrix.target }}",
+        "archive=\"car-go-clean-${{ matrix.target }}.tar.xz\"",
+        "checksum=\"$archive.sha256\"",
+    ] {
+        assert!(
+            build_run.contains(fragment),
+            "build step is missing `{fragment}`"
+        );
+    }
+    assert_eq!(
+        uses_action(
+            build_steps,
+            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+        )
+        .len(),
+        1
+    );
+
+    let smoke_steps = workflow_steps(&rehearsal, "smoke");
+    let smoke = named_step(smoke_steps, "Smoke actual installer and formula");
+    let smoke_run = run_command(smoke).unwrap();
+    for fragment in [
+        "scripts/verify-release-assets.sh",
+        "version_output=$(\"$binary\" version)",
+        "health --skip-cargo",
+        "python3 -m http.server",
+        "packaging/release/car-go-clean-installer.sh",
+        "--download-base-url",
+        "Library/LaunchAgents/com.dcchuck.car-go-clean.plist",
+        ".config/systemd/user/car-go-clean.service",
+        "test ! -e \"$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist\"",
+        "test ! -e \"$HOME/.config/systemd/user/car-go-clean.service\"",
+        "scripts/render-homebrew-formula.sh",
+        "brew install --formula",
+        "brew test car-go-clean",
+        "brew_binary=\"$(brew --prefix car-go-clean)/bin/car-go-clean\"",
+        "\"$brew_binary\" version",
+    ] {
+        assert!(
+            smoke_run.contains(fragment),
+            "smoke step is missing `{fragment}`"
+        );
+    }
+
+    for job in ["build", "smoke"] {
+        let steps = workflow_steps(&rehearsal, job);
+        let upload = named_step(steps, "Upload target evidence");
+        assert_eq!(upload["if"].as_str(), Some("${{ always() }}"));
+        assert_eq!(
+            upload["uses"].as_str(),
+            Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+        );
+        assert!(upload["with"]["name"]
+            .as_str()
+            .unwrap()
+            .contains("${{ inputs.commit_sha }}-${{ matrix.target }}"));
+    }
+}
+
+#[test]
+fn rehearse_release_fails_closed_on_intel_or_tap_gaps_and_aggregates_evidence() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+
+    let resolution = workflow_steps(&rehearsal, "runner-resolution");
+    let verify = named_step(resolution, "Verify resolved runner labels");
+    let verify_run = run_command(verify).unwrap();
+    for fragment in [
+        "/actions/runs/$GITHUB_RUN_ID/jobs",
+        "macos-15-intel",
+        "runner_name",
+        "x86_64 macOS",
+        "archive/checksum coverage only",
+    ] {
+        assert!(
+            verify_run.contains(fragment),
+            "runner resolution is missing `{fragment}`"
+        );
+    }
+
+    let tap_job = &rehearsal["jobs"]["tap-capability"];
+    assert!(tap_job["if"].as_str().unwrap().contains("always()"));
+    let tap_steps = workflow_steps(&rehearsal, "tap-capability");
+    let capability = named_step(tap_steps, "Rehearse tap capability");
+    assert_eq!(
+        capability["env"]["GH_TOKEN"].as_str(),
+        Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
+    );
+    assert!(
+        run_command(capability)
+            .unwrap()
+            .contains("scripts/rehearse-tap-capability.sh"),
+        "Task 3 tap script hook is absent"
+    );
+    let cleanup = named_step(tap_steps, "Cleanup tap rehearsal");
+    assert_eq!(cleanup["if"].as_str(), Some("${{ always() }}"));
+    assert_eq!(
+        cleanup["env"]["GH_TOKEN"].as_str(),
+        Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
+    );
+
+    let aggregate_job = &rehearsal["jobs"]["aggregate-evidence"];
+    assert!(aggregate_job["if"].as_str().unwrap().contains("always()"));
+    let aggregate_steps = workflow_steps(&rehearsal, "aggregate-evidence");
+    let upload = named_step(aggregate_steps, "Upload release rehearsal evidence");
+    assert_eq!(
+        upload["with"]["name"].as_str(),
+        Some("release-rehearsal-${{ inputs.commit_sha }}")
+    );
+}
+
+#[test]
+fn rehearse_release_ci_uses_the_verified_release_toolchain() {
+    let ci = workflow(".github/workflows/ci.yml");
+    let steps = workflow_steps(&ci, "verify");
+    assert_eq!(
+        uses_action(
+            steps,
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        uses_action(
+            steps,
+            "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        run_command(named_step(steps, "Install verified dist")),
+        Some("scripts/install-cargo-dist.sh")
+    );
+    step_running(steps, "make test-release-scripts");
 }
 
 #[test]
