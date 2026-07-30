@@ -104,6 +104,7 @@ session_review=
 session_binary_path=
 session_old_binary_path=
 session_definition_backup_sha256=
+session_definition_binary_path=
 carriage_return=$(printf '\r')
 
 validate_line_value() {
@@ -315,6 +316,180 @@ backup_installed_service_definition() {
     definition_temp=
 }
 
+extract_launchd_definition_binary() {
+    awk '
+        function decode_xml(value, output, character) {
+            output = ""
+            while (length(value) > 0) {
+                character = substr(value, 1, 1)
+                if (character != "&") {
+                    output = output character
+                    value = substr(value, 2)
+                } else if (substr(value, 1, 5) == "&amp;") {
+                    output = output "&"
+                    value = substr(value, 6)
+                } else if (substr(value, 1, 4) == "&lt;") {
+                    output = output "<"
+                    value = substr(value, 5)
+                } else if (substr(value, 1, 4) == "&gt;") {
+                    output = output ">"
+                    value = substr(value, 5)
+                } else if (substr(value, 1, 6) == "&quot;") {
+                    output = output "\""
+                    value = substr(value, 7)
+                } else if (substr(value, 1, 6) == "&apos;") {
+                    output = output "\047"
+                    value = substr(value, 7)
+                } else {
+                    parse_error = 1
+                    return ""
+                }
+            }
+            return output
+        }
+
+        {
+            line = $0
+            sub(/^[ \t]*/, "", line)
+            sub(/[ \t]*$/, "", line)
+            if (line == "<key>ProgramArguments</key>") {
+                key_count++
+                if (key_count != 1 || waiting_for_array || in_array) {
+                    parse_error = 1
+                }
+                waiting_for_array = 1
+                next
+            }
+            if (waiting_for_array) {
+                if (line == "") {
+                    next
+                }
+                if (line != "<array>") {
+                    parse_error = 1
+                } else {
+                    in_array = 1
+                }
+                waiting_for_array = 0
+                next
+            }
+            if (in_array && !found_binary) {
+                if (line == "") {
+                    next
+                }
+                if (line !~ /^<string>.*<\/string>$/) {
+                    parse_error = 1
+                    next
+                }
+                sub(/^<string>/, "", line)
+                sub(/<\/string>$/, "", line)
+                binary = decode_xml(line)
+                found_binary = 1
+                next
+            }
+            if (in_array && found_binary && line == "</array>") {
+                in_array = 0
+                closed_array = 1
+            }
+        }
+
+        END {
+            if (!parse_error && key_count == 1 && found_binary && closed_array) {
+                print binary
+            } else {
+                exit 1
+            }
+        }
+    ' "$1"
+}
+
+extract_systemd_definition_binary() {
+    awk '
+        function decode_exec_start(value, output, position, character, escaped, rest) {
+            if (substr(value, 1, 1) != "\"") {
+                parse_error = 1
+                return ""
+            }
+            output = ""
+            position = 2
+            while (position <= length(value)) {
+                character = substr(value, position, 1)
+                if (character == "\"") {
+                    rest = substr(value, position + 1)
+                    if (rest !~ /^[ \t]+daemon[ \t]*$/) {
+                        parse_error = 1
+                    }
+                    return output
+                }
+                if (character == "\\") {
+                    escaped = substr(value, position + 1, 1)
+                    if (escaped != "\\" && escaped != "\"") {
+                        parse_error = 1
+                        return ""
+                    }
+                    output = output escaped
+                    position += 2
+                } else if (character == "%") {
+                    if (substr(value, position + 1, 1) != "%") {
+                        parse_error = 1
+                        return ""
+                    }
+                    output = output "%"
+                    position += 2
+                } else {
+                    output = output character
+                    position++
+                }
+            }
+            parse_error = 1
+            return ""
+        }
+
+        /^[ \t]*ExecStart=/ {
+            exec_start_count++
+            value = $0
+            sub(/^[ \t]*ExecStart=/, "", value)
+            binary = decode_exec_start(value)
+        }
+
+        END {
+            if (!parse_error && exec_start_count == 1) {
+                print binary
+            } else {
+                exit 1
+            }
+        }
+    ' "$1"
+}
+
+extract_service_definition_binary() {
+    case "$platform" in
+        Darwin) extract_launchd_definition_binary "$1" ;;
+        Linux) extract_systemd_definition_binary "$1" ;;
+    esac
+}
+
+authenticate_service_definition() {
+    definition_path=$1
+    expected_digest=$2
+    [ ! -L "$definition_path" ] && [ -f "$definition_path" ] || return 1
+    definition_metadata_before=$(portable_file_metadata "$definition_path") ||
+        return 1
+    definition_digest_before=$(sha256_file "$definition_path") || return 1
+    [ "$definition_digest_before" = "$expected_digest" ] || return 1
+    definition_binary=$(extract_service_definition_binary "$definition_path") ||
+        return 1
+    validate_absolute_path_value "$definition_binary" || return 1
+    resolved_definition_binary=$(canonical_existing_binary "$definition_binary") ||
+        return 1
+    definition_digest_after=$(sha256_file "$definition_path") || return 1
+    definition_metadata_after=$(portable_file_metadata "$definition_path") ||
+        return 1
+    [ ! -L "$definition_path" ] && [ -f "$definition_path" ] || return 1
+    [ "$definition_digest_after" = "$expected_digest" ] || return 1
+    [ "$definition_metadata_after" = "$definition_metadata_before" ] || return 1
+    printf '%s\n' "$resolved_definition_binary"
+}
+
 launchd_target() {
     uid=$(id -u) || return 1
     printf 'gui/%s/com.dcchuck.car-go-clean\n' "$uid"
@@ -350,14 +525,53 @@ restore_active_service() {
     esac
 }
 
-service_is_active() {
+service_activity_state() {
     case "$platform" in
         Darwin)
-            target=$(launchd_target) || return 1
-            launchctl print "$target" >/dev/null 2>&1
+            target=$(launchd_target) || {
+                printf 'error\n'
+                return 0
+            }
+            if activity_output=$(launchctl print "$target" 2>&1); then
+                printf 'active\n'
+                return 0
+            else
+                activity_status=$?
+            fi
+            case "$activity_status:$activity_output" in
+                113:*"Could not find specified service"*|\
+                113:*"Could not find service \"com.dcchuck.car-go-clean\""*|\
+                113:*"Service not found"*|\
+                113:*"No such process"*)
+                    printf 'inactive\n'
+                    ;;
+                *)
+                    echo "car-go-clean upgrade: launchctl activity query failed: $activity_output" >&2
+                    printf 'error\n'
+                    ;;
+            esac
             ;;
         Linux)
-            systemctl --user is-active --quiet car-go-clean.service >/dev/null 2>&1
+            if activity_output=$(
+                systemctl --user is-active car-go-clean.service 2>&1
+            ); then
+                activity_status=0
+            else
+                activity_status=$?
+            fi
+            case "$activity_status:$activity_output" in
+                0:active|0:reloading|0:refreshing)
+                    printf 'active\n'
+                    ;;
+                3:inactive|3:failed|3:activating|3:deactivating|3:maintenance|\
+                4:unknown)
+                    printf 'inactive\n'
+                    ;;
+                *)
+                    echo "car-go-clean upgrade: systemctl activity query failed: $activity_output" >&2
+                    printf 'error\n'
+                    ;;
+            esac
             ;;
     esac
 }
@@ -440,38 +654,58 @@ stop_service_only() {
     esac
 }
 
+keep_service_disabled_and_stopped() {
+    case "$platform" in
+        Darwin)
+            target=$(launchd_target) || return 1
+            launchctl disable "$target" >/dev/null 2>&1 || :
+            launchctl bootout "$target" >/dev/null 2>&1 || :
+            ;;
+        Linux)
+            systemctl --user disable --now car-go-clean.service \
+                >/dev/null 2>&1 || :
+            ;;
+    esac
+}
+
 converge_final_service_state() {
-    enabled_state=$(service_enabled_state) || return 1
-    active_state=false
-    if service_is_active; then
-        active_state=true
+    if [ "$session_state" = absent ]; then
+        return 0
     fi
+
+    enabled_state=$(service_enabled_state) || return 1
+    activity_state=$(service_activity_state)
+    [ "$activity_state" != error ] || return 1
 
     case "$session_state" in
         active)
-            if [ "$enabled_state" = disabled ] && [ "$active_state" = false ]; then
+            if [ "$enabled_state" = disabled ] &&
+                [ "$activity_state" = inactive ]; then
                 restore_active_service || return 1
             else
                 if [ "$enabled_state" = disabled ]; then
                     enable_service_only || return 1
                 fi
-                if [ "$active_state" = false ]; then
+                if [ "$activity_state" = inactive ]; then
                     start_service_only || return 1
                 fi
             fi
-            [ "$(service_enabled_state)" = enabled ] && service_is_active
+            final_enabled_state=$(service_enabled_state) || return 1
+            final_activity_state=$(service_activity_state)
+            [ "$final_enabled_state" = enabled ] &&
+                [ "$final_activity_state" = active ]
             ;;
         stopped)
             if [ "$enabled_state" = enabled ]; then
                 disable_service_only || return 1
             fi
-            if [ "$active_state" = true ]; then
+            if [ "$activity_state" = active ]; then
                 stop_service_only || return 1
             fi
-            [ "$(service_enabled_state)" = disabled ] && ! service_is_active
-            ;;
-        absent)
-            return 0
+            final_enabled_state=$(service_enabled_state) || return 1
+            final_activity_state=$(service_activity_state)
+            [ "$final_enabled_state" = disabled ] &&
+                [ "$final_activity_state" = inactive ]
             ;;
     esac
 }
@@ -481,11 +715,23 @@ recover_exact_old_active_service() {
     resolved_old_binary=$(canonical_existing_binary "$session_old_binary_path") ||
         return 1
     [ "$resolved_old_binary" = "$session_old_binary_path" ] || return 1
+    definition_path=$(installed_service_definition) || return 1
+    recovered_definition_binary=$(
+        authenticate_service_definition \
+            "$definition_path" "$session_definition_backup_sha256"
+    ) || return 1
+    [ "$recovered_definition_binary" = "$session_definition_binary_path" ] ||
+        return 1
+    [ "$recovered_definition_binary" = "$session_old_binary_path" ] || return 1
     recovered_old_version=$("$resolved_old_binary" version 2>&1) || return 1
     [ "$recovered_old_version" = "$session_old_version" ] || return 1
-    restore_active_service &&
-        [ "$(service_enabled_state)" = enabled ] &&
-        service_is_active
+    service_enabled_state >/dev/null || return 1
+    recovery_activity_state=$(service_activity_state)
+    [ "$recovery_activity_state" != error ] || return 1
+    restore_active_service || return 1
+    [ "$(service_enabled_state)" = enabled ] || return 1
+    recovered_activity_state=$(service_activity_state)
+    [ "$recovered_activity_state" = active ]
 }
 
 on_exit() {
@@ -498,7 +744,7 @@ on_exit() {
             echo "Upgrade replacement failed; exact car-go-clean $session_old_version was validated at $session_old_binary_path and the previously active service was restored." >&2
             rm -f "$session_file" "$service_definition_backup"
         else
-            disable_installed_service >/dev/null 2>&1 || :
+            keep_service_disabled_and_stopped >/dev/null 2>&1 || :
             replacement_recovery_guidance
         fi
     elif [ "$status" -ne 0 ] &&
@@ -508,7 +754,7 @@ on_exit() {
             echo "Upgrade failed before replacement; exact car-go-clean $session_old_version was validated at $session_old_binary_path and the previously active service was restored." >&2
             rm -f "$session_file" "$service_definition_backup"
         else
-            disable_installed_service >/dev/null 2>&1 || :
+            keep_service_disabled_and_stopped >/dev/null 2>&1 || :
             pre_replacement_recovery_guidance
         fi
     fi
@@ -575,6 +821,7 @@ load_session() {
     session_binary_path=
     session_old_binary_path=
     session_definition_backup_sha256=
+    session_definition_binary_path=
     seen_format=false
     seen_version=false
     seen_method=false
@@ -585,6 +832,7 @@ load_session() {
     seen_binary_path=false
     seen_old_binary_path=false
     seen_definition_backup_sha256=false
+    seen_definition_binary_path=false
     malformed=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
@@ -638,6 +886,11 @@ load_session() {
                 session_definition_backup_sha256=${line#definition_backup_sha256=}
                 seen_definition_backup_sha256=true
                 ;;
+            definition_binary_path=*)
+                [ "$seen_definition_binary_path" = false ] || malformed=true
+                session_definition_binary_path=${line#definition_binary_path=}
+                seen_definition_binary_path=true
+                ;;
             *)
                 malformed=true
                 ;;
@@ -654,9 +907,10 @@ load_session() {
         [ "$seen_review" = true ] &&
         [ "$seen_binary_path" = true ] &&
         [ "$seen_old_binary_path" = true ] &&
-        [ "$seen_definition_backup_sha256" = true ] ||
+        [ "$seen_definition_backup_sha256" = true ] &&
+        [ "$seen_definition_binary_path" = true ] ||
         die "upgrade session is malformed"
-    [ "$session_format" = 5 ] || die "upgrade session is malformed"
+    [ "$session_format" = 6 ] || die "upgrade session is malformed"
     [ "$session_version" = 0.4.0 ] || die "upgrade session is malformed"
     case "$session_method" in homebrew|shell) ;; *) die "upgrade session is malformed" ;; esac
     case "$session_old_version" in
@@ -671,6 +925,16 @@ load_session() {
                 *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
             esac
             [ "${#session_definition_backup_sha256}" -eq 64 ] ||
+                die "upgrade session is malformed"
+            ;;
+        *)
+            die "upgrade session is malformed"
+            ;;
+    esac
+    case "$session_state:$session_definition_binary_path" in
+        absent:none) ;;
+        active:*|stopped:*)
+            validate_absolute_path_value "$session_definition_binary_path" ||
                 die "upgrade session is malformed"
             ;;
         *)
@@ -719,7 +983,7 @@ write_session() {
     chmod 600 "$session_temp" ||
         die "could not secure upgrade session"
     if ! {
-        printf 'format=5\n'
+        printf 'format=6\n'
         printf 'version=%s\n' "$session_version"
         printf 'method=%s\n' "$session_method"
         printf 'old_version=%s\n' "$session_old_version"
@@ -729,6 +993,7 @@ write_session() {
         printf 'binary_path=%s\n' "$session_binary_path"
         printf 'old_binary_path=%s\n' "$session_old_binary_path"
         printf 'definition_backup_sha256=%s\n' "$session_definition_backup_sha256"
+        printf 'definition_binary_path=%s\n' "$session_definition_binary_path"
     } > "$session_temp"; then
         die "could not write upgrade session"
     fi
@@ -1166,6 +1431,9 @@ refresh_definition_phase() {
 
 finalize_executed_session() {
     if ! converge_final_service_state; then
+        if [ "$session_state" != absent ]; then
+            keep_service_disabled_and_stopped >/dev/null 2>&1 || :
+        fi
         restoration_recovery_guidance
         return 1
     fi
@@ -1351,6 +1619,12 @@ if [ "$original_state" != absent ]; then
         die "could not preserve the installed service definition before replacement"
     session_definition_backup_sha256=$(sha256_file "$service_definition_backup") ||
         die "could not fingerprint the preserved service definition"
+    session_definition_binary_path=$(
+        authenticate_service_definition \
+            "$service_definition_backup" "$session_definition_backup_sha256"
+    ) || die "could not authenticate the preserved service definition executable"
+    [ "$session_definition_binary_path" = "$session_old_binary_path" ] ||
+        die "installed service definition does not resolve to the authenticated old binary"
     if [ "$original_state" = active ]; then
         rollback_armed=true
     fi
@@ -1358,6 +1632,7 @@ if [ "$original_state" != absent ]; then
 else
     rm -f "$service_definition_backup"
     session_definition_backup_sha256=none
+    session_definition_binary_path=none
 fi
 
 write_session replacement_attempt none

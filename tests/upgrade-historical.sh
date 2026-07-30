@@ -30,6 +30,12 @@ assert_historical_release() {
         package && /^version = "/ { print $2; exit }
     ' "$source_dir/Cargo.toml")
     test "$source_version" = "$version"
+    grep -F '<key>ProgramArguments</key>' \
+        "$source_dir/packaging/launchd/com.dcchuck.car-go-clean.plist" >/dev/null
+    grep -F '<string>__CAR_GO_CLEAN_BIN__</string>' \
+        "$source_dir/packaging/launchd/com.dcchuck.car-go-clean.plist" >/dev/null
+    grep -F 'ExecStart=__CAR_GO_CLEAN_BIN__ daemon' \
+        "$source_dir/packaging/systemd/car-go-clean.service" >/dev/null
 
     CARGO_TARGET_DIR=$target_dir \
         mise exec rust@1.95.0 -- \
