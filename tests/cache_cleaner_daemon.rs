@@ -16,14 +16,16 @@ use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::config;
 use car_go_clean::daemon::{
     clamp_next_scan_at, Clock, Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions,
-    ShutdownFlag,
+    RunSource, ShutdownFlag,
 };
 use car_go_clean::identity::{
     BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
 };
 use car_go_clean::logging::{Logger, LoggerOptions};
 use car_go_clean::policy::{Environment, ScopePolicy};
-use car_go_clean::safety::SafetyOptions;
+use car_go_clean::safety::{
+    review_project_with_identity_provider, CleanDecision, ProjectReview, SafetyOptions,
+};
 use car_go_clean::scanner::{
     GitWorktreeError, GitWorktreeResolver, Scanner, ScannerOptions, SystemGitWorktreeResolver,
 };
@@ -5965,4 +5967,223 @@ fn ancestor_symlink_mutation_after_review_is_rejected_before_cargo() {
     assert_eq!(result.cleaned, 0);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(outside_project.join("target/outside.bin").exists());
+}
+
+#[derive(Clone)]
+struct SequencedRunner {
+    events: Arc<Mutex<Vec<String>>>,
+    exit_code: i32,
+}
+
+impl CommandRunner for SequencedRunner {
+    fn run(&self, dir: &Path, _cmd: &mut Command) -> anyhow::Result<CleanOutcome> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("cargo:{}", dir.display()));
+        Ok(CleanOutcome {
+            exit_code: self.exit_code,
+            stderr: if self.exit_code != 0 {
+                "synthetic cargo failure"
+            } else {
+                ""
+            }
+            .to_string(),
+        })
+    }
+}
+
+fn cleanable_review(path: &Path) -> ProjectReview {
+    let safety = SafetyOptions {
+        target_quiet_period: Duration::ZERO,
+        include_managed_cache: false,
+        include_active: false,
+        force: false,
+    };
+    let review = review_project_with_identity_provider(
+        path,
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &safety,
+        &SystemIdentityProvider,
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+    review
+}
+
+#[test]
+fn exact_review_execution_never_appends_scanner_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let included = root.path().join("included");
+    let not_in_plan = root.path().join("not-in-plan");
+    for project in [&included, &not_in_plan] {
+        write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+        write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    }
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+    let review = cleanable_review(&included.canonicalize().unwrap());
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            vec![review],
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        runner.calls.lock().unwrap()[0].dir,
+        included.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn execution_reports_target_before_cargo_and_continues_after_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    for project in [&first, &second] {
+        write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+        write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    }
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let runner = SequencedRunner {
+        events: events.clone(),
+        exit_code: 7,
+    };
+    let reporter_events = events.clone();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner, Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_target_reporter(move |review| {
+        reporter_events
+            .lock()
+            .unwrap()
+            .push(format!("target:{}", review.path.display()));
+    });
+    let first = first.canonicalize().unwrap();
+    let second = second.canonicalize().unwrap();
+    let reviews = vec![cleanable_review(&first), cleanable_review(&second)];
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            reviews,
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.errors, 2);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("target:{}", first.display()),
+            format!("cargo:{}", first.display()),
+            format!("target:{}", second.display()),
+            format!("cargo:{}", second.display()),
+        ]
+    );
+}
+
+#[test]
+fn exact_review_execution_removes_replaced_target_without_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let project = project.canonicalize().unwrap();
+    let review = cleanable_review(&project);
+    fs::rename(project.join("target"), project.join("target-reviewed")).unwrap();
+    write_file(&project.join("target/replacement.bin"), &[0; 2048]);
+
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            vec![review],
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/replacement.bin").exists());
 }

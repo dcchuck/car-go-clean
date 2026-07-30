@@ -7,6 +7,78 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn review_fixture(
+    work: &tempfile::TempDir,
+    project_names: &[&str],
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let root = work.path().join("root");
+    for name in project_names {
+        let project = root.join(name);
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(project.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    }
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ns\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let home = work.path().join("missing-home");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let mut path = bin.clone().into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    (config, state, home, PathBuf::from(path))
+}
+
+#[cfg(unix)]
+fn create_review_plan(
+    config: &std::path::Path,
+    state: &std::path::Path,
+    home: &std::path::Path,
+    path: &std::path::Path,
+) -> (i64, String) {
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--config"])
+        .arg(config)
+        .args(["--state-dir"])
+        .arg(state)
+        .env("HOME", home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Review ID: "))
+        .unwrap_or_else(|| panic!("missing review ID in {stdout}"))
+        .parse()
+        .unwrap();
+    (id, stdout)
+}
+
 fn seed_incomplete_diagnostic_state(work: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
     let root = work.path().join("root");
     let project = root.join("project");
@@ -2481,6 +2553,436 @@ fn run_dry_run_syncs_stale_cached_projects_before_review() {
         .assert()
         .success()
         .stdout(contains("Cached projects: 2"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_without_all_persists_and_prints_review_metadata() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+
+    let (review_id, stdout) = create_review_plan(&config, &state, &home, &path);
+
+    assert!(review_id > 0);
+    for label in [
+        "Policy hash: ",
+        "Discovery generation: ",
+        "Created: ",
+        "Expires: ",
+        "Candidate bytes: ",
+    ] {
+        assert!(stdout.contains(label), "missing {label:?} in {stdout}");
+    }
+    let connection = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    let plan_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM review_plans", [], |row| row.get(0))
+        .unwrap();
+    let target_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_plan_targets WHERE plan_id = ?1",
+            [review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(plan_count, 1);
+    assert_eq!(target_count, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_json_is_newline_delimited_and_structurally_usable() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let events = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "{stdout}");
+    assert!(events[0]["generation"].as_i64().unwrap() > 0);
+    assert!(events[1]["review"]["id"].as_i64().unwrap() > 0);
+    assert_eq!(events[1]["reviews"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn dry_run_no_scan_without_authority_creates_no_review_plan() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--no-scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .assert()
+        .code(2)
+        .stdout(contains("No review ID was created"));
+
+    let connection = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    let plan_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM review_plans", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(plan_count, 0);
+}
+
+#[test]
+fn run_all_without_dry_run_is_a_cli_error() {
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--all"])
+        .assert()
+        .code(1)
+        .stderr(contains("--all"))
+        .stderr(contains("--dry-run"));
+}
+
+#[test]
+fn review_conflicts_with_mutating_run_options_but_allows_json() {
+    for option in [
+        "--dry-run",
+        "--no-scan",
+        "--include-managed-cache",
+        "--include-active",
+        "--force",
+        "--all",
+    ] {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .args(["run", "--review", "1", option])
+            .assert()
+            .code(1)
+            .stderr(contains("cannot be used with"));
+    }
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", "1", "--json"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::is_match("unexpected argument.*--json")
+                .unwrap()
+                .not(),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_run_executes_only_persisted_cleanable_targets() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["approved"]);
+    let pending = work.path().join("root/pending");
+    fs::create_dir_all(&pending).unwrap();
+    fs::write(pending.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    fs::create_dir_all(pending.join("target")).unwrap();
+    fs::write(pending.join("target/new.bin"), vec![0; 4096]).unwrap();
+
+    let marker = work.path().join("cargo-calls");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> '{}'\nrm -rf \"$3\"\n",
+            marker.display()
+        ),
+    );
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "reviewed run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let approved = work.path().join("root/approved").canonicalize().unwrap();
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().trim(),
+        approved.display().to_string()
+    );
+    assert!(!approved.join("target").exists());
+    assert!(pending.join("target/new.bin").exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let cleaning = format!(
+        "Cleaning {} (project {})",
+        approved.join("target").display(),
+        approved.display()
+    );
+    assert!(stdout.contains(&cleaning), "{stdout}");
+    assert!(stdout.find(&cleaning) < stdout.find("Run complete:").or(Some(usize::MAX)));
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_run_preserves_persisted_managed_storage_opt_in() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let project = home.join(".cargo/registry/src/project");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 4096]).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = []\ntarget_quiet_period = \"1ns\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let state = work.path().join("state");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &bin.join("cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\nrm -rf \"$3\"\n", marker.display()),
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let path = PathBuf::from(path);
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--include-managed-cache", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let review_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Review ID: "))
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("cleaned=1"));
+
+    assert!(marker.exists());
+    assert!(!project.join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_run_removes_target_that_became_unsafe_without_invoking_cargo() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let project = work.path().join("root/project");
+    fs::rename(project.join("target"), project.join("target-reviewed")).unwrap();
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("target/replacement.bin"), vec![0; 4096]).unwrap();
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("cleaned=0"))
+        .stdout(contains("skipped=1"));
+
+    assert!(!marker.exists());
+    assert!(project.join("target/replacement.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn superseded_generation_rejects_entire_review_without_cargo() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stderr(contains("review plan"));
+
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_mismatched_review_exits_one_without_cargo() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let changed_config = work.path().join("changed-config.toml");
+    fs::write(
+        &changed_config,
+        format!(
+            "scan_dirs = [\"{}\"]\noverride_excludes = [\"new-exclusion\"]\ntarget_quiet_period = \"1ms\"\n",
+            work.path().join("root").display()
+        ),
+    )
+    .unwrap();
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&changed_config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stderr(contains("policy"));
+
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_run_fails_cleanly_while_daemon_holds_lock() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["project"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let marker = work.path().join("cargo-ran");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join("daemon.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stderr(contains("another car-go-clean process is running"));
+
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_run_continues_after_cargo_failure_and_prints_each_attempt() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["fails", "succeeds"]);
+    let (review_id, _) = create_review_plan(&config, &state, &home, &path);
+    let marker = work.path().join("cargo-calls");
+    write_executable(
+        &work.path().join("bin/cargo"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> '{}'\ncase \"$PWD\" in\n  */fails) printf failed >&2; exit 7 ;;\n  *) rm -rf \"$3\"; exit 0 ;;\nesac\n",
+            marker.display()
+        ),
+    );
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let calls = fs::read_to_string(&marker).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.matches("Cleaning ").count(), 2, "{stdout}");
+    assert!(stdout.contains("cleaned=1"), "{stdout}");
+    assert!(stdout.contains("errors=1"), "{stdout}");
+    assert!(!work.path().join("root/succeeds/target").exists());
+    assert!(work.path().join("root/fails/target").exists());
 }
 
 #[cfg(unix)]

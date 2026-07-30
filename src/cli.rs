@@ -2,7 +2,7 @@ use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
-use crate::daemon::{Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions};
+use crate::daemon::{Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions, RunSource};
 use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
 use crate::logging::Logger;
@@ -16,7 +16,7 @@ use crate::scanner::{Scanner, ScannerOptions};
 use crate::service::{
     resolve_service_binary, ServiceAction, ServiceManager, ServicePlatform, SystemCommandRunner,
 };
-use crate::store::{DiscoveryOriginKind, ErrorRecord, Store};
+use crate::store::{DiscoveryOriginKind, ErrorRecord, ReviewPlan, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -239,8 +239,25 @@ enum Commands {
         #[arg(long)]
         force: bool,
         /// Show every cleanable target in dry-run output.
-        #[arg(long)]
+        #[arg(long, requires = "dry_run")]
         all: bool,
+        /// Execute an exact persisted dry-run review.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = [
+                "dry_run",
+                "no_scan",
+                "include_managed_cache",
+                "include_active",
+                "force",
+                "all"
+            ]
+        )]
+        review: Option<i64>,
+        /// Emit machine-readable output.
+        #[arg(long)]
+        json: bool,
     },
     /// Run the long-lived scan and clean scheduler.
     Daemon {
@@ -279,6 +296,8 @@ struct RunOptions {
     include_active: bool,
     force: bool,
     all: bool,
+    review: Option<i64>,
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,6 +399,8 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             include_active,
             force,
             all,
+            review,
+            json,
         } => run_once(RunOptions {
             config_path: config,
             state_dir,
@@ -389,6 +410,8 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             include_active,
             force,
             all,
+            review,
+            json,
         }),
         Commands::Daemon { config, state_dir } => {
             daemon(config, state_dir).map(|_| CommandOutcome::Complete)
@@ -883,7 +906,7 @@ fn scan_and_report(
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "generation": result.generation,
                 "policy_hash": result.policy_hash,
                 "origins": origins,
@@ -921,6 +944,8 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
         include_active,
         force,
         all,
+        review,
+        json,
     } = options;
     let path_set = paths_for(state_dir.as_deref());
     let _lock = lockfile::try_acquire(&path_set.lock_path)
@@ -935,18 +960,107 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
     };
     let store = open_store_at(&path_set)?;
 
+    if let Some(review_id) = review {
+        let current_generation = store.current_generation(policy.hash())?;
+        let current_generation_id = current_generation
+            .as_ref()
+            .map(|generation| generation.id)
+            .unwrap_or(-1);
+        let plan = store
+            .load_review_plan(
+                review_id,
+                SystemTime::now(),
+                policy.hash(),
+                current_generation_id,
+            )
+            .map_err(|error| anyhow!(error))?;
+        let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
+        let daemon =
+            daemon_for_clean(&store, &cfg, cargo, &policy).with_target_reporter(move |review| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "target",
+                            "project": review.path,
+                            "target": review.target_path,
+                        })
+                    );
+                } else {
+                    println!(
+                        "Cleaning {} (project {})",
+                        review.target_path.display(),
+                        review.path.display()
+                    );
+                }
+            });
+        // Only rows already persisted as Cleanable reach the execution engine.
+        // Preserve that plan-time managed-storage opt-in while current activity,
+        // scan diagnostics, quiet-period, policy, and identity checks stay strict.
+        let reviewed_safety = SafetyOptions {
+            include_managed_cache: true,
+            ..safety
+        };
+        let result = daemon.execute_reviews_with_safety(
+            plan.targets
+                .into_iter()
+                .map(|target| target.review)
+                .collect(),
+            plan.coverage_incomplete,
+            reviewed_safety,
+            &crate::activity::SysinfoProcessInspector,
+            RunSource::Reviewed,
+        )?;
+        print_run_result(&result, json, Some(plan.id))?;
+        return Ok(run_result_outcome(&result));
+    }
+
     let mut outcome = CommandOutcome::Complete;
     if !no_scan {
-        outcome = outcome.merge(scan_and_report(&store, &cfg, &policy, false)?);
+        outcome = outcome.merge(scan_and_report(&store, &cfg, &policy, json)?);
     }
 
     if dry_run {
         reconcile_review_state(&store, &cfg, &policy)?;
         let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "dry-run")?;
         let reviews = batch.reviews;
-        print_review_summary("Dry run", &reviews);
-        print_skip_breakdown(&review_summary(&reviews));
-        print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, all);
+        let summary = review_summary(&reviews);
+        let plan = match batch.generation {
+            Some(generation_id) => Some(
+                store.create_review_plan(
+                    SystemTime::now(),
+                    policy.hash(),
+                    generation_id,
+                    batch.coverage_incomplete,
+                    i64::try_from(summary.cleanable_bytes)
+                        .context("candidate bytes exceed supported range")?,
+                    &reviews,
+                )?,
+            ),
+            None => None,
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "review",
+                    "review": plan.as_ref().map(review_plan_json),
+                    "reviews": reviews,
+                    "summary": summary,
+                    "coverage_incomplete": batch.coverage_incomplete,
+                })
+            );
+        } else {
+            print_review_summary("Dry run", &reviews);
+            print_skip_breakdown(&summary);
+            print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, all);
+            match &plan {
+                Some(plan) => print_review_plan(plan),
+                None => println!(
+                    "No review ID was created because no valid matching discovery generation exists."
+                ),
+            }
+        }
         if batch.coverage_incomplete {
             outcome = outcome.merge(CommandOutcome::Incomplete);
         }
@@ -954,19 +1068,28 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
     }
 
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
-    let daemon = daemon_for_clean(&store, &cfg, cargo, &policy);
+    let daemon =
+        daemon_for_clean(&store, &cfg, cargo, &policy).with_target_reporter(move |review| {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "target",
+                        "project": review.path,
+                        "target": review.target_path,
+                    })
+                );
+            } else {
+                println!(
+                    "Cleaning {} (project {})",
+                    review.target_path.display(),
+                    review.path.display()
+                );
+            }
+        });
     let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
-    println!(
-        "Run complete: cleaned={} skipped={} recovered={} errors={}",
-        result.cleaned, result.skipped, result.bytes_recovered, result.errors
-    );
-    outcome = outcome.merge(if result.errors > 0 {
-        CommandOutcome::Failed
-    } else if result.coverage_incomplete {
-        CommandOutcome::Incomplete
-    } else {
-        CommandOutcome::Complete
-    });
+    print_run_result(&result, json, None)?;
+    outcome = outcome.merge(run_result_outcome(&result));
     Ok(outcome)
 }
 
@@ -974,6 +1097,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
 struct ReviewBatch {
     reviews: Vec<ProjectReview>,
     coverage_incomplete: bool,
+    generation: Option<i64>,
 }
 
 fn project_reviews(
@@ -1047,7 +1171,72 @@ fn project_reviews(
             || durable_generation_incomplete
             || scan_coverage_incomplete
             || !discovery_blocks.is_empty(),
+        generation: generation.map(|generation| generation.id),
     })
+}
+
+fn review_plan_json(plan: &ReviewPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id,
+        "policy_hash": plan.policy_hash,
+        "generation": plan.generation_id,
+        "created": humantime::format_rfc3339_seconds(plan.created_at).to_string(),
+        "expires": humantime::format_rfc3339_seconds(plan.expires_at).to_string(),
+        "candidate_bytes": plan.candidate_bytes,
+    })
+}
+
+fn print_review_plan(plan: &ReviewPlan) {
+    println!("Review ID: {}", plan.id);
+    println!("Policy hash: {}", plan.policy_hash);
+    println!("Discovery generation: {}", plan.generation_id);
+    println!(
+        "Created: {}",
+        humantime::format_rfc3339_seconds(plan.created_at)
+    );
+    println!(
+        "Expires: {}",
+        humantime::format_rfc3339_seconds(plan.expires_at)
+    );
+    println!("Candidate bytes: {}", plan.candidate_bytes);
+}
+
+fn print_run_result(
+    result: &crate::daemon::RunCycleResult,
+    json: bool,
+    review_id: Option<i64>,
+) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "summary",
+                "review_id": review_id,
+                "run_id": result.run_id,
+                "cleaned": result.cleaned,
+                "skipped": result.skipped,
+                "bytes_recovered": result.bytes_recovered,
+                "errors": result.errors,
+                "coverage_incomplete": result.coverage_incomplete,
+            })
+        );
+    } else {
+        println!(
+            "Run complete: cleaned={} skipped={} recovered={} errors={}",
+            result.cleaned, result.skipped, result.bytes_recovered, result.errors
+        );
+    }
+    Ok(())
+}
+
+fn run_result_outcome(result: &crate::daemon::RunCycleResult) -> CommandOutcome {
+    if result.errors > 0 {
+        CommandOutcome::Failed
+    } else if result.coverage_incomplete {
+        CommandOutcome::Incomplete
+    } else {
+        CommandOutcome::Complete
+    }
 }
 
 fn print_review_summary(label: &str, reviews: &[ProjectReview]) {

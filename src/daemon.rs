@@ -4,7 +4,8 @@ use crate::cleaner::{Cleaner, CommandRunner};
 use crate::logging::Logger;
 use crate::safety::{
     bind_review_to_observation, revalidate_before_clean, review_project_with_identity_provider,
-    review_summary, CleanDecision, ObservationIdentityStatus, SafetyOptions, SkipReason,
+    review_summary, CleanDecision, ObservationIdentityStatus, ProjectReview, SafetyOptions,
+    SkipReason,
 };
 use crate::scanner::{
     DiscoveryOriginKind as ScannerOriginKind, DiscoveryOriginResult, ScanErrorKind, Scanner,
@@ -138,6 +139,28 @@ pub struct ScanCycleResult {
     pub origins: Vec<DiscoveryOriginResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSource {
+    Dynamic,
+    Reviewed,
+}
+
+impl RunSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dynamic => "run",
+            Self::Reviewed => "reviewed-run",
+        }
+    }
+}
+
+struct PreparedReview {
+    review: ProjectReview,
+    reverified_across_boot: bool,
+}
+
+type TargetReporter = dyn Fn(&ProjectReview) + Send + Sync;
+
 pub struct Daemon<'a, R: CommandRunner> {
     store: &'a Store,
     cache: Cache<'a>,
@@ -147,6 +170,7 @@ pub struct Daemon<'a, R: CommandRunner> {
     logger: Option<Logger>,
     clock: Arc<dyn Clock>,
     cycle_factory: Option<Arc<dyn DaemonCycleFactory>>,
+    target_reporter: Option<Arc<TargetReporter>>,
 }
 
 impl<'a, R: CommandRunner> Daemon<'a, R> {
@@ -166,6 +190,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             logger: None,
             clock: Arc::new(SystemClock),
             cycle_factory: None,
+            target_reporter: None,
         }
     }
 
@@ -181,6 +206,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 
     pub fn with_cycle_factory(mut self, factory: Arc<dyn DaemonCycleFactory>) -> Self {
         self.cycle_factory = Some(factory);
+        self
+    }
+
+    pub fn with_target_reporter(
+        mut self,
+        reporter: impl Fn(&ProjectReview) + Send + Sync + 'static,
+    ) -> Self {
+        self.target_reporter = Some(Arc::new(reporter));
         self
     }
 
@@ -302,15 +335,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         inspector: &impl ProcessInspector,
     ) -> Result<RunCycleResult> {
         self.reconcile_cached_state_with(&snapshot.scanner)?;
-        let started = self.clock.now();
-        let run_id = self.store.start_run(started)?;
+        let reviewed_at = self.clock.now();
         let (observations, generation) = self.authorized_observations(&snapshot.scanner)?;
         let generation_missing = generation.is_none();
         let project_paths: Vec<PathBuf> = observations
             .iter()
             .map(|observation| observation.project_path.clone())
             .collect();
-        let scan_error_since = started
+        let scan_error_since = reviewed_at
             .checked_sub(snapshot.options.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
@@ -327,13 +359,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             || !discovery_blocks.is_empty();
         let mut activity_sampler = ActivitySampler::new(inspector);
         let activity =
-            activity_signals(activity_sampler.active_projects_at(&project_paths, started)?);
+            activity_signals(activity_sampler.active_projects_at(&project_paths, reviewed_at)?);
         let mut reviews = Vec::with_capacity(observations.len());
-
-        let mut projects_cleaned = 0;
-        let mut cleaner_skipped = 0;
-        let mut bytes_recovered = 0;
-        let mut errors_count = 0;
 
         for observation in &observations {
             let path = observation.project_path.clone();
@@ -342,7 +369,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 &scan_errors,
                 &discovery_blocks,
                 &activity,
-                started,
+                reviewed_at,
                 &safety,
                 snapshot.scanner.identity_provider(),
             )?;
@@ -377,6 +404,92 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     observed_boot.as_ref(),
                 ) == ObservationIdentityStatus::ReverifiedAcrossBoot;
             }
+            reviews.push(PreparedReview {
+                review,
+                reverified_across_boot,
+            });
+        }
+
+        self.execute_prepared_reviews(
+            snapshot,
+            reviews,
+            generation.as_ref().map(|generation| generation.id),
+            coverage_incomplete,
+            safety,
+            &mut activity_sampler,
+            RunSource::Dynamic,
+        )
+    }
+
+    pub fn execute_reviews_with_safety(
+        &self,
+        reviews: Vec<ProjectReview>,
+        coverage_incomplete: bool,
+        safety: SafetyOptions,
+        inspector: &impl ProcessInspector,
+        source: RunSource,
+    ) -> Result<RunCycleResult> {
+        let snapshot = self.cycle_snapshot()?;
+        let reviews = reviews
+            .into_iter()
+            .filter(|review| review.decision == CleanDecision::Cleanable)
+            .map(|review| PreparedReview {
+                review,
+                reverified_across_boot: false,
+            })
+            .collect();
+        let mut activity_sampler = ActivitySampler::new(inspector);
+        self.execute_prepared_reviews(
+            &snapshot,
+            reviews,
+            None,
+            coverage_incomplete,
+            safety,
+            &mut activity_sampler,
+            source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_prepared_reviews<I: ProcessInspector + ?Sized>(
+        &self,
+        snapshot: &DaemonCycleSnapshot,
+        mut reviews: Vec<PreparedReview>,
+        generation_id: Option<i64>,
+        mut coverage_incomplete: bool,
+        safety: SafetyOptions,
+        activity_sampler: &mut ActivitySampler<'_, I>,
+        source: RunSource,
+    ) -> Result<RunCycleResult> {
+        let started = self.clock.now();
+        let run_id = self.store.start_run(started)?;
+        let project_paths = reviews
+            .iter()
+            .map(|prepared| prepared.review.path.clone())
+            .collect::<Vec<_>>();
+        let scan_error_since = started
+            .checked_sub(snapshot.options.scan_interval)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let scan_coverage_incomplete = self
+            .store
+            .scan_coverage_incomplete_since(scan_error_since)?;
+        let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
+        let durable_generation_incomplete = self
+            .store
+            .current_generation_coverage_incomplete(snapshot.scanner.policy_hash())?;
+        coverage_incomplete = coverage_incomplete
+            || durable_generation_incomplete
+            || scan_coverage_incomplete
+            || !discovery_blocks.is_empty();
+        let mut projects_cleaned = 0;
+        let mut cleaner_skipped = 0;
+        let mut bytes_recovered = 0;
+        let mut errors_count = 0;
+
+        for prepared in &mut reviews {
+            let review = &mut prepared.review;
+            let path = review.path.clone();
             if review.decision == CleanDecision::Cleanable {
                 // This is the last validation boundary available before Cleaner
                 // measures the target and spawns Cargo. The filesystem can still
@@ -385,7 +498,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 let revalidation_now = self.clock.now();
                 review.decision = match snapshot.scanner.policy() {
                     Some(policy) => revalidate_before_clean(
-                        &review,
+                        review,
                         policy,
                         snapshot.scanner.identity_provider(),
                         &activity_signals(
@@ -400,17 +513,16 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     None => CleanDecision::Skipped(SkipReason::OutOfScope),
                 };
             }
-            if review.decision == CleanDecision::Cleanable && reverified_across_boot {
-                if let (Some(generation), Some(identity)) =
-                    (generation.as_ref(), review.reviewed_identity.as_ref())
+            if review.decision == CleanDecision::Cleanable && prepared.reverified_across_boot {
+                if let (Some(generation_id), Some(identity)) =
+                    (generation_id, review.reviewed_identity.as_ref())
                 {
                     self.store
-                        .mark_observation_reverified(generation.id, &path, identity)?;
+                        .mark_observation_reverified(generation_id, &path, identity)?;
                 }
             }
 
-            if review.decision == CleanDecision::Skipped(crate::safety::SkipReason::TargetReadError)
-            {
+            if review.decision == CleanDecision::Skipped(SkipReason::TargetReadError) {
                 self.store.record_error(&ErrorRecord {
                     id: 0,
                     ts: self.clock.now(),
@@ -420,10 +532,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         .to_string(),
                 })?;
             }
-            let should_clean = review.decision == CleanDecision::Cleanable;
-            reviews.push(review);
-            if !should_clean {
+            if review.decision != CleanDecision::Cleanable {
                 continue;
+            }
+            if let Some(reporter) = &self.target_reporter {
+                reporter(review);
             }
 
             match self.cleaner.clean(&path) {
@@ -493,9 +606,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
         }
 
-        let summary = review_summary(&reviews);
+        let final_reviews = reviews
+            .into_iter()
+            .map(|prepared| prepared.review)
+            .collect::<Vec<_>>();
+        let summary = review_summary(&final_reviews);
         let skipped = summary.skipped_projects as i64 + cleaner_skipped;
-        self.store.record_review_status(started, "run", &summary)?;
+        self.store
+            .record_review_status(started, source.label(), &summary)?;
         self.store.finish_run(
             run_id,
             self.clock.now(),
