@@ -64,8 +64,18 @@ case "$*" in
     run\ --review\ *)
         review=${3-}
         printf '%s\n' "$review" > "$EXECUTED_REVIEW"
+        if [ -n "${EXECUTE_MARKER-}" ]; then
+            : > "$EXECUTE_MARKER"
+        fi
+        if [ -n "${EXECUTE_FIFO-}" ]; then
+            IFS= read -r release < "$EXECUTE_FIFO"
+            test "$release" = release
+        fi
         if [ -n "${EXECUTE_ERROR-}" ]; then
             printf '%s\n' "$EXECUTE_ERROR" >&2
+        fi
+        if [ "${EXECUTE_SIGNAL-0}" = 1 ]; then
+            kill -TERM "$PPID"
         fi
         exit "${EXECUTE_EXIT-0}"
         ;;
@@ -84,9 +94,21 @@ case "$1" in
     bootout)
         printf 'stopped\n' > "$SERVICE_STATE"
         ;;
-    bootstrap|kickstart)
+    bootstrap)
         test "${RESTORE_FAIL-0}" != 1
         printf 'running\n' > "$SERVICE_STATE"
+        ;;
+    kickstart)
+        test "${RESTORE_FAIL-0}" != 1
+        printf 'running\n' > "$SERVICE_STATE"
+        if [ "${RESTORE_SIGNAL-0}" = 1 ] &&
+            [ ! -e "$RESTORE_SIGNAL_MARKER" ]; then
+            : > "$RESTORE_SIGNAL_MARKER"
+            kill -TERM "$PPID"
+        fi
+        ;;
+    print)
+        test "$(cat "$SERVICE_STATE")" = running
         ;;
     *)
         exit 64
@@ -105,6 +127,9 @@ case "$*" in
     "--user start car-go-clean.service")
         test "${RESTORE_FAIL-0}" != 1
         printf 'running\n' > "$SERVICE_STATE"
+        ;;
+    "--user is-active --quiet car-go-clean.service")
+        test "$(cat "$SERVICE_STATE")" = running
         ;;
     *)
         exit 64
@@ -233,6 +258,8 @@ new_case() {
     version_file="$current_case/version"
     service_state="$current_case/service-state"
     executed_review="$current_case/executed-review"
+    execute_marker="$current_case/execute-marker"
+    restore_signal_marker="$current_case/restore-signal-marker"
     output_file="$current_case/output"
     mkdir -p "$home" "$state_dir"
     : > "$call_log"
@@ -252,6 +279,9 @@ new_case() {
     CONFIG_EXIT=0
     EXECUTE_EXIT=0
     EXECUTE_ERROR=
+    EXECUTE_FIFO=
+    EXECUTE_MARKER=
+    EXECUTE_SIGNAL=0
     LEGACY_EXCLUDES=0
     BREW_INSTALLED=1
     BREW_UPDATE_FAIL=0
@@ -261,13 +291,23 @@ new_case() {
     WRONG_NEW_VERSION=0
     GNU_STAT_FIXTURE=0
     RESTORE_FAIL=0
+    RESTORE_SIGNAL=0
+    RESTORE_SIGNAL_MARKER=$restore_signal_marker
     export TEST_PLATFORM VERSION_FILE SERVICE_STATE CALL_LOG EXECUTED_REVIEW
     export CAR_GO_CLEAN_UPGRADE_STATE_DIR REVIEW_ID PREVIEW_EXIT PREVIEW_TEXT
     export CONFIG_EXIT EXECUTE_EXIT LEGACY_EXCLUDES BREW_INSTALLED
     export EXECUTE_ERROR RESTORE_FAIL
+    export EXECUTE_FIFO EXECUTE_MARKER EXECUTE_SIGNAL
+    export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
     export BREW_UPDATE_FAIL BREW_REPLACE_FAIL SHELL_DOWNLOAD_FAIL
     export SHELL_REPLACE_FAIL WRONG_NEW_VERSION
     export GNU_STAT_FIXTURE
+}
+
+session_value() {
+    field=$1
+    awk -F= -v field="$field" '$1 == field { print substr($0, length(field) + 2) }' \
+        "$state_dir/upgrade-session"
 }
 
 run_upgrade() {
@@ -328,10 +368,21 @@ complete_upgrade() {
     assert_status 0
     assert_session_mode_600
     test "$(cat "$service_state")" = stopped || test "$old_state" != running
-    if [ "$old_state" != running ]; then
-        assert_calls_lack "launchctl bootout"
-        assert_calls_lack "systemctl --user stop car-go-clean.service"
-    fi
+    case "$old_state" in
+        running)
+            assert_output_has "originally active service remains stopped"
+            ;;
+        stopped)
+            assert_output_has "originally stopped service remains stopped"
+            assert_calls_lack "launchctl bootout"
+            assert_calls_lack "systemctl --user stop car-go-clean.service"
+            ;;
+        "not installed")
+            assert_output_has "No service was installed or started"
+            assert_calls_lack "launchctl bootout"
+            assert_calls_lack "systemctl --user stop car-go-clean.service"
+            ;;
+    esac
     : > "$call_log"
     run_upgrade --version 0.4.0 --method "$method" --execute-review 42
     assert_status 0
@@ -382,6 +433,35 @@ do
     esac
 done
 
+# Reviewed exit 2 is a completed execution outcome for every original state.
+for state in running stopped 'not installed'
+do
+    case "$state" in
+        running) name=execute-two-active ;;
+        stopped) name=execute-two-stopped ;;
+        "not installed") name=execute-two-absent ;;
+    esac
+    new_case "$name" Linux 0.3.0 "$state" homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    EXECUTE_EXIT=2
+    export EXECUTE_EXIT
+    : > "$call_log"
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+    assert_status 0
+    test ! -e "$state_dir/upgrade-session"
+    case "$state" in
+        running)
+            test "$(cat "$service_state")" = running
+            assert_calls_have "systemctl --user start car-go-clean.service"
+            ;;
+        stopped|"not installed")
+            test "$(cat "$service_state")" = "$state"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+done
+
 # GNU stat accepts `-f` with different semantics; mode inspection still resumes.
 new_case gnu-stat-session Linux 0.3.0 stopped homebrew
 GNU_STAT_FIXTURE=1
@@ -418,7 +498,53 @@ test "$run_status" -ne 0
 test "$(cat "$service_state")" = stopped
 assert_output_has "service remains stopped"
 assert_output_has "rollback"
-test ! -e "$state_dir/upgrade-session"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = preview_pending
+
+# Exact replacement persists a resumable preview session before config/preview.
+new_case resumable-config-failure Darwin 0.2.0 running homebrew
+CONFIG_EXIT=1
+export CONFIG_EXIT
+run_upgrade --version 0.4.0 --method homebrew
+test "$run_status" -ne 0
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = preview_pending
+test "$(session_value old_version)" = 0.2.0
+test "$(session_value review_id)" = none
+test "$(cat "$service_state")" = stopped
+assert_output_has "$upgrade --version 0.4.0 --method homebrew"
+assert_output_has "brew extract --version=0.2.0"
+assert_output_has "car-go-clean service start"
+
+CONFIG_EXIT=0
+export CONFIG_EXIT
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+test "$(session_value phase)" = review_pending
+test "$(session_value review_id)" = 42
+assert_calls_lack "brew "
+assert_calls_lack "service status"
+test "$(cat "$service_state")" = stopped
+
+new_case stopped-preview-failure Linux 0.3.0 stopped shell
+PREVIEW_EXIT=1
+export PREVIEW_EXIT
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+test "$(session_value phase)" = preview_pending
+assert_output_has "releases/download/v0.3.0/car-go-clean-installer.sh"
+if grep -F "car-go-clean service start" "$output_file" >/dev/null; then
+    echo "stopped service received start guidance" >&2
+    exit 1
+fi
+PREVIEW_EXIT=0
+export PREVIEW_EXIT
+: > "$call_log"
+run_upgrade --version 0.4.0 --method shell
+assert_status 0
+test "$(session_value phase)" = review_pending
+assert_calls_lack "curl "
 
 new_case preview-failure Linux 0.3.0 running homebrew
 PREVIEW_EXIT=1
@@ -428,7 +554,8 @@ test "$run_status" -ne 0
 test "$(cat "$service_state")" = stopped
 assert_output_has "preview failed"
 assert_output_has "service remains stopped"
-test ! -e "$state_dir/upgrade-session"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = preview_pending
 
 # A complete/incomplete preview still requires exactly one usable review ID.
 for preview in no-id duplicate-id nonnumeric-id
@@ -444,7 +571,8 @@ Review ID: 43' ;;
     run_upgrade --version 0.4.0 --method homebrew
     test "$run_status" -ne 0
     test "$(cat "$service_state")" = stopped
-    test ! -e "$state_dir/upgrade-session"
+    test -f "$state_dir/upgrade-session"
+    test "$(session_value phase)" = preview_pending
 done
 
 # Legacy configuration receives actionable migration guidance.
@@ -469,8 +597,9 @@ run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
 test "$(cat "$service_state")" = stopped
 test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = executing
 assert_output_has "service remains stopped"
-assert_output_has "fresh preview"
+assert_output_has "will not run review 42 again"
 assert_calls_lack "brew "
 assert_calls_lack "run --dry-run"
 
@@ -498,7 +627,105 @@ run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
 test "$(cat "$service_state")" = stopped
 test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = executed
 assert_output_has "service remains stopped"
+
+RESTORE_FAIL=0
+export RESTORE_FAIL
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+assert_calls_lack "run --review"
+assert_calls_have "launchctl bootstrap"
+test ! -e "$state_dir/upgrade-session"
+
+# A signal after reviewed execution leaves `executing`; resume never reruns it.
+new_case execute-signal Linux 0.3.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+EXECUTE_SIGNAL=1
+export EXECUTE_SIGNAL
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+test "$(session_value phase)" = executing
+test "$(cat "$service_state")" = stopped
+EXECUTE_SIGNAL=0
+export EXECUTE_SIGNAL
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test "$(cat "$service_state")" = stopped
+test "$(session_value phase)" = executing
+assert_output_has "will not run review 42 again"
+
+# A signal after native restoration is finalized without cleanup or a second start.
+new_case restored-before-signal Darwin 0.2.0 running homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+RESTORE_SIGNAL=1
+export RESTORE_SIGNAL
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+test "$run_status" -ne 0
+test "$(session_value phase)" = executed
+test "$(cat "$service_state")" = running
+RESTORE_SIGNAL=0
+export RESTORE_SIGNAL
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test "$(grep -c '^launchctl bootstrap ' "$call_log")" -eq 1
+test ! -e "$state_dir/upgrade-session"
+
+# An exclusive claim rejects a concurrent resume without a second reviewed run.
+new_case concurrent-resume Linux 0.3.0 stopped homebrew
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+execute_fifo="$current_case/execute.fifo"
+mkfifo "$execute_fifo"
+EXECUTE_FIFO=$execute_fifo
+EXECUTE_MARKER=$execute_marker
+export EXECUTE_FIFO EXECUTE_MARKER
+: > "$call_log"
+PATH="$fake_bin:/usr/bin:/bin" HOME="$home" \
+    "$upgrade" --version 0.4.0 --method homebrew --execute-review 42 \
+    > "$current_case/first-resume.out" 2>&1 &
+first_resume_pid=$!
+attempts=0
+while [ ! -e "$execute_marker" ] && kill -0 "$first_resume_pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+        kill "$first_resume_pid" 2>/dev/null || :
+        wait "$first_resume_pid" 2>/dev/null || :
+        cat "$current_case/first-resume.out" >&2
+        echo "background resume did not reach reviewed execution" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+if [ ! -e "$execute_marker" ]; then
+    wait "$first_resume_pid" 2>/dev/null || :
+    cat "$current_case/first-resume.out" >&2
+    echo "background resume exited before reviewed execution" >&2
+    exit 1
+fi
+EXECUTE_FIFO=
+EXECUTE_MARKER=
+export EXECUTE_FIFO EXECUTE_MARKER
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+second_resume_status=$run_status
+printf 'release\n' > "$execute_fifo"
+if wait "$first_resume_pid"; then
+    first_resume_status=0
+else
+    first_resume_status=$?
+fi
+test "$first_resume_status" -eq 0
+test "$second_resume_status" -ne 0
+assert_output_has "already in progress"
+test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test ! -e "$state_dir/upgrade-session"
 
 # Missing, malformed, symlinked, and broadly readable sessions fail closed.
 new_case missing-session Darwin 0.4.0 stopped homebrew
@@ -519,7 +746,7 @@ test "$run_status" -ne 0
 assert_output_has "symlink"
 rm "$state_dir/upgrade-session"
 
-printf 'format=1\nversion=0.4.0\nmethod=homebrew\nservice_state=stopped\nreview_id=42\n' \
+printf 'format=2\nversion=0.4.0\nmethod=homebrew\nold_version=0.3.0\nservice_state=stopped\nphase=review_pending\nreview_id=42\n' \
     > "$state_dir/upgrade-session"
 chmod 644 "$state_dir/upgrade-session"
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42

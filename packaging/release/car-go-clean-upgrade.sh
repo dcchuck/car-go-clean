@@ -85,10 +85,13 @@ case "$state_dir" in
 esac
 
 session_file=$state_dir/upgrade-session
+session_lock=$state_dir/upgrade-session.lock
 work_dir=
 session_temp=
+lock_held=false
 rollback_armed=false
 original_state=
+cgc_binary=car-go-clean
 
 cleanup_temporary_files() {
     if [ -n "$session_temp" ] && [ -e "$session_temp" ]; then
@@ -96,6 +99,10 @@ cleanup_temporary_files() {
     fi
     if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
         rm -rf "$work_dir"
+    fi
+    if [ "$lock_held" = true ]; then
+        rmdir "$session_lock" 2>/dev/null || :
+        lock_held=false
     fi
 }
 
@@ -130,6 +137,18 @@ restore_active_service() {
     esac
 }
 
+service_is_active() {
+    case "$platform" in
+        Darwin)
+            target=$(launchd_target) || return 1
+            launchctl print "$target" >/dev/null 2>&1
+            ;;
+        Linux)
+            systemctl --user is-active --quiet car-go-clean.service >/dev/null 2>&1
+            ;;
+    esac
+}
+
 on_exit() {
     status=$?
     trap - 0 HUP INT TERM
@@ -158,6 +177,14 @@ prepare_state_dir() {
     umask 077
     mkdir -p "$state_dir"
     [ -d "$state_dir" ] || die "upgrade state path is not a directory: $state_dir"
+}
+
+acquire_session_lock() {
+    if mkdir "$session_lock" 2>/dev/null; then
+        lock_held=true
+        return 0
+    fi
+    die "another car-go-clean upgrade is already in progress; if no helper is running, inspect and remove $session_lock"
 }
 
 session_mode() {
@@ -191,12 +218,16 @@ load_session() {
     session_format=
     session_version=
     session_method=
+    session_old_version=
     session_state=
+    session_phase=
     session_review=
     seen_format=false
     seen_version=false
     seen_method=false
+    seen_old_version=false
     seen_state=false
+    seen_phase=false
     seen_review=false
     malformed=false
     while IFS= read -r line || [ -n "$line" ]; do
@@ -216,10 +247,20 @@ load_session() {
                 seen_method=true
                 session_method=${line#method=}
                 ;;
+            old_version=*)
+                [ "$seen_old_version" = false ] || malformed=true
+                seen_old_version=true
+                session_old_version=${line#old_version=}
+                ;;
             service_state=*)
                 [ "$seen_state" = false ] || malformed=true
                 seen_state=true
                 session_state=${line#service_state=}
+                ;;
+            phase=*)
+                [ "$seen_phase" = false ] || malformed=true
+                seen_phase=true
+                session_phase=${line#phase=}
                 ;;
             review_id=*)
                 [ "$seen_review" = false ] || malformed=true
@@ -236,82 +277,289 @@ load_session() {
         [ "$seen_format" = true ] &&
         [ "$seen_version" = true ] &&
         [ "$seen_method" = true ] &&
+        [ "$seen_old_version" = true ] &&
         [ "$seen_state" = true ] &&
+        [ "$seen_phase" = true ] &&
         [ "$seen_review" = true ] ||
         die "upgrade session is malformed"
-    [ "$session_format" = 1 ] || die "upgrade session is malformed"
+    [ "$session_format" = 2 ] || die "upgrade session is malformed"
     [ "$session_version" = 0.4.0 ] || die "upgrade session is malformed"
     case "$session_method" in homebrew|shell) ;; *) die "upgrade session is malformed" ;; esac
+    case "$session_old_version" in
+        0.2.0|0.3.0|absent) ;;
+        *) die "upgrade session is malformed" ;;
+    esac
     case "$session_state" in active|stopped|absent) ;; *) die "upgrade session is malformed" ;; esac
-    case "$session_review" in
-        ''|*[!0-9]*) die "upgrade session is malformed" ;;
-        *) [ "$session_review" -gt 0 ] || die "upgrade session is malformed" ;;
+    case "$session_phase" in
+        preview_pending)
+            [ "$session_review" = none ] || die "upgrade session is malformed"
+            ;;
+        review_pending|executing|executed)
+            case "$session_review" in
+                ''|*[!0-9]*) die "upgrade session is malformed" ;;
+                *) [ "$session_review" -gt 0 ] || die "upgrade session is malformed" ;;
+            esac
+            ;;
+        *)
+            die "upgrade session is malformed"
+            ;;
     esac
 }
 
 write_session() {
-    review_id=$1
+    next_phase=$1
+    next_review=$2
     prepare_state_dir
     session_temp=$(mktemp "$state_dir/.upgrade-session.XXXXXX") ||
         die "could not create upgrade session"
-    chmod 600 "$session_temp"
-    {
-        printf 'format=1\n'
-        printf 'version=%s\n' "$version"
-        printf 'method=%s\n' "$method"
-        printf 'service_state=%s\n' "$original_state"
-        printf 'review_id=%s\n' "$review_id"
-    } > "$session_temp"
-    mv -f "$session_temp" "$session_file"
+    chmod 600 "$session_temp" ||
+        die "could not secure upgrade session"
+    if ! {
+        printf 'format=2\n'
+        printf 'version=%s\n' "$session_version"
+        printf 'method=%s\n' "$session_method"
+        printf 'old_version=%s\n' "$session_old_version"
+        printf 'service_state=%s\n' "$session_state"
+        printf 'phase=%s\n' "$next_phase"
+        printf 'review_id=%s\n' "$next_review"
+    } > "$session_temp"; then
+        die "could not write upgrade session"
+    fi
+    mv -f "$session_temp" "$session_file" ||
+        die "could not publish upgrade session"
     session_temp=
+    session_phase=$next_phase
+    session_review=$next_review
 }
 
-post_replacement_guidance() {
-    echo "The v0.4.0 binary is installed, but the upgrade did not complete; the service remains stopped." >&2
-    echo "Resolve the error, then rerun the helper or perform a binary rollback before starting the service." >&2
+validate_resumed_binary() {
+    cgc_binary=car-go-clean
+    resumed_version=$("$cgc_binary" version 2>&1) ||
+        die "could not validate the replacement car-go-clean binary"
+    [ "$resumed_version" = 0.4.0 ] ||
+        die "expected car-go-clean 0.4.0 while resuming, found $resumed_version"
 }
 
-pending_review_guidance() {
-    echo "Reviewed cleanup did not complete; the service remains stopped and the session was retained." >&2
-    echo "For a transient failure, resolve it and rerun with --execute-review $session_review." >&2
-    echo "For a stale or invalid review, create and approve a fresh preview manually; the original service state was $session_state." >&2
-    echo "After that reviewed run succeeds, restore only an originally active service and remove $session_file." >&2
+preview_recovery_guidance() {
+    echo "The exact v0.4.0 binary is installed, but preview approval is still pending." >&2
+    case "$session_state" in
+        active)
+            echo "The originally active service remains stopped." >&2
+            ;;
+        stopped)
+            echo "The originally stopped service remains stopped." >&2
+            ;;
+        absent)
+            echo "No service was installed or started." >&2
+            ;;
+    esac
+    echo "Resolve the error, then resume config and preview with exactly:" >&2
+    printf '  %s --version 0.4.0 --method %s\n' "$0" "$session_method" >&2
+    if [ "$session_old_version" != absent ]; then
+        case "$session_method" in
+            homebrew)
+                echo "To roll the binary back to exact $session_old_version with Homebrew:" >&2
+                echo "  brew tap-new \"\$USER/car-go-clean-rollback\"" >&2
+                printf "  brew extract --version=%s dcchuck/tap/car-go-clean \"\$USER/car-go-clean-rollback\"\n" \
+                    "$session_old_version" >&2
+                printf "  brew install \"\$USER/car-go-clean-rollback/car-go-clean@%s\"\n" \
+                    "$session_old_version" >&2
+                ;;
+            shell)
+                rollback_installer=car-go-clean-installer-v$session_old_version.sh
+                echo "To roll the binary back with the exact old release installer:" >&2
+                printf '  curl --proto '\''=https'\'' --tlsv1.2 -fsSL -o %s https://github.com/dcchuck/car-go-clean/releases/download/v%s/car-go-clean-installer.sh\n' \
+                    "$rollback_installer" "$session_old_version" >&2
+                install_dir_expression="\$(dirname \"\$(command -v car-go-clean)\")"
+                printf '  sh %s --version %s --install-dir "%s"\n' \
+                    "$rollback_installer" "$session_old_version" "$install_dir_expression" >&2
+                ;;
+        esac
+    fi
+    if [ "$session_state" = active ]; then
+        echo "Only after a successful preview/cleanup or rollback, restore the prior state with:" >&2
+        echo "  car-go-clean service start" >&2
+    fi
+}
+
+ambiguous_execution_guidance() {
+    echo "Reviewed execution did not report a complete outcome; the session remains in executing state." >&2
+    echo "The helper will not run review $session_review again because completion is ambiguous." >&2
+    echo "Inspect car-go-clean status and logs before deciding whether to restore service state." >&2
+    if [ "$session_state" = active ]; then
+        echo "The originally active service remains stopped; restore it manually only after that inspection." >&2
+    fi
+    echo "Session retained at $session_file." >&2
+}
+
+restoration_recovery_guidance() {
+    echo "Reviewed execution completed, but service restoration did not; the service remains stopped." >&2
+    printf 'Resume restoration without repeating cleanup with exactly:\n  %s --version 0.4.0 --method %s --execute-review %s\n' \
+        "$0" "$session_method" "$session_review" >&2
+}
+
+run_preview_phase() {
+    set +e
+    config_output=$("$cgc_binary" config 2>&1)
+    config_status=$?
+    set -e
+    printf '%s\n' "$config_output"
+    if [ "$config_status" -ne 0 ]; then
+        preview_recovery_guidance
+        return 1
+    fi
+    case "$config_output" in
+        *"\`excludes\` is deprecated"*)
+            echo "Detected legacy \`excludes\` configuration."
+            echo 'Review and apply the migration with: car-go-clean config migrate'
+            ;;
+    esac
+
+    set +e
+    preview_output=$("$cgc_binary" run --dry-run --all 2>&1)
+    preview_status=$?
+    set -e
+    printf '%s\n' "$preview_output"
+    case "$preview_status" in
+        0|2) ;;
+        *)
+            echo "car-go-clean preview failed with exit $preview_status." >&2
+            preview_recovery_guidance
+            return 1
+            ;;
+    esac
+
+    review_ids=$(printf '%s\n' "$preview_output" |
+        sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p')
+    review_count=$(printf '%s\n' "$review_ids" |
+        awk 'NF { count++ } END { print count + 0 }')
+    if [ "$review_count" -ne 1 ]; then
+        echo "preview did not produce exactly one usable numeric review ID" >&2
+        preview_recovery_guidance
+        return 1
+    fi
+    case "$review_ids" in
+        ''|*[!0-9]*)
+            echo "preview produced an unusable review ID" >&2
+            preview_recovery_guidance
+            return 1
+            ;;
+        *)
+            if [ "$review_ids" -le 0 ]; then
+                echo "preview produced an unusable review ID" >&2
+                preview_recovery_guidance
+                return 1
+            fi
+            ;;
+    esac
+
+    write_session review_pending "$review_ids"
+    echo "Upgrade preview saved as review $review_ids."
+    case "$session_state" in
+        active)
+            echo "The originally active service remains stopped pending reviewed execution."
+            ;;
+        stopped)
+            echo "The originally stopped service remains stopped."
+            ;;
+        absent)
+            echo "No service was installed or started."
+            ;;
+    esac
+    echo "After approval, execute exactly this review with:"
+    printf '  %s --version 0.4.0 --method %s --execute-review %s\n' \
+        "$0" "$session_method" "$review_ids"
+}
+
+finalize_executed_session() {
+    if [ "$session_state" = active ] && ! service_is_active; then
+        if ! restore_active_service; then
+            restoration_recovery_guidance
+            return 1
+        fi
+    fi
+    if ! rm -f "$session_file"; then
+        echo "Reviewed execution completed, but the completed upgrade session could not be cleared." >&2
+        printf 'Retry finalization without repeating cleanup with exactly:\n  %s --version 0.4.0 --method %s --execute-review %s\n' \
+            "$0" "$session_method" "$session_review" >&2
+        return 1
+    fi
+    echo "Upgrade to car-go-clean 0.4.0 completed."
+}
+
+execute_review_session() {
+    case "$session_phase" in
+        review_pending)
+            write_session executing "$session_review"
+            set +e
+            "$cgc_binary" run --review "$session_review"
+            review_status=$?
+            set -e
+            case "$review_status" in
+                0|2)
+                    write_session executed "$session_review"
+                    ;;
+                *)
+                    ambiguous_execution_guidance
+                    return 1
+                    ;;
+            esac
+            ;;
+        executing)
+            ambiguous_execution_guidance
+            return 1
+            ;;
+        executed)
+            ;;
+        preview_pending)
+            die "preview is still pending; resume it without --execute-review using: $0 --version 0.4.0 --method $session_method"
+            ;;
+    esac
+    finalize_executed_session
 }
 
 prepare_state_dir
+acquire_session_lock
 
-if [ -n "$execute_review" ]; then
+if [ -e "$session_file" ] || [ -L "$session_file" ]; then
     load_session
     [ "$session_version" = "$version" ] ||
         die "session version does not match requested version"
     [ "$session_method" = "$method" ] ||
         die "session method does not match requested method"
-    [ "$session_review" = "$execute_review" ] ||
-        die "review ID $execute_review does not match live session review $session_review"
-    resumed_version=$(car-go-clean version 2>&1) ||
-        die "could not validate the replacement car-go-clean binary"
-    [ "$resumed_version" = 0.4.0 ] ||
-        die "expected car-go-clean 0.4.0 before reviewed execution, found $resumed_version"
-
-    if ! car-go-clean run --review "$session_review"; then
-        pending_review_guidance
-        exit 1
-    fi
-    if [ "$session_state" = active ]; then
-        if ! restore_active_service; then
-            pending_review_guidance
+    validate_resumed_binary
+    if [ -n "$execute_review" ]; then
+        if [ "$session_phase" != preview_pending ] &&
+            [ "$session_review" != "$execute_review" ]; then
+            die "review ID $execute_review does not match live session review $session_review"
+        fi
+        if ! execute_review_session; then
             exit 1
         fi
+        exit 0
     fi
-    rm -f "$session_file"
-    echo "Upgrade to car-go-clean 0.4.0 completed."
-    exit 0
+    case "$session_phase" in
+        preview_pending)
+            if ! run_preview_phase; then
+                exit 1
+            fi
+            exit 0
+            ;;
+        review_pending)
+            die "review $session_review is awaiting approval; execute it with: $0 --version 0.4.0 --method $session_method --execute-review $session_review"
+            ;;
+        executing)
+            ambiguous_execution_guidance
+            exit 1
+            ;;
+        executed)
+            die "review $session_review already executed; finalize with: $0 --version 0.4.0 --method $session_method --execute-review $session_review"
+            ;;
+    esac
 fi
 
-if [ -e "$session_file" ] || [ -L "$session_file" ]; then
-    load_session
-    die "a live upgrade session already exists for review $session_review; resume it with --execute-review $session_review"
-fi
+[ -z "$execute_review" ] ||
+    die "no resumable upgrade session exists; run the preview phase first"
 
 old_binary=
 if command -v car-go-clean >/dev/null 2>&1; then
@@ -341,6 +589,7 @@ if command -v car-go-clean >/dev/null 2>&1; then
         *) die "could not parse v0.2/v0.3 service status output" ;;
     esac
 else
+    old_version=absent
     original_state=absent
 fi
 
@@ -410,53 +659,13 @@ new_version=$("$new_binary" version 2>&1) ||
 [ "$new_version" = 0.4.0 ] ||
     die "expected car-go-clean 0.4.0 after replacement, found $new_version"
 rollback_armed=false
+cgc_binary=$new_binary
 
-set +e
-config_output=$("$new_binary" config 2>&1)
-config_status=$?
-set -e
-printf '%s\n' "$config_output"
-if [ "$config_status" -ne 0 ]; then
-    post_replacement_guidance
+session_version=$version
+session_method=$method
+session_old_version=$old_version
+session_state=$original_state
+write_session preview_pending none
+if ! run_preview_phase; then
     exit 1
 fi
-case "$config_output" in
-    *"\`excludes\` is deprecated"*)
-        echo "Detected legacy \`excludes\` configuration."
-        echo 'Review and apply the migration with: car-go-clean config migrate'
-        ;;
-esac
-
-set +e
-preview_output=$("$new_binary" run --dry-run --all 2>&1)
-preview_status=$?
-set -e
-printf '%s\n' "$preview_output"
-case "$preview_status" in
-    0|2) ;;
-    *)
-        echo "car-go-clean preview failed with exit $preview_status." >&2
-        post_replacement_guidance
-        exit 1
-        ;;
-esac
-
-review_ids=$(printf '%s\n' "$preview_output" |
-    sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p')
-review_count=$(printf '%s\n' "$review_ids" |
-    awk 'NF { count++ } END { print count + 0 }')
-[ "$review_count" -eq 1 ] || {
-    echo "preview did not produce exactly one usable numeric review ID" >&2
-    post_replacement_guidance
-    exit 1
-}
-case "$review_ids" in
-    ''|*[!0-9]*) die "preview produced an unusable review ID" ;;
-    *) [ "$review_ids" -gt 0 ] || die "preview produced an unusable review ID" ;;
-esac
-
-write_session "$review_ids"
-echo "Upgrade preview saved as review $review_ids; the service remains stopped."
-echo "After approval, execute exactly this review with:"
-printf '  %s --version 0.4.0 --method %s --execute-review %s\n' \
-    "$0" "$method" "$review_ids"
