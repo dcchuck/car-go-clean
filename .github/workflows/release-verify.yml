@@ -180,7 +180,11 @@ jobs:
             "$archive" \
             car-go-clean-installer.sh \
             car-go-clean-upgrade.sh \
-            car-go-clean-shell-assets.sha256
+            car-go-clean-shell-assets.sha256 \
+            car-go-clean.rb \
+            sha256.sum \
+            source.tar.gz \
+            source.tar.gz.sha256
           do
             gh attestation verify "$ASSET_DIR/$attested_asset" \
               --repo "$GITHUB_REPOSITORY"
@@ -236,6 +240,7 @@ jobs:
             git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
             git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release smoke"
             git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+            git -C "$ISOLATED_ROOT/formula-tap" config commit.gpgsign false
             git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
             git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local release formula"
             cleanup() {

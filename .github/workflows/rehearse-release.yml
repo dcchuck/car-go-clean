@@ -23,11 +23,13 @@ jobs:
     outputs:
       evidence_key: ${{ steps.evidence_key.outputs.value }}
       safe_exact_sha: ${{ steps.evidence_key.outputs.safe_exact_sha }}
+      safe_version: ${{ steps.evidence_key.outputs.safe_version }}
     steps:
       - id: evidence_key
         name: Normalize the evidence key
         env:
           CANDIDATE_SHA: ${{ inputs.commit_sha }}
+          CANDIDATE_VERSION: ${{ inputs.version }}
         run: |
           candidate_sha=$CANDIDATE_SHA
           case "$candidate_sha" in
@@ -41,8 +43,18 @@ jobs:
             evidence_key="run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             safe_exact_sha=invalid
           fi
-          printf 'value=%s\n' "$evidence_key" >> "$GITHUB_OUTPUT"
-          printf 'safe_exact_sha=%s\n' "$safe_exact_sha" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$CANDIDATE_VERSION" |
+            LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          then
+            safe_version=$CANDIDATE_VERSION
+          else
+            safe_version=invalid
+          fi
+          {
+            printf 'value=%s\n' "$evidence_key"
+            printf 'safe_exact_sha=%s\n' "$safe_exact_sha"
+            printf 'safe_version=%s\n' "$safe_version"
+          } >> "$GITHUB_OUTPUT"
       - id: checkout
         name: Checkout exact release commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -57,7 +69,15 @@ jobs:
           git fetch --force origin 'refs/tags/*:refs/tags/*'
       - id: validate_inputs
         name: Validate exact SHA and version
-        run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
+        env:
+          EXACT_SHA: ${{ steps.evidence_key.outputs.safe_exact_sha }}
+          VERSION: ${{ steps.evidence_key.outputs.safe_version }}
+        run: |
+          scripts/validate-release-inputs.sh "$EXACT_SHA" "$VERSION"
+          test "$GITHUB_SHA" = "$EXACT_SHA" || {
+            echo "rehearsal must run from exact main commit $EXACT_SHA" >&2
+            exit 1
+          }
       - id: rust_toolchain
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
@@ -68,10 +88,12 @@ jobs:
         run: scripts/install-cargo-dist.sh
       - id: dist_plan
         name: Plan exact release
+        env:
+          VERSION: ${{ steps.evidence_key.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-plan"
           dist plan \
-            --tag "v${{ inputs.version }}" \
+            --tag "v$VERSION" \
             --output-format=json \
             > "$RUNNER_TEMP/rehearsal-plan/dist-plan.json"
       - name: Write validation evidence
@@ -84,6 +106,8 @@ jobs:
           RUST_TOOLCHAIN_OUTCOME: ${{ steps.rust_toolchain.outcome }}
           INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
           DIST_PLAN_OUTCOME: ${{ steps.dist_plan.outcome }}
+          EXACT_SHA: ${{ steps.evidence_key.outputs.safe_exact_sha }}
+          VERSION: ${{ steps.evidence_key.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           if command -v dist >/dev/null 2>&1
@@ -93,8 +117,8 @@ jobs:
             cargo_dist_version=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ steps.evidence_key.outputs.safe_exact_sha }}" \
-            --arg version "${{ inputs.version }}" \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
             --arg runner_os "${{ runner.os }}" \
             --arg runner_arch "${{ runner.arch }}" \
             --arg evidence_key "$EVIDENCE_KEY_OUTCOME" \
@@ -184,7 +208,10 @@ jobs:
           git fetch --force origin 'refs/tags/*:refs/tags/*'
       - id: revalidate_inputs
         name: Revalidate exact checkout
-        run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
+        env:
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
+        run: scripts/validate-release-inputs.sh "$EXACT_SHA" "$VERSION"
       - id: rust_toolchain
         name: Install Rust toolchain and target
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
@@ -202,6 +229,8 @@ jobs:
         run: scripts/install-cargo-dist.sh
       - id: build_target
         name: Build and verify target archive
+        env:
+          VERSION: ${{ needs.validate.outputs.safe_version }}
         run: |
           actual_arch=$(uname -m)
           test "$actual_arch" = "${{ matrix.expected_uname }}" || {
@@ -210,7 +239,7 @@ jobs:
           }
 
           dist build \
-            --tag "v${{ inputs.version }}" \
+            --tag "v$VERSION" \
             --artifacts=local \
             --target=${{ matrix.target }} \
             --print=linkage \
@@ -261,6 +290,8 @@ jobs:
           BUILD_OUTCOME: ${{ steps.build_target.outcome }}
           ATTEST_OUTCOME: ${{ steps.attest_archive.outcome }}
           ARCHIVE_UPLOAD_OUTCOME: ${{ steps.upload_archive.outcome }}
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           archive="$RUNNER_TEMP/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz"
@@ -282,8 +313,8 @@ jobs:
             cargo_dist_version=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
-            --arg version "${{ inputs.version }}" \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
             --arg target "${{ matrix.target }}" \
             --arg requested_runner "${{ matrix.runner }}" \
             --arg runner_os "${{ runner.os }}" \
@@ -383,7 +414,7 @@ jobs:
       - id: smoke_paths
         name: Smoke actual installer and formula
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
           TARGET: ${{ matrix.target }}
           EXPECTED_UNAME: ${{ matrix.expected_uname }}
           ARTIFACT_DIR: ${{ runner.temp }}/rehearsal-artifacts
@@ -487,6 +518,7 @@ jobs:
             git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
             git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release rehearsal"
             git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+            git -C "$ISOLATED_ROOT/formula-tap" config commit.gpgsign false
             git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
             git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local rehearsal formula"
             brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
@@ -507,6 +539,8 @@ jobs:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
           SMOKE_OUTCOME: ${{ steps.smoke_paths.outcome }}
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           archive="$RUNNER_TEMP/rehearsal-artifacts/car-go-clean-${{ matrix.target }}.tar.xz"
@@ -522,8 +556,8 @@ jobs:
             archive_hash=unavailable
           fi
           jq -n \
-            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
-            --arg version "${{ inputs.version }}" \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
             --arg target "${{ matrix.target }}" \
             --arg requested_runner "${{ matrix.runner }}" \
             --arg runner_os "${{ runner.os }}" \
@@ -581,7 +615,9 @@ jobs:
       - id: resolve
         name: Verify resolved runner labels
         env:
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           gh api \
@@ -617,8 +653,8 @@ jobs:
           fi
 
           jq -n \
-            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
-            --arg version "${{ inputs.version }}" \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
             --arg resolution "$resolution" \
             --arg coverage_statement "$coverage_statement" \
             --argjson requested_jobs "$intel_job_count" \
@@ -688,11 +724,13 @@ jobs:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           CAPABILITY_OUTCOME: ${{ steps.capability.outcome }}
           CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
         run: |
           mkdir -p "$RUNNER_TEMP/rehearsal-evidence"
           jq -n \
-            --arg exact_sha "${{ needs.validate.outputs.safe_exact_sha }}" \
-            --arg version "${{ inputs.version }}" \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
             --arg checkout "$CHECKOUT_OUTCOME" \
             --arg capability "$CAPABILITY_OUTCOME" \
             --arg cleanup "$CLEANUP_OUTCOME" \
@@ -729,6 +767,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      attestations: write
+      contents: read
+      id-token: write
     steps:
       - id: download_evidence
         name: Download per-job evidence
@@ -752,7 +793,7 @@ jobs:
         if: ${{ always() }}
         env:
           EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
           EVIDENCE_DOWNLOAD_OUTCOME: ${{ steps.download_evidence.outcome }}
           PLAN_DOWNLOAD_OUTCOME: ${{ steps.download_plan.outcome }}
         run: |
@@ -915,8 +956,72 @@ jobs:
           path: evidence
           if-no-files-found: error
           retention-days: 30
-      - name: Enforce complete sanitized evidence
+      - name: Enforce complete successful sanitized evidence
         if: ${{ always() }}
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUNNER_RESOLUTION_RESULT: ${{ needs.runner-resolution.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          TAP_CAPABILITY_RESULT: ${{ needs.tap-capability.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
         run: |
           test -f evidence/aggregate-status.txt
           test "$(cat evidence/aggregate-status.txt)" = ready
+          for result in \
+            "$VALIDATE_RESULT" \
+            "$BUILD_RESULT" \
+            "$SMOKE_RESULT" \
+            "$RUNNER_RESOLUTION_RESULT" \
+            "$TAP_CAPABILITY_RESULT"
+          do
+            test "$result" = success
+          done
+      - name: Write release authorization record
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          EXACT_SHA: ${{ needs.validate.outputs.safe_exact_sha }}
+          RUNNER_RESOLUTION_RESULT: ${{ needs.runner-resolution.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          TAP_CAPABILITY_RESULT: ${{ needs.tap-capability.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          VERSION: ${{ needs.validate.outputs.safe_version }}
+        run: |
+          mkdir -p release-authorization
+          jq -n \
+            --arg exact_sha "$EXACT_SHA" \
+            --arg version "$VERSION" \
+            --arg validate "$VALIDATE_RESULT" \
+            --arg build "$BUILD_RESULT" \
+            --arg smoke "$SMOKE_RESULT" \
+            --arg runner_resolution "$RUNNER_RESOLUTION_RESULT" \
+            --arg tap_capability "$TAP_CAPABILITY_RESULT" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{
+              format_version: 1,
+              exact_sha: $exact_sha,
+              version: $version,
+              status: "success",
+              workflow_run: {
+                id: $run_id,
+                attempt: $run_attempt
+              },
+              job_results: {
+                validate: $validate,
+                build: $build,
+                smoke: $smoke,
+                runner_resolution: $runner_resolution,
+                tap_capability: $tap_capability
+              }
+            }' > release-authorization/rehearsal-authorization.json
+      - name: Attest release authorization record
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: release-authorization/rehearsal-authorization.json
+      - name: Upload release authorization record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-authorization-${{ needs.validate.outputs.safe_exact_sha }}-v${{ needs.validate.outputs.safe_version }}
+          path: release-authorization/rehearsal-authorization.json
+          if-no-files-found: error
+          retention-days: 90

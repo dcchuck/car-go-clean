@@ -14,8 +14,7 @@
 # title/body based on your changelogs.
 
 name: Release
-permissions:
-  "contents": "write"
+permissions: {}
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -44,13 +43,127 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  release-authorization:
+    name: Authorize exact rehearsed release
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - id: metadata
+        name: Validate stable release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          printf '%s\n' "$RELEASE_TAG" |
+            LC_ALL=C grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          printf '%s\n' "$RELEASE_COMMIT" |
+            LC_ALL=C grep -Eq '^[0-9a-f]{40}$'
+          VERSION=${RELEASE_TAG#v}
+          printf 'tag=%s\nversion=%s\n' "$RELEASE_TAG" "$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Enforce annotated vX.Y.Z release tag
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "car-go-clean").version')"
+          test "$TAG" = "v$CARGO_VERSION" || {
+            echo "tag $TAG does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          }
+          test "$VERSION" = "$CARGO_VERSION"
+          test "$(git cat-file -t "refs/tags/$TAG")" = tag || {
+            echo "release tag must be annotated" >&2
+            exit 1
+          }
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$RELEASE_COMMIT" || {
+            echo "release tag does not resolve to workflow commit $RELEASE_COMMIT" >&2
+            exit 1
+          }
+          test "$(git rev-parse 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+      - name: Verify exact rehearsal authorization
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -eu
+          artifact_name="release-authorization-$RELEASE_COMMIT-v$VERSION"
+          authorized=false
+          run_ids="$(
+            gh run list \
+              --workflow rehearse-release.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --status success \
+              --commit "$RELEASE_COMMIT" \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )"
+          for run_id in $run_ids
+          do
+            candidate_dir="$RUNNER_TEMP/release-authorization-$run_id"
+            rm -rf "$candidate_dir"
+            mkdir -p "$candidate_dir"
+            if ! gh run download "$run_id" \
+              --name "$artifact_name" \
+              --dir "$candidate_dir"
+            then
+              continue
+            fi
+            record="$candidate_dir/rehearsal-authorization.json"
+            if ! jq -e \
+              --arg exact_sha "$RELEASE_COMMIT" \
+              --arg version "$VERSION" \
+              '
+                .format_version == 1 and
+                .exact_sha == $exact_sha and
+                .version == $version and
+                .status == "success"
+              ' "$record" >/dev/null
+            then
+              continue
+            fi
+            if gh attestation verify "$record" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rehearse-release.yml" \
+              --source-digest "$RELEASE_COMMIT" \
+              --signer-digest "$RELEASE_COMMIT" \
+              --source-ref refs/heads/main
+            then
+              authorized=true
+              break
+            fi
+          done
+          test "$authorized" = true || {
+            echo "no successful attested rehearsal authorizes $RELEASE_COMMIT v$VERSION" >&2
+            exit 1
+          }
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - release-authorization
     runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      tag: ${{ needs.release-authorization.outputs.tag }}
+      tag-flag: ${{ format('--tag={0}', needs.release-authorization.outputs.tag) }}
       publishing: ${{ !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,8 +185,11 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          TAG: ${{ needs.release-authorization.outputs.tag }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist host --steps=create --tag "$TAG" \
+            --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -144,15 +260,16 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: "Enforce annotated vX.Y.Z release tag"
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          TAG="$GITHUB_REF_NAME"
-          case "$TAG" in
-              v[0-9]*.[0-9]*.[0-9]*) ;;
-              *) echo "release tag must be vX.Y.Z, got $TAG" >&2; exit 1 ;;
-          esac
+          printf '%s\n' "$TAG" |
+            LC_ALL=C grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "car-go-clean").version')"
           test "$TAG" = "v$VERSION" || { echo "tag $TAG does not match Cargo.toml version $VERSION" >&2; exit 1; }
           test "$(git cat-file -t "refs/tags/$TAG")" = tag || { echo "release tag must be annotated" >&2; exit 1; }
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$RELEASE_COMMIT" || { echo "release tag does not resolve to workflow commit" >&2; exit 1; }
       - name: "Check formatting"
         run: "cargo fmt --all -- --check"
       - name: "Check Clippy"
@@ -176,10 +293,12 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           # Actually do builds and make zips and whatnot
           # shellcheck disable=SC2086
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build "$TAG_FLAG" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - name: Attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
@@ -217,6 +336,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -237,8 +358,10 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build "$TAG_FLAG" --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -256,18 +379,45 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+
+  attest-global-artifacts:
+    needs:
+      - build-global-artifacts
+    runs-on: ubuntu-22.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Download cargo-dist global assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: artifacts-build-global
+          path: target/distrib
+      - name: Attest cargo-dist global assets
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            target/distrib/car-go-clean.rb
+            target/distrib/sha256.sum
+            target/distrib/source.tar.gz
+            target/distrib/source.tar.gz.sha256
+
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      - attest-global-artifacts
       - release-preflight
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.release-preflight.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.release-preflight.result == 'success' && needs.attest-global-artifacts.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -296,10 +446,11 @@ jobs:
       - name: Compose reviewed release notes
         env:
           ANNOUNCEMENT_BODY: "${{ fromJson(needs.plan.outputs.val).announcement_github_body }}"
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           printf '%s\n' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/generated-notes.md"
           scripts/compose-release-notes.sh \
-            "${{ needs.plan.outputs.tag }}" \
+            "$TAG" \
             "$RUNNER_TEMP/generated-notes.md" \
             "$RUNNER_TEMP/notes.txt"
       - name: Upsert commit-bound draft release
@@ -308,9 +459,10 @@ jobs:
           CARGO_DIST_GLOBAL_MANIFEST: ${{ runner.temp }}/global-dist-manifest.json
           CARGO_DIST_PLAN_MANIFEST: ${{ runner.temp }}/plan-dist-manifest.json
           RELEASE_COMMIT: "${{ github.sha }}"
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           scripts/upsert-draft-release.sh \
-            "${{ needs.plan.outputs.tag }}" \
+            "$TAG" \
             "$RELEASE_COMMIT" \
             "$ANNOUNCEMENT_TITLE" \
             "$RUNNER_TEMP/notes.txt" \

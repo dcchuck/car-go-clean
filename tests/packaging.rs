@@ -1050,7 +1050,16 @@ fn rehearse_release_dispatch_is_exact_sha_bound_and_uses_only_pinned_actions() {
         ("smoke", [("contents", "read")].as_slice()),
         ("runner-resolution", [("actions", "read")].as_slice()),
         ("tap-capability", [("contents", "read")].as_slice()),
-        ("aggregate-evidence", [("actions", "read")].as_slice()),
+        (
+            "aggregate-evidence",
+            [
+                ("actions", "read"),
+                ("attestations", "write"),
+                ("contents", "read"),
+                ("id-token", "write"),
+            ]
+            .as_slice(),
+        ),
     ];
     for (job, expected) in expected_permissions {
         let permissions = rehearsal["jobs"][job]["permissions"]
@@ -1330,7 +1339,10 @@ fn rehearse_release_fails_closed_on_intel_or_tap_gaps_and_aggregates_evidence() 
         upload["with"]["name"].as_str(),
         Some("release-rehearsal-${{ needs.validate.outputs.evidence_key }}")
     );
-    let enforce = named_step(aggregate_steps, "Enforce complete sanitized evidence");
+    let enforce = named_step(
+        aggregate_steps,
+        "Enforce complete successful sanitized evidence",
+    );
     assert_eq!(enforce["if"].as_str(), Some("${{ always() }}"));
     let upload_index = aggregate_steps
         .iter()
@@ -1355,11 +1367,11 @@ fn rehearse_release_evidence_records_gate_outcomes_and_rejects_unsafe_artifact_n
     for (candidate, expected) in [
         (
             "0123456789abcdef0123456789abcdef01234567",
-            "value=0123456789abcdef0123456789abcdef01234567\nsafe_exact_sha=0123456789abcdef0123456789abcdef01234567\n",
+            "value=0123456789abcdef0123456789abcdef01234567\nsafe_exact_sha=0123456789abcdef0123456789abcdef01234567\nsafe_version=0.4.0\n",
         ),
         (
             "../../bad candidate HOMEBREW_TAP_TOKEN",
-            "value=run-123-4\nsafe_exact_sha=invalid\n",
+            "value=run-123-4\nsafe_exact_sha=invalid\nsafe_version=0.4.0\n",
         ),
     ] {
         let output_file = tempdir().unwrap();
@@ -1367,6 +1379,7 @@ fn rehearse_release_evidence_records_gate_outcomes_and_rejects_unsafe_artifact_n
         let output = Command::new("sh")
             .args(["-eu", "-c", run_command(normalize).unwrap()])
             .env("CANDIDATE_SHA", candidate)
+            .env("CANDIDATE_VERSION", "0.4.0")
             .env("GITHUB_RUN_ID", "123")
             .env("GITHUB_RUN_ATTEMPT", "4")
             .env("GITHUB_OUTPUT", &github_output)
@@ -2136,13 +2149,12 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
         .any(|word| word == "\"$RUNNER_TEMP/notes.txt\""));
 
     let runner_temp = tempdir().unwrap();
-    let runnable = run_command(compose.1)
-        .unwrap()
-        .replace("${{ needs.plan.outputs.tag }}", "v0.4.0");
+    let runnable = run_command(compose.1).unwrap();
     let output = Command::new("sh")
         .args(["-eu", "-c", &runnable])
         .current_dir(root)
         .env("ANNOUNCEMENT_BODY", "generated workflow body")
+        .env("TAG", "v0.4.0")
         .env("RUNNER_TEMP", runner_temp.path())
         .output()
         .unwrap();
@@ -2230,6 +2242,283 @@ fn release_publication_workflows_pin_actions_and_use_verified_dist() {
         "cargo-dist must be installed before packaging tests execute"
     );
     assert!(!repo_file(".github/workflows/release.yml").contains("cargo-dist-installer.sh | sh"));
+}
+
+#[test]
+fn release_workflows_keep_untrusted_values_out_of_generated_shell() {
+    let release = workflow(".github/workflows/release.yml");
+    assert!(
+        release["permissions"]
+            .as_hash()
+            .is_some_and(|permissions| permissions.is_empty()),
+        "release workflow-level permissions must be empty"
+    );
+    for (job, expected) in [
+        ("plan", BTreeSet::from([("contents", "read")])),
+        (
+            "build-global-artifacts",
+            BTreeSet::from([("contents", "read")]),
+        ),
+        ("host", BTreeSet::from([("contents", "write")])),
+    ] {
+        let permissions = release["jobs"][job]["permissions"]
+            .as_hash()
+            .unwrap_or_else(|| panic!("{job} must declare job-scoped permissions"));
+        let actual = permissions
+            .iter()
+            .map(|(key, value)| (key.as_str().unwrap(), value.as_str().unwrap()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "{job} permissions are not least-privilege"
+        );
+    }
+
+    let workflows = [
+        (
+            ".github/workflows/release.yml",
+            vec![
+                "${{ github.ref_name }}",
+                "${{ needs.plan.outputs.tag }}",
+                "${{ needs.plan.outputs.tag-flag }}",
+            ],
+        ),
+        (
+            ".github/workflows/rehearse-release.yml",
+            vec!["${{ inputs.commit_sha }}", "${{ inputs.version }}"],
+        ),
+    ];
+    for (path, forbidden) in workflows {
+        let document = workflow(path);
+        for (job_name, job) in document["jobs"].as_hash().unwrap() {
+            let Some(steps) = job["steps"].as_vec() else {
+                continue;
+            };
+            for step in steps {
+                let Some(run) = run_command(step) else {
+                    continue;
+                };
+                for value in &forbidden {
+                    assert!(
+                        !run.contains(value),
+                        "{path} job {} step {:?} embeds untrusted `{value}` in generated shell",
+                        job_name.as_str().unwrap(),
+                        step["name"].as_str()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn release_tag_gate_rejects_suffixes_and_leading_zeroes_before_planning() {
+    let release = workflow(".github/workflows/release.yml");
+    let authorization = &release["jobs"]["release-authorization"];
+    let steps = workflow_steps(&release, "release-authorization");
+    let metadata = named_step(steps, "Validate stable release tag");
+    assert_eq!(metadata["id"].as_str(), Some("metadata"));
+    assert_eq!(
+        metadata["env"]["RELEASE_TAG"].as_str(),
+        Some("${{ github.ref_name }}")
+    );
+    assert_eq!(
+        metadata["env"]["RELEASE_COMMIT"].as_str(),
+        Some("${{ github.sha }}")
+    );
+    assert_eq!(
+        steps.iter().position(|step| run_command(step).is_some()),
+        steps.iter().position(|step| std::ptr::eq(step, metadata)),
+        "the strict tag validator must be the first generated shell"
+    );
+
+    let run = run_command(metadata).unwrap();
+    for (tag, should_succeed) in [
+        ("v0.4.0", true),
+        ("v10.20.30", true),
+        ("v0.4.0-rc.1", false),
+        ("v01.4.0", false),
+        ("v0.04.0", false),
+        ("v0.4.00", false),
+        ("v0.4.0/evil", false),
+    ] {
+        let output_dir = tempdir().unwrap();
+        let output = Command::new("sh")
+            .args(["-eu", "-c", run])
+            .env("RELEASE_TAG", tag)
+            .env("RELEASE_COMMIT", "0123456789abcdef0123456789abcdef01234567")
+            .env("GITHUB_OUTPUT", output_dir.path().join("github-output"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            should_succeed,
+            "tag {tag} had unexpected status; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let plan_needs = yaml_strings(&release["jobs"]["plan"]["needs"]);
+    assert!(
+        plan_needs.contains("release-authorization"),
+        "dist planning must wait for exact rehearsal authorization"
+    );
+    assert_eq!(
+        authorization["permissions"]["actions"].as_str(),
+        Some("read")
+    );
+    assert_eq!(
+        authorization["permissions"]["contents"].as_str(),
+        Some("read")
+    );
+}
+
+#[test]
+fn successful_rehearsal_authorizes_only_the_exact_sha_and_version() {
+    let rehearsal = workflow(".github/workflows/rehearse-release.yml");
+    let aggregate = &rehearsal["jobs"]["aggregate-evidence"];
+    for (permission, expected) in [
+        ("actions", "read"),
+        ("attestations", "write"),
+        ("contents", "read"),
+        ("id-token", "write"),
+    ] {
+        assert_eq!(
+            aggregate["permissions"][permission].as_str(),
+            Some(expected)
+        );
+    }
+    let steps = workflow_steps(&rehearsal, "aggregate-evidence");
+    let enforce = named_step(steps, "Enforce complete successful sanitized evidence");
+    let write = named_step(steps, "Write release authorization record");
+    let attest = named_step(steps, "Attest release authorization record");
+    let upload = named_step(steps, "Upload release authorization record");
+    let index = |needle: &Yaml| {
+        steps
+            .iter()
+            .position(|step| std::ptr::eq(step, needle))
+            .unwrap()
+    };
+    assert!(index(enforce) < index(write));
+    assert!(index(write) < index(attest));
+    assert!(index(attest) < index(upload));
+    for step in [write, attest, upload] {
+        assert!(
+            step["if"].is_badvalue(),
+            "authorization records must not be produced by an always-on partial path"
+        );
+    }
+    let write_run = run_command(write).unwrap();
+    for fragment in [
+        "needs.validate.result",
+        "needs.build.result",
+        "needs.smoke.result",
+        "needs.runner-resolution.result",
+        "needs.tap-capability.result",
+        "exact_sha: $exact_sha",
+        "version: $version",
+        "status: \"success\"",
+    ] {
+        assert!(
+            format!("{write:?}{write_run}").contains(fragment),
+            "authorization record omits `{fragment}`"
+        );
+    }
+    assert_eq!(
+        attest["uses"].as_str(),
+        Some("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d")
+    );
+    assert_eq!(
+        attest["with"]["subject-path"].as_str(),
+        Some("release-authorization/rehearsal-authorization.json")
+    );
+    assert_eq!(
+        upload["with"]["name"].as_str(),
+        Some(
+            "release-authorization-${{ needs.validate.outputs.safe_exact_sha }}-v${{ needs.validate.outputs.safe_version }}"
+        )
+    );
+
+    let release = workflow(".github/workflows/release.yml");
+    let verify = named_step(
+        workflow_steps(&release, "release-authorization"),
+        "Verify exact rehearsal authorization",
+    );
+    let verify_run = run_command(verify).unwrap();
+    for fragment in [
+        "gh run list",
+        "--commit \"$RELEASE_COMMIT\"",
+        "gh run download \"$run_id\"",
+        "release-authorization-$RELEASE_COMMIT-v$VERSION",
+        ".exact_sha == $exact_sha",
+        ".version == $version",
+        "gh attestation verify \"$record\"",
+        "--signer-workflow \"$GITHUB_REPOSITORY/.github/workflows/rehearse-release.yml\"",
+        "--source-digest \"$RELEASE_COMMIT\"",
+        "--signer-digest \"$RELEASE_COMMIT\"",
+        "--source-ref refs/heads/main",
+    ] {
+        assert!(
+            verify_run.contains(fragment),
+            "release authorization verifier omits `{fragment}`"
+        );
+    }
+}
+
+#[test]
+fn cargo_dist_global_assets_are_attested_and_publicly_smoked() {
+    let assets = [
+        "car-go-clean.rb",
+        "sha256.sum",
+        "source.tar.gz",
+        "source.tar.gz.sha256",
+    ];
+    let release = workflow(".github/workflows/release.yml");
+    let attest_job = &release["jobs"]["attest-global-artifacts"];
+    for (permission, expected) in [
+        ("attestations", "write"),
+        ("contents", "read"),
+        ("id-token", "write"),
+    ] {
+        assert_eq!(
+            attest_job["permissions"][permission].as_str(),
+            Some(expected)
+        );
+    }
+    let attest = named_step(
+        workflow_steps(&release, "attest-global-artifacts"),
+        "Attest cargo-dist global assets",
+    );
+    assert_eq!(
+        attest["uses"].as_str(),
+        Some("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d")
+    );
+    let subject_paths = attest["with"]["subject-path"].as_str().unwrap();
+    for asset in assets {
+        assert!(
+            subject_paths
+                .lines()
+                .any(|line| line.trim().ends_with(asset)),
+            "global attestation omits {asset}"
+        );
+    }
+    assert!(
+        yaml_strings(&release["jobs"]["host"]["needs"]).contains("attest-global-artifacts"),
+        "draft hosting must wait for global provenance"
+    );
+
+    let hosted = workflow(".github/workflows/hosted-release-smoke.yml");
+    let run = run_command(named_step(
+        workflow_steps(&hosted, "smoke"),
+        "Verify public install paths",
+    ))
+    .unwrap();
+    for asset in assets {
+        assert!(
+            run.matches(asset).count() >= 2,
+            "public smoke must both download and attest {asset}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -2469,10 +2758,12 @@ fn formula_release_branch_must_be_formula_only_and_based_on_current_tap_main() {
         let generated = work.path().join("generated-formula");
         let fake_bin = work.path().join("bin");
         let github_env = work.path().join("github-env");
+        let global_git_config = work.path().join("global-gitconfig");
 
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&generated).unwrap();
         fs::create_dir_all(&fake_bin).unwrap();
+        fs::write(&global_git_config, "[commit]\n\tgpgsign = true\n").unwrap();
         assert!(Command::new("git")
             .args(["init", "--quiet", "--bare"])
             .arg(&origin)
@@ -2669,6 +2960,7 @@ fn formula_release_branch_must_be_formula_only_and_based_on_current_tap_main() {
             .env("BRANCH", branch)
             .env("VERSION", "0.4.0")
             .env("GITHUB_ENV", &github_env)
+            .env("GIT_CONFIG_GLOBAL", &global_git_config)
             .output()
             .unwrap();
 

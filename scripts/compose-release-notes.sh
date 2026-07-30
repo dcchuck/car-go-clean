@@ -20,7 +20,7 @@ then
   exit 2
 fi
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 versioned="$repo_root/docs/releases/$tag.md"
 test -r "$versioned"
 test -r "$generated"
