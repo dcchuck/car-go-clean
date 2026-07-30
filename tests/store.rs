@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use car_go_clean::identity::{BootSessionId, FilesystemIdentity, ReviewedIdentity};
-use car_go_clean::safety::ReviewSummary;
+use car_go_clean::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use car_go_clean::store::{
     CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
-    ObservationReconciliation, OriginReconciliation, Store,
+    ObservationReconciliation, OriginReconciliation, PlanLoadError, Store, REVIEW_PLAN_RETENTION,
+    REVIEW_PLAN_TTL,
 };
 
 fn test_store(path: &Path) -> Store {
@@ -34,6 +35,8 @@ fn open_creates_file_and_migrations_create_tables() {
     assert!(store.table_exists("discovery_generations").unwrap());
     assert!(store.table_exists("discovery_origins").unwrap());
     assert!(store.table_exists("project_observations").unwrap());
+    assert!(store.table_exists("review_plans").unwrap());
+    assert!(store.table_exists("review_plan_targets").unwrap());
 }
 
 #[test]
@@ -167,7 +170,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 11);
+    assert_eq!(schema_version, 12);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1766,7 +1769,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 11);
+        assert_eq!(schema_version, 12);
     }
 }
 
@@ -1843,7 +1846,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
     assert!(store.authorized_observations(1).unwrap().is_empty());
     assert_eq!(store.current_generation("policy-a").unwrap(), None);
 
-    let inspection = rusqlite::Connection::open(database).unwrap();
+    let inspection = rusqlite::Connection::open(&database).unwrap();
     let preserved_generation = inspection
         .query_row(
             "
@@ -1901,7 +1904,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 11);
+    assert_eq!(schema_version, 12);
 }
 
 #[test]
@@ -2259,6 +2262,622 @@ fn invalid_latest_generation_does_not_fall_back_to_older_complete_authority() {
     assert!(store
         .current_generation_coverage_incomplete("policy-a")
         .unwrap());
+}
+
+fn review_generation(
+    store: &Store,
+    created_at: SystemTime,
+    policy_hash: &str,
+) -> car_go_clean::store::DiscoveryGeneration {
+    store
+        .reconcile_generation(
+            created_at,
+            &GenerationReconciliation {
+                policy_hash: policy_hash.to_string(),
+                boot_session_id: Some("generation-boot".to_string()),
+                origins: vec![completed_origin("/review-root", Vec::new())],
+            },
+        )
+        .unwrap()
+}
+
+fn persisted_review(
+    project: &str,
+    canonical_project: Option<&str>,
+    class: ProjectClass,
+    target_bytes: u64,
+    identity: Option<(u64, u64, u64, u64, Option<&str>)>,
+    decision: CleanDecision,
+) -> ProjectReview {
+    ProjectReview {
+        path: PathBuf::from(project),
+        canonical_path: canonical_project.map(PathBuf::from),
+        class,
+        target_path: PathBuf::from(format!("{project}/target")),
+        target_bytes,
+        reviewed_identity: identity.map(
+            |(project_device, project_inode, target_device, target_inode, boot_session)| {
+                ReviewedIdentity {
+                    project: FilesystemIdentity {
+                        device: project_device,
+                        inode: project_inode,
+                    },
+                    target: FilesystemIdentity {
+                        device: target_device,
+                        inode: target_inode,
+                    },
+                    boot_session: boot_session.map(|value| BootSessionId(value.to_string())),
+                }
+            },
+        ),
+        decision,
+    }
+}
+
+#[test]
+fn review_plan_round_trips_order_and_complete_review_authority() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let normalized_now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let now = normalized_now + Duration::from_millis(123);
+    let generation = review_generation(&store, now, "policy-a");
+    let reviews = vec![
+        persisted_review(
+            "/logical/first",
+            Some("/physical/first"),
+            ProjectClass::Workspace,
+            4_096,
+            Some((11, 12, 11, 13, Some("review-boot"))),
+            CleanDecision::Cleanable,
+        ),
+        persisted_review(
+            "/logical/second",
+            Some("/physical/second"),
+            ProjectClass::ManagedCache,
+            8_192,
+            Some((21, 22, 21, 23, None)),
+            CleanDecision::Skipped(SkipReason::ActiveRecentWrite {
+                newest_age_secs: 17,
+            }),
+        ),
+        persisted_review(
+            "/logical/unreadable",
+            None,
+            ProjectClass::ContainerStorage,
+            0,
+            None,
+            CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable),
+        ),
+    ];
+
+    let created = store
+        .create_review_plan(now, "policy-a", generation.id, true, 4_096, &reviews)
+        .unwrap();
+
+    assert_eq!(created.created_at, normalized_now);
+    assert_eq!(created.expires_at, normalized_now + REVIEW_PLAN_TTL);
+    assert_eq!(created.policy_hash, "policy-a");
+    assert_eq!(created.generation_id, generation.id);
+    assert!(created.coverage_incomplete);
+    assert_eq!(created.candidate_bytes, 4_096);
+    assert_eq!(
+        created
+            .targets
+            .iter()
+            .map(|target| target.ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        created
+            .targets
+            .iter()
+            .map(|target| target.review.clone())
+            .collect::<Vec<_>>(),
+        reviews
+    );
+
+    let loaded = store
+        .load_review_plan(created.id, now, "policy-a", generation.id)
+        .unwrap();
+    assert_eq!(loaded, created);
+}
+
+#[test]
+fn review_plan_load_reports_each_authority_failure_without_fallback() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
+    let first = review_generation(&store, now, "policy-a");
+    let plan = store
+        .create_review_plan(now, "policy-a", first.id, false, 0, &[])
+        .unwrap();
+
+    assert_eq!(
+        store.load_review_plan(9_999, now, "policy-a", first.id),
+        Err(PlanLoadError::Missing)
+    );
+    assert_eq!(
+        store.load_review_plan(
+            plan.id,
+            now + REVIEW_PLAN_TTL - Duration::from_secs(1),
+            "policy-a",
+            first.id,
+        ),
+        Ok(plan.clone())
+    );
+    assert_eq!(
+        store.load_review_plan(plan.id, now + REVIEW_PLAN_TTL, "policy-a", first.id),
+        Err(PlanLoadError::Expired)
+    );
+
+    let policy_plan = store
+        .create_review_plan(
+            now + Duration::from_secs(1),
+            "policy-a",
+            first.id,
+            false,
+            0,
+            &[],
+        )
+        .unwrap();
+    let other_policy = review_generation(&store, now + Duration::from_secs(2), "policy-b");
+    assert_eq!(
+        store.load_review_plan(
+            policy_plan.id,
+            now + Duration::from_secs(2),
+            "policy-b",
+            other_policy.id,
+        ),
+        Err(PlanLoadError::PolicyMismatch)
+    );
+
+    let current_a = review_generation(&store, now + Duration::from_secs(3), "policy-a");
+    let generation_plan = store
+        .create_review_plan(
+            now + Duration::from_secs(3),
+            "policy-a",
+            current_a.id,
+            false,
+            0,
+            &[],
+        )
+        .unwrap();
+    let superseding_a = review_generation(&store, now + Duration::from_secs(4), "policy-a");
+    assert_eq!(
+        store.load_review_plan(
+            generation_plan.id,
+            now + Duration::from_secs(4),
+            "policy-a",
+            superseding_a.id,
+        ),
+        Err(PlanLoadError::GenerationMismatch)
+    );
+}
+
+#[test]
+fn review_plan_creation_is_atomic_and_retains_only_newest_twenty() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = test_store(&database);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30_000);
+    let generation = review_generation(&store, now, "policy");
+    let unrepresentable = persisted_review(
+        "/too-large",
+        Some("/too-large"),
+        ProjectClass::Workspace,
+        u64::MAX,
+        Some((1, 2, 1, 3, Some("boot"))),
+        CleanDecision::Cleanable,
+    );
+
+    assert!(store
+        .create_review_plan(
+            now,
+            "policy",
+            generation.id,
+            false,
+            i64::MAX,
+            &[unrepresentable],
+        )
+        .is_err());
+    {
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            inspection
+                .query_row("SELECT COUNT(*) FROM review_plans", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "a failed target insert must roll back the plan header"
+        );
+    }
+
+    let mut plans = Vec::new();
+    for offset in 0..(REVIEW_PLAN_RETENTION + 2) {
+        let created_at = now + Duration::from_secs(offset as u64 + 1);
+        plans.push(
+            store
+                .create_review_plan(
+                    created_at,
+                    "policy",
+                    generation.id,
+                    false,
+                    offset as i64,
+                    &[],
+                )
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        store.load_review_plan(
+            plans[0].id,
+            now + Duration::from_secs(25),
+            "policy",
+            generation.id,
+        ),
+        Err(PlanLoadError::Missing)
+    );
+    assert_eq!(
+        store.load_review_plan(
+            plans[1].id,
+            now + Duration::from_secs(25),
+            "policy",
+            generation.id,
+        ),
+        Err(PlanLoadError::Missing)
+    );
+    assert_eq!(
+        store
+            .load_review_plan(
+                plans[2].id,
+                now + Duration::from_secs(25),
+                "policy",
+                generation.id,
+            )
+            .unwrap()
+            .candidate_bytes,
+        2
+    );
+
+    drop(store);
+    let inspection = rusqlite::Connection::open(database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM review_plans", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        REVIEW_PLAN_RETENTION as i64
+    );
+}
+
+#[test]
+fn review_plan_pruning_on_open_removes_expired_or_invalid_authority_and_cascades_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let now = SystemTime::now();
+    let (expired_plan_id, generation_id) = {
+        let store = test_store(&database);
+        let generation = review_generation(&store, now, "policy");
+        let review = persisted_review(
+            "/project",
+            Some("/project"),
+            ProjectClass::Workspace,
+            100,
+            Some((1, 2, 1, 3, Some("boot"))),
+            CleanDecision::Cleanable,
+        );
+        let plan = store
+            .create_review_plan(now, "policy", generation.id, false, 100, &[review])
+            .unwrap();
+        (plan.id, generation.id)
+    };
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE review_plans SET expires_at = 0 WHERE id = ?1",
+                [expired_plan_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = Store::open(&database).unwrap();
+    drop(reopened);
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM review_plans", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM review_plan_targets", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "plan pruning must cascade so no stale target authority survives"
+    );
+    drop(inspection);
+
+    let invalid_plan_id = {
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+        let review = persisted_review(
+            "/project",
+            Some("/project"),
+            ProjectClass::Workspace,
+            100,
+            Some((1, 2, 1, 3, Some("boot"))),
+            CleanDecision::Cleanable,
+        );
+        store
+            .create_review_plan(now, "policy", generation_id, false, 100, &[review])
+            .unwrap()
+            .id
+    };
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE discovery_generations SET authority_valid = 0 WHERE id = ?1",
+                [generation_id],
+            )
+            .unwrap();
+    }
+    drop(Store::open(&database).unwrap());
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row(
+                "SELECT COUNT(*) FROM review_plans WHERE id = ?1",
+                [invalid_plan_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "SELECT COUNT(*) FROM review_plan_targets WHERE plan_id = ?1",
+                [invalid_plan_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(inspection);
+
+    let (missing_plan_id, missing_generation_id) = {
+        let store = Store::open(&database).unwrap();
+        store.migrate().unwrap();
+        let generation = review_generation(&store, now, "other-policy");
+        let review = persisted_review(
+            "/missing-generation",
+            Some("/missing-generation"),
+            ProjectClass::Workspace,
+            100,
+            Some((1, 4, 1, 5, Some("boot"))),
+            CleanDecision::Cleanable,
+        );
+        let plan = store
+            .create_review_plan(now, "other-policy", generation.id, false, 100, &[review])
+            .unwrap();
+        (plan.id, generation.id)
+    };
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM discovery_generations WHERE id = ?1",
+                [missing_generation_id],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM review_plans WHERE id = ?1",
+                    [missing_plan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "the fixture must leave an orphan for Store::open to prune"
+        );
+    }
+    drop(Store::open(&database).unwrap());
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row(
+                "SELECT COUNT(*) FROM review_plans WHERE id = ?1",
+                [missing_plan_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        inspection
+            .query_row(
+                "SELECT COUNT(*) FROM review_plan_targets WHERE plan_id = ?1",
+                [missing_plan_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn review_plan_load_rejects_an_older_generation_when_the_newest_is_invalid() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = test_store(&database);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(35_000);
+    let first = review_generation(&store, now, "policy");
+    let plan = store
+        .create_review_plan(now, "policy", first.id, false, 0, &[])
+        .unwrap();
+    let newest = review_generation(&store, now + Duration::from_secs(1), "policy");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE discovery_generations SET authority_valid = 0 WHERE id = ?1",
+                [newest.id],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        store.load_review_plan(plan.id, now + Duration::from_secs(1), "policy", first.id,),
+        Err(PlanLoadError::GenerationMismatch)
+    );
+}
+
+#[test]
+fn version_eleven_migration_adds_review_plans_without_changing_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(37_000);
+    {
+        let store = test_store(&database);
+        store.upsert_project("/history/project", now).unwrap();
+        let run_id = store.start_run(now).unwrap();
+        store
+            .record_clean_event(&CleanEvent {
+                id: 0,
+                run_id,
+                ts: now,
+                path: "/history/project".to_string(),
+                bytes_before: 900,
+                bytes_after: 100,
+                duration_ms: 3,
+                exit_code: 0,
+                stderr_excerpt: String::new(),
+            })
+            .unwrap();
+        store
+            .record_error(&ErrorRecord {
+                id: 0,
+                ts: now,
+                category: "scan".to_string(),
+                path: Some("/history/project".to_string()),
+                message: "historical warning".to_string(),
+            })
+            .unwrap();
+        store.finish_run(run_id, now, 1, 800, 1).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                DROP TABLE review_plan_targets;
+                DROP TABLE review_plans;
+                DELETE FROM schema_version WHERE version = 12;
+                ",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            11
+        );
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    assert!(store.table_exists("review_plans").unwrap());
+    assert!(store.table_exists("review_plan_targets").unwrap());
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+    assert_eq!(store.last_run().unwrap().bytes_recovered, 800);
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        800
+    );
+}
+
+#[test]
+fn review_plan_pruning_preserves_run_clean_project_error_and_recovery_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = test_store(&database);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(40_000);
+    let generation = review_generation(&store, now, "policy");
+    let plan = store
+        .create_review_plan(now, "policy", generation.id, false, 0, &[])
+        .unwrap();
+    store.upsert_project("/history/project", now).unwrap();
+    let run_id = store.start_run(now).unwrap();
+    store
+        .record_clean_event(&CleanEvent {
+            id: 0,
+            run_id,
+            ts: now,
+            path: "/history/project".to_string(),
+            bytes_before: 500,
+            bytes_after: 200,
+            duration_ms: 5,
+            exit_code: 0,
+            stderr_excerpt: String::new(),
+        })
+        .unwrap();
+    store
+        .record_error(&ErrorRecord {
+            id: 0,
+            ts: now,
+            category: "scan".to_string(),
+            path: Some("/history/project".to_string()),
+            message: "preserve me".to_string(),
+        })
+        .unwrap();
+    store.finish_run(run_id, now, 1, 300, 1).unwrap();
+
+    assert_eq!(
+        store
+            .prune_review_plans(now + REVIEW_PLAN_TTL, Some(("policy", generation.id)),)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.load_review_plan(plan.id, now + REVIEW_PLAN_TTL, "policy", generation.id,),
+        Err(PlanLoadError::Missing)
+    );
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+    assert_eq!(store.last_run().unwrap().bytes_recovered, 300);
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        300
+    );
 }
 
 #[test]

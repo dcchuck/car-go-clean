@@ -1,12 +1,17 @@
 use crate::identity::{FilesystemIdentity, ReviewedIdentity};
-use crate::safety::ReviewSummary;
+use crate::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+pub const REVIEW_PLAN_TTL: Duration = Duration::from_secs(30 * 60);
+pub const REVIEW_PLAN_RETENTION: usize = 20;
 
 pub struct Store {
     conn: Connection,
@@ -146,6 +151,50 @@ pub struct GenerationReconciliation {
     pub origins: Vec<OriginReconciliation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPlanTarget {
+    pub ordinal: usize,
+    pub review: ProjectReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPlan {
+    pub id: i64,
+    pub created_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub policy_hash: String,
+    pub generation_id: i64,
+    pub coverage_incomplete: bool,
+    pub candidate_bytes: i64,
+    pub targets: Vec<ReviewPlanTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanLoadError {
+    Missing,
+    Expired,
+    PolicyMismatch,
+    GenerationMismatch,
+    Storage(String),
+}
+
+impl fmt::Display for PlanLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("review plan does not exist"),
+            Self::Expired => formatter.write_str("review plan has expired"),
+            Self::PolicyMismatch => {
+                formatter.write_str("review plan policy does not match current policy")
+            }
+            Self::GenerationMismatch => formatter
+                .write_str("review plan generation is not the current discovery generation"),
+            Self::Storage(message) => write!(formatter, "review plan storage error: {message}"),
+        }
+    }
+}
+
+impl Error for PlanLoadError {}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -153,9 +202,12 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.prune_review_plans(SystemTime::now(), None)?;
+        Ok(store)
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -608,20 +660,221 @@ impl Store {
             }
             tx.commit()?;
         }
+        if current < 12 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS review_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    generation_id INTEGER NOT NULL
+                        REFERENCES discovery_generations(id) ON DELETE CASCADE,
+                    coverage_incomplete INTEGER NOT NULL
+                        CHECK(coverage_incomplete IN (0, 1)),
+                    candidate_bytes INTEGER NOT NULL CHECK(candidate_bytes >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS review_plan_targets (
+                    plan_id INTEGER NOT NULL
+                        REFERENCES review_plans(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                    project_path TEXT NOT NULL,
+                    canonical_project_path TEXT,
+                    project_class TEXT NOT NULL
+                        CHECK(project_class IN (
+                            'workspace',
+                            'managed_cache',
+                            'container_storage'
+                        )),
+                    target_path TEXT NOT NULL,
+                    project_device INTEGER CHECK(project_device >= 0),
+                    project_inode INTEGER CHECK(project_inode >= 0),
+                    target_device INTEGER CHECK(target_device >= 0),
+                    target_inode INTEGER CHECK(target_inode >= 0),
+                    review_boot_session_id TEXT,
+                    reviewed_bytes INTEGER NOT NULL CHECK(reviewed_bytes >= 0),
+                    decision TEXT NOT NULL
+                        CHECK(decision IN ('cleanable', 'skipped')),
+                    skip_reason TEXT,
+                    skip_newest_age_secs INTEGER
+                        CHECK(skip_newest_age_secs >= 0),
+                    CHECK(
+                        (
+                            project_device IS NULL
+                            AND project_inode IS NULL
+                            AND target_device IS NULL
+                            AND target_inode IS NULL
+                            AND review_boot_session_id IS NULL
+                        )
+                        OR (
+                            project_device IS NOT NULL
+                            AND project_inode IS NOT NULL
+                            AND target_device IS NOT NULL
+                            AND target_inode IS NOT NULL
+                        )
+                    ),
+                    CHECK(
+                        (decision = 'cleanable' AND skip_reason IS NULL)
+                        OR (decision = 'skipped' AND skip_reason IS NOT NULL)
+                    ),
+                    CHECK(
+                        (skip_reason = 'active_recent_write'
+                            AND skip_newest_age_secs IS NOT NULL)
+                        OR (skip_reason <> 'active_recent_write'
+                            AND skip_newest_age_secs IS NULL)
+                        OR skip_reason IS NULL
+                    ),
+                    PRIMARY KEY(plan_id, ordinal)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_review_plans_expires
+                    ON review_plans(expires_at);
+                INSERT INTO schema_version(version) VALUES (12);
+                ",
+            )?;
+            tx.commit()?;
+        }
+        self.prune_review_plans(SystemTime::now(), None)?;
         Ok(())
     }
 
     pub fn table_exists(&self, table: &str) -> Result<bool> {
-        let exists = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |_| Ok(()),
+        connection_table_exists(&self.conn, table)
+    }
+
+    pub fn create_review_plan(
+        &self,
+        created_at: SystemTime,
+        policy_hash: &str,
+        generation_id: i64,
+        coverage_incomplete: bool,
+        candidate_bytes: i64,
+        reviews: &[ProjectReview],
+    ) -> Result<ReviewPlan> {
+        let created_at_epoch = to_epoch(created_at)?;
+        let created_at = from_epoch(created_at_epoch);
+        let expires_at = created_at
+            .checked_add(REVIEW_PLAN_TTL)
+            .context("review plan expiry exceeds system time range")?;
+        let expires_at_epoch = to_epoch(expires_at)?;
+        let tx = self.conn.unchecked_transaction()?;
+
+        if !generation_is_current(&tx, policy_hash, generation_id)? {
+            bail!(
+                "generation {generation_id} is not the current valid generation for policy {policy_hash}"
+            );
+        }
+
+        prune_review_plans_in_transaction(
+            &tx,
+            created_at_epoch,
+            Some((policy_hash, generation_id)),
+        )?;
+        tx.execute(
+            "
+            INSERT INTO review_plans (
+                created_at,
+                expires_at,
+                policy_hash,
+                generation_id,
+                coverage_incomplete,
+                candidate_bytes
             )
-            .optional()?
-            .is_some();
-        Ok(exists)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                created_at_epoch,
+                expires_at_epoch,
+                policy_hash,
+                generation_id,
+                coverage_incomplete,
+                candidate_bytes,
+            ],
+        )?;
+        let plan_id = tx.last_insert_rowid();
+        let mut targets = Vec::with_capacity(reviews.len());
+        for (ordinal, review) in reviews.iter().enumerate() {
+            insert_review_plan_target(&tx, plan_id, ordinal, review)?;
+            targets.push(ReviewPlanTarget {
+                ordinal,
+                review: review.clone(),
+            });
+        }
+        prune_review_plan_retention_in_transaction(&tx)?;
+        tx.commit()?;
+
+        Ok(ReviewPlan {
+            id: plan_id,
+            created_at,
+            expires_at,
+            policy_hash: policy_hash.to_string(),
+            generation_id,
+            coverage_incomplete,
+            candidate_bytes,
+            targets,
+        })
+    }
+
+    pub fn load_review_plan(
+        &self,
+        id: i64,
+        now: SystemTime,
+        current_policy_hash: &str,
+        current_generation_id: i64,
+    ) -> std::result::Result<ReviewPlan, PlanLoadError> {
+        let now_epoch = to_epoch(now).map_err(plan_storage_error)?;
+        let plan = load_review_plan_from_connection(&self.conn, id).map_err(plan_storage_error)?;
+        let result = match plan {
+            None => Err(PlanLoadError::Missing),
+            Some(plan) if plan.expires_at <= now => Err(PlanLoadError::Expired),
+            Some(plan) if plan.policy_hash != current_policy_hash => {
+                Err(PlanLoadError::PolicyMismatch)
+            }
+            Some(plan)
+                if plan.generation_id != current_generation_id
+                    || !generation_is_current(
+                        &self.conn,
+                        current_policy_hash,
+                        current_generation_id,
+                    )
+                    .map_err(plan_storage_error)? =>
+            {
+                Err(PlanLoadError::GenerationMismatch)
+            }
+            Some(plan) => Ok(plan),
+        };
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(plan_storage_error)?;
+        prune_review_plans_in_transaction(
+            &tx,
+            now_epoch,
+            Some((current_policy_hash, current_generation_id)),
+        )
+        .map_err(plan_storage_error)?;
+        tx.commit().map_err(plan_storage_error)?;
+        result
+    }
+
+    pub fn prune_review_plans(
+        &self,
+        now: SystemTime,
+        current_authority: Option<(&str, i64)>,
+    ) -> Result<usize> {
+        if !connection_table_exists(&self.conn, "review_plans")?
+            || !connection_table_exists(&self.conn, "discovery_generations")?
+            || !connection_column_exists(&self.conn, "discovery_generations", "authority_valid")?
+        {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let pruned = prune_review_plans_in_transaction(&tx, to_epoch(now)?, current_authority)?;
+        tx.commit()?;
+        Ok(pruned)
     }
 
     pub fn upsert_project(&self, path: impl AsRef<Path>, now: SystemTime) -> Result<()> {
@@ -2112,6 +2365,435 @@ fn project_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pro
         authorized: row.get(8)?,
         blocked_reason: row.get(9)?,
     })
+}
+
+fn connection_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn connection_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn generation_is_current(
+    connection: &Connection,
+    policy_hash: &str,
+    generation_id: i64,
+) -> Result<bool> {
+    let newest = connection
+        .query_row(
+            "
+            SELECT id, authority_valid
+            FROM discovery_generations
+            WHERE policy_hash = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [policy_hash],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(newest, Some((id, true)) if id == generation_id))
+}
+
+fn insert_review_plan_target(
+    tx: &Transaction<'_>,
+    plan_id: i64,
+    ordinal: usize,
+    review: &ProjectReview,
+) -> Result<()> {
+    let (project_device, project_inode, target_device, target_inode, boot_session_id) =
+        match review.reviewed_identity.as_ref() {
+            Some(identity) => (
+                Some(i64::try_from(identity.project.device)?),
+                Some(i64::try_from(identity.project.inode)?),
+                Some(i64::try_from(identity.target.device)?),
+                Some(i64::try_from(identity.target.inode)?),
+                identity
+                    .boot_session
+                    .as_ref()
+                    .map(|boot_session| boot_session.0.as_str()),
+            ),
+            None => (None, None, None, None, None),
+        };
+    let (decision, skip_reason, skip_newest_age_secs) = decision_parts(&review.decision);
+    let reviewed_bytes = i64::try_from(review.target_bytes)
+        .context("reviewed target bytes exceed SQLite integer range")?;
+    let skip_newest_age_secs = skip_newest_age_secs
+        .map(i64::try_from)
+        .transpose()
+        .context("skip age exceeds SQLite integer range")?;
+    tx.execute(
+        "
+        INSERT INTO review_plan_targets (
+            plan_id,
+            ordinal,
+            project_path,
+            canonical_project_path,
+            project_class,
+            target_path,
+            project_device,
+            project_inode,
+            target_device,
+            target_inode,
+            review_boot_session_id,
+            reviewed_bytes,
+            decision,
+            skip_reason,
+            skip_newest_age_secs
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+        )
+        ",
+        params![
+            plan_id,
+            i64::try_from(ordinal)?,
+            path_to_string(&review.path)?,
+            review
+                .canonical_path
+                .as_deref()
+                .map(path_to_string)
+                .transpose()?,
+            project_class_label(review.class),
+            path_to_string(&review.target_path)?,
+            project_device,
+            project_inode,
+            target_device,
+            target_inode,
+            boot_session_id,
+            reviewed_bytes,
+            decision,
+            skip_reason,
+            skip_newest_age_secs,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_review_plan_from_connection(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<ReviewPlan>> {
+    let header = connection
+        .query_row(
+            "
+            SELECT
+                id,
+                created_at,
+                expires_at,
+                policy_hash,
+                generation_id,
+                coverage_incomplete,
+                candidate_bytes
+            FROM review_plans
+            WHERE id = ?1
+            ",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        created_at,
+        expires_at,
+        policy_hash,
+        generation_id,
+        coverage_incomplete,
+        candidate_bytes,
+    )) = header
+    else {
+        return Ok(None);
+    };
+
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            ordinal,
+            project_path,
+            canonical_project_path,
+            project_class,
+            target_path,
+            project_device,
+            project_inode,
+            target_device,
+            target_inode,
+            review_boot_session_id,
+            reviewed_bytes,
+            decision,
+            skip_reason,
+            skip_newest_age_secs
+        FROM review_plan_targets
+        WHERE plan_id = ?1
+        ORDER BY ordinal
+        ",
+    )?;
+    let mut rows = statement.query([id])?;
+    let mut targets = Vec::new();
+    while let Some(row) = rows.next()? {
+        let ordinal = usize::try_from(row.get::<_, i64>(0)?)
+            .context("review-plan target ordinal is out of range")?;
+        let project_path = PathBuf::from(row.get::<_, String>(1)?);
+        let canonical_project_path = row.get::<_, Option<String>>(2)?.map(PathBuf::from);
+        let project_class = parse_project_class(&row.get::<_, String>(3)?)?;
+        let target_path = PathBuf::from(row.get::<_, String>(4)?);
+        let project_device = row.get::<_, Option<i64>>(5)?;
+        let project_inode = row.get::<_, Option<i64>>(6)?;
+        let target_device = row.get::<_, Option<i64>>(7)?;
+        let target_inode = row.get::<_, Option<i64>>(8)?;
+        let boot_session_id = row.get::<_, Option<String>>(9)?;
+        let reviewed_identity = parse_reviewed_identity(
+            project_device,
+            project_inode,
+            target_device,
+            target_inode,
+            boot_session_id,
+        )?;
+        let reviewed_bytes = u64::try_from(row.get::<_, i64>(10)?)
+            .context("reviewed target bytes are out of range")?;
+        let decision = parse_decision(
+            &row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?.as_deref(),
+            row.get::<_, Option<i64>>(13)?,
+        )?;
+        targets.push(ReviewPlanTarget {
+            ordinal,
+            review: ProjectReview {
+                path: project_path,
+                canonical_path: canonical_project_path,
+                class: project_class,
+                target_path,
+                target_bytes: reviewed_bytes,
+                reviewed_identity,
+                decision,
+            },
+        });
+    }
+
+    Ok(Some(ReviewPlan {
+        id,
+        created_at: from_epoch(created_at),
+        expires_at: from_epoch(expires_at),
+        policy_hash,
+        generation_id,
+        coverage_incomplete,
+        candidate_bytes,
+        targets,
+    }))
+}
+
+fn prune_review_plans_in_transaction(
+    tx: &Transaction<'_>,
+    now_epoch: i64,
+    current_authority: Option<(&str, i64)>,
+) -> Result<usize> {
+    let mut pruned = tx.execute(
+        "
+        DELETE FROM review_plans
+        WHERE expires_at <= ?1
+           OR NOT EXISTS(
+                SELECT 1
+                FROM discovery_generations AS generation
+                WHERE generation.id = review_plans.generation_id
+                  AND generation.policy_hash = review_plans.policy_hash
+                  AND generation.authority_valid = 1
+                  AND generation.id = (
+                      SELECT newest.id
+                      FROM discovery_generations AS newest
+                      WHERE newest.policy_hash = review_plans.policy_hash
+                      ORDER BY newest.id DESC
+                      LIMIT 1
+                  )
+           )
+        ",
+        [now_epoch],
+    )?;
+    if let Some((policy_hash, generation_id)) = current_authority {
+        pruned += tx.execute(
+            "
+            DELETE FROM review_plans
+            WHERE policy_hash <> ?1 OR generation_id <> ?2
+            ",
+            params![policy_hash, generation_id],
+        )?;
+    }
+    pruned += prune_review_plan_retention_in_transaction(tx)?;
+    Ok(pruned)
+}
+
+fn prune_review_plan_retention_in_transaction(tx: &Transaction<'_>) -> Result<usize> {
+    Ok(tx.execute(
+        "
+        DELETE FROM review_plans
+        WHERE id IN (
+            SELECT id
+            FROM review_plans
+            ORDER BY created_at DESC, id DESC
+            LIMIT -1 OFFSET ?1
+        )
+        ",
+        [i64::try_from(REVIEW_PLAN_RETENTION)?],
+    )?)
+}
+
+fn project_class_label(class: ProjectClass) -> &'static str {
+    match class {
+        ProjectClass::Workspace => "workspace",
+        ProjectClass::ManagedCache => "managed_cache",
+        ProjectClass::ContainerStorage => "container_storage",
+    }
+}
+
+fn parse_project_class(value: &str) -> Result<ProjectClass> {
+    match value {
+        "workspace" => Ok(ProjectClass::Workspace),
+        "managed_cache" => Ok(ProjectClass::ManagedCache),
+        "container_storage" => Ok(ProjectClass::ContainerStorage),
+        other => bail!("unknown persisted project class {other:?}"),
+    }
+}
+
+fn decision_parts(decision: &CleanDecision) -> (&'static str, Option<&'static str>, Option<u64>) {
+    match decision {
+        CleanDecision::Cleanable => ("cleanable", None, None),
+        CleanDecision::Skipped(reason) => {
+            let (reason, age) = skip_reason_parts(reason);
+            ("skipped", Some(reason), age)
+        }
+    }
+}
+
+fn skip_reason_parts(reason: &SkipReason) -> (&'static str, Option<u64>) {
+    match reason {
+        SkipReason::NoTarget => ("no_target", None),
+        SkipReason::ActiveRecentWrite { newest_age_secs } => {
+            ("active_recent_write", Some(*newest_age_secs))
+        }
+        SkipReason::ActiveProcess => ("active_process", None),
+        SkipReason::ManagedCache => ("managed_cache", None),
+        SkipReason::ContainerStorage => ("container_storage", None),
+        SkipReason::ScanError => ("scan_error", None),
+        SkipReason::TargetReadError => ("target_read_error", None),
+        SkipReason::InvalidManifest => ("invalid_manifest", None),
+        SkipReason::ProjectIdentityUnavailable => ("project_identity_unavailable", None),
+        SkipReason::TargetIdentityUnavailable => ("target_identity_unavailable", None),
+        SkipReason::CrossDeviceTarget => ("cross_device_target", None),
+        SkipReason::ProjectIdentityChanged => ("project_identity_changed", None),
+        SkipReason::TargetIdentityChanged => ("target_identity_changed", None),
+        SkipReason::OutOfScope => ("out_of_scope", None),
+        SkipReason::Excluded => ("excluded", None),
+    }
+}
+
+fn parse_decision(
+    decision: &str,
+    skip_reason: Option<&str>,
+    skip_newest_age_secs: Option<i64>,
+) -> Result<CleanDecision> {
+    match (decision, skip_reason) {
+        ("cleanable", None) if skip_newest_age_secs.is_none() => Ok(CleanDecision::Cleanable),
+        ("skipped", Some(reason)) => Ok(CleanDecision::Skipped(parse_skip_reason(
+            reason,
+            skip_newest_age_secs,
+        )?)),
+        _ => bail!(
+            "invalid persisted cleanup decision {decision:?} with skip reason {skip_reason:?}"
+        ),
+    }
+}
+
+fn parse_skip_reason(reason: &str, newest_age_secs: Option<i64>) -> Result<SkipReason> {
+    if reason == "active_recent_write" {
+        let newest_age_secs = newest_age_secs
+            .context("active_recent_write is missing newest age")?
+            .try_into()
+            .context("active_recent_write newest age is out of range")?;
+        return Ok(SkipReason::ActiveRecentWrite { newest_age_secs });
+    }
+    if newest_age_secs.is_some() {
+        bail!("persisted skip reason {reason:?} unexpectedly has a newest age");
+    }
+    match reason {
+        "no_target" => Ok(SkipReason::NoTarget),
+        "active_process" => Ok(SkipReason::ActiveProcess),
+        "managed_cache" => Ok(SkipReason::ManagedCache),
+        "container_storage" => Ok(SkipReason::ContainerStorage),
+        "scan_error" => Ok(SkipReason::ScanError),
+        "target_read_error" => Ok(SkipReason::TargetReadError),
+        "invalid_manifest" => Ok(SkipReason::InvalidManifest),
+        "project_identity_unavailable" => Ok(SkipReason::ProjectIdentityUnavailable),
+        "target_identity_unavailable" => Ok(SkipReason::TargetIdentityUnavailable),
+        "cross_device_target" => Ok(SkipReason::CrossDeviceTarget),
+        "project_identity_changed" => Ok(SkipReason::ProjectIdentityChanged),
+        "target_identity_changed" => Ok(SkipReason::TargetIdentityChanged),
+        "out_of_scope" => Ok(SkipReason::OutOfScope),
+        "excluded" => Ok(SkipReason::Excluded),
+        other => bail!("unknown persisted skip reason {other:?}"),
+    }
+}
+
+fn parse_reviewed_identity(
+    project_device: Option<i64>,
+    project_inode: Option<i64>,
+    target_device: Option<i64>,
+    target_inode: Option<i64>,
+    boot_session_id: Option<String>,
+) -> Result<Option<ReviewedIdentity>> {
+    match (project_device, project_inode, target_device, target_inode) {
+        (None, None, None, None) if boot_session_id.is_none() => Ok(None),
+        (Some(project_device), Some(project_inode), Some(target_device), Some(target_inode)) => {
+            Ok(Some(ReviewedIdentity {
+                project: FilesystemIdentity {
+                    device: project_device
+                        .try_into()
+                        .context("project device is out of range")?,
+                    inode: project_inode
+                        .try_into()
+                        .context("project inode is out of range")?,
+                },
+                target: FilesystemIdentity {
+                    device: target_device
+                        .try_into()
+                        .context("target device is out of range")?,
+                    inode: target_inode
+                        .try_into()
+                        .context("target inode is out of range")?,
+                },
+                boot_session: boot_session_id.map(crate::identity::BootSessionId),
+            }))
+        }
+        _ => bail!("persisted review identity is incomplete"),
+    }
+}
+
+fn plan_storage_error(error: impl fmt::Display) -> PlanLoadError {
+    PlanLoadError::Storage(error.to_string())
 }
 
 fn collect_rows<T>(
