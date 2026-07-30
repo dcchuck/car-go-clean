@@ -302,8 +302,12 @@ stop is completed in the pre-reboot phase. The host then issues an actual
 guest reboot. It copies the complete pre-reboot transcript and milestones
 before issuing that reboot, records the Linux boot ID or macOS boot time on
 both sides, and requires the identity to change before post-reboot acceptance.
-The post-reboot phase proves the service stayed disabled before start and
-uninstall. Pre- and post-reboot transcripts are separate files.
+The service lifecycle installs and starts explicitly, persistently stops,
+refreshes the definition and captured physical manager roots without enabling
+or starting, and then crosses manager recreation and reboot. The post-reboot
+phase proves the service stayed disabled before explicit start and uninstall,
+and proves uninstall retained config, state, logs, and history. Pre- and
+post-reboot transcripts are separate files.
 
 No acceptance failure deletes a VM. Sanitized transcripts and host-side
 launch, SSH, hash, normalized tool-version, and boot-identity evidence are

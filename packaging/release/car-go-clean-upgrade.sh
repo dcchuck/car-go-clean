@@ -86,8 +86,10 @@ esac
 
 session_file=$state_dir/upgrade-session
 session_lock=$state_dir/upgrade-session.lock
+service_definition_backup=$state_dir/upgrade-service-definition
 work_dir=
 session_temp=
+definition_temp=
 lock_held=false
 rollback_armed=false
 original_state=
@@ -110,6 +112,12 @@ validate_absolute_path_value() {
         /*) ;;
         *) return 1 ;;
     esac
+}
+
+quote_shell_word() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
 }
 
 canonical_existing_binary() (
@@ -149,6 +157,9 @@ cleanup_temporary_files() {
     if [ -n "$session_temp" ] && [ -e "$session_temp" ]; then
         rm -f "$session_temp"
     fi
+    if [ -n "$definition_temp" ] && [ -e "$definition_temp" ]; then
+        rm -f "$definition_temp"
+    fi
     if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
         rm -rf "$work_dir"
     fi
@@ -158,19 +169,50 @@ cleanup_temporary_files() {
     fi
 }
 
+installed_service_definition() {
+    case "$platform" in
+        Darwin)
+            printf '%s\n' "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+            ;;
+        Linux)
+            printf '%s\n' "$HOME/.config/systemd/user/car-go-clean.service"
+            ;;
+    esac
+}
+
+backup_installed_service_definition() {
+    definition_path=$(installed_service_definition) || return 1
+    [ ! -L "$definition_path" ] && [ -f "$definition_path" ] || {
+        echo "car-go-clean upgrade: installed service definition is unavailable or unsafe: $definition_path" >&2
+        return 1
+    }
+    definition_temp=$(mktemp "$state_dir/.upgrade-service-definition.XXXXXX") || {
+        echo "car-go-clean upgrade: could not create service-definition backup" >&2
+        return 1
+    }
+    chmod 600 "$definition_temp" || return 1
+    cp "$definition_path" "$definition_temp" || return 1
+    chmod 600 "$definition_temp" || return 1
+    mv -f "$definition_temp" "$service_definition_backup" || return 1
+    definition_temp=
+}
+
 launchd_target() {
     uid=$(id -u) || return 1
     printf 'gui/%s/com.dcchuck.car-go-clean\n' "$uid"
 }
 
-stop_active_service() {
+disable_installed_service() {
     case "$platform" in
         Darwin)
             target=$(launchd_target) || return 1
-            launchctl bootout "$target"
+            launchctl disable "$target" &&
+                if [ "$original_state" = active ]; then
+                    launchctl bootout "$target"
+                fi
             ;;
         Linux)
-            systemctl --user stop car-go-clean.service
+            systemctl --user disable --now car-go-clean.service
             ;;
     esac
 }
@@ -179,12 +221,13 @@ restore_active_service() {
     case "$platform" in
         Darwin)
             target=$(launchd_target) || return 1
-            launchctl bootstrap "gui/$(id -u)" \
+            launchctl enable "$target" &&
+                launchctl bootstrap "gui/$(id -u)" \
                 "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist" &&
                 launchctl kickstart -k "$target"
             ;;
         Linux)
-            systemctl --user start car-go-clean.service
+            systemctl --user enable --now car-go-clean.service
             ;;
     esac
 }
@@ -357,7 +400,7 @@ load_session() {
     [ "$resolved_session_binary" = "$session_binary_path" ] ||
         die "upgrade session binary path is no longer exact"
     case "$session_phase" in
-        preview_pending)
+        replacement_pending|definition_pending|preview_pending)
             [ "$session_review" = none ] || die "upgrade session is malformed"
             ;;
         review_pending|executing|executed)
@@ -401,13 +444,21 @@ write_session() {
 
 validate_resumed_binary() {
     cgc_binary=$session_binary_path
-    resumed_version=$("$cgc_binary" version 2>&1) ||
-        die "could not validate the replacement car-go-clean binary"
-    [ "$resumed_version" = 0.4.0 ] ||
-        die "expected car-go-clean 0.4.0 while resuming, found $resumed_version"
+    resumed_version=$("$cgc_binary" version 2>&1) || {
+        echo "car-go-clean upgrade: could not validate the replacement car-go-clean binary" >&2
+        return 1
+    }
+    if [ "$resumed_version" != 0.4.0 ]; then
+        echo "car-go-clean upgrade: expected car-go-clean 0.4.0, found $resumed_version" >&2
+        return 1
+    fi
 }
 
+# shellcheck disable=SC2016 # The rollback block must expand these expressions when the operator runs it.
 print_homebrew_rollback_block() {
+    rollback_definition=$(installed_service_definition)
+    rollback_backup_word=$(quote_shell_word "$service_definition_backup")
+    rollback_definition_word=$(quote_shell_word "$rollback_definition")
     echo "Copy and run this entire rollback block; it stops at the first failing command:" >&2
     echo "# BEGIN car-go-clean exact Homebrew rollback" >&2
     echo "if (" >&2
@@ -420,11 +471,27 @@ print_homebrew_rollback_block() {
     echo "    brew install \"\$rollback_formula\" &&" >&2
     echo "    brew link --force --overwrite \"\$rollback_formula\" &&" >&2
     echo "    rollback_version=\$(car-go-clean version) &&" >&2
+    echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
+    if [ "$session_state" != absent ]; then
+        echo "    [ -f $rollback_backup_word ] &&" >&2
+        echo "    cp $rollback_backup_word $rollback_definition_word &&" >&2
+        if [ "$platform" = Linux ]; then
+            echo "    systemctl --user daemon-reload &&" >&2
+        fi
+    fi
     if [ "$session_state" = active ]; then
-        echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
-        echo "    car-go-clean service start" >&2
+        case "$platform" in
+            Darwin)
+                echo '    launchctl enable "gui/$(id -u)/com.dcchuck.car-go-clean" &&' >&2
+                echo '    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist" &&' >&2
+                echo '    launchctl kickstart -k "gui/$(id -u)/com.dcchuck.car-go-clean"' >&2
+                ;;
+            Linux)
+                echo "    systemctl --user enable --now car-go-clean.service" >&2
+                ;;
+        esac
     else
-        echo "    [ \"\$rollback_version\" = $session_old_version ]" >&2
+        echo "    true" >&2
     fi
     echo "); then" >&2
     echo "    echo \"Exact car-go-clean $session_old_version rollback validated.\"" >&2
@@ -440,6 +507,104 @@ print_homebrew_rollback_block() {
     echo "    false" >&2
     echo "fi" >&2
     echo "# END car-go-clean exact Homebrew rollback" >&2
+}
+
+# shellcheck disable=SC2016 # Guidance intentionally preserves expressions for the operator's shell.
+print_native_restore_guidance() {
+    case "$platform" in
+        Darwin)
+            echo '  launchctl enable "gui/$(id -u)/com.dcchuck.car-go-clean"' >&2
+            echo '  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"' >&2
+            echo '  launchctl kickstart -k "gui/$(id -u)/com.dcchuck.car-go-clean"' >&2
+            ;;
+        Linux)
+            echo "  systemctl --user enable --now car-go-clean.service" >&2
+            ;;
+    esac
+}
+
+# shellcheck disable=SC2016 # The rollback block must expand these expressions when the operator runs it.
+print_shell_rollback_block() {
+    rollback_installer=car-go-clean-installer-v$session_old_version.sh
+    rollback_install_dir=$(dirname "$session_binary_path")
+    rollback_definition=$(installed_service_definition)
+    rollback_installer_word=$(quote_shell_word "$rollback_installer")
+    rollback_install_dir_word=$(quote_shell_word "$rollback_install_dir")
+    rollback_binary_word=$(quote_shell_word "$session_binary_path")
+    rollback_backup_word=$(quote_shell_word "$service_definition_backup")
+    rollback_definition_word=$(quote_shell_word "$rollback_definition")
+    echo "Copy and run this entire rollback block; it stops at the first failing command:" >&2
+    echo "# BEGIN car-go-clean exact shell rollback" >&2
+    echo "if (" >&2
+    printf '    curl --proto '\''=https'\'' --tlsv1.2 -fsSL -o %s https://github.com/dcchuck/car-go-clean/releases/download/v%s/car-go-clean-installer.sh &&\n' \
+        "$rollback_installer_word" "$session_old_version" >&2
+    printf '    sh %s --version %s --install-dir %s &&\n' \
+        "$rollback_installer_word" "$session_old_version" "$rollback_install_dir_word" >&2
+    echo "    rollback_version=\$($rollback_binary_word version) &&" >&2
+    echo "    [ \"\$rollback_version\" = $session_old_version ] &&" >&2
+    if [ "$session_state" != absent ]; then
+        echo "    [ -f $rollback_backup_word ] &&" >&2
+        echo "    cp $rollback_backup_word $rollback_definition_word &&" >&2
+        if [ "$platform" = Linux ]; then
+            echo "    systemctl --user daemon-reload &&" >&2
+        fi
+    fi
+    if [ "$session_state" = active ]; then
+        case "$platform" in
+            Darwin)
+                echo '    launchctl enable "gui/$(id -u)/com.dcchuck.car-go-clean" &&' >&2
+                echo '    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist" &&' >&2
+                echo '    launchctl kickstart -k "gui/$(id -u)/com.dcchuck.car-go-clean"' >&2
+                ;;
+            Linux)
+                echo "    systemctl --user enable --now car-go-clean.service" >&2
+                ;;
+        esac
+    else
+        echo "    true" >&2
+    fi
+    echo "); then" >&2
+    echo "    echo \"Exact car-go-clean $session_old_version rollback validated.\"" >&2
+    echo "else" >&2
+    case "$session_state" in
+        active)
+            echo "    echo \"Rollback or service restoration failed; the chain stopped at the first failing command.\" >&2" >&2
+            ;;
+        stopped|absent)
+            echo "    echo \"Rollback failed; no service start was requested.\" >&2" >&2
+            ;;
+    esac
+    echo "    false" >&2
+    echo "fi" >&2
+    echo "# END car-go-clean exact shell rollback" >&2
+}
+
+replacement_recovery_guidance() {
+    echo "The replacement binary did not pass exact v0.4.0 validation." >&2
+    case "$session_state" in
+        active)
+            echo "The originally active service remains persistently disabled and stopped." >&2
+            ;;
+        stopped)
+            echo "The originally stopped service remains persistently disabled and stopped." >&2
+            ;;
+        absent)
+            echo "No service was installed or started." >&2
+            ;;
+    esac
+    echo "Recovery state is retained at $session_file." >&2
+    if [ "$session_old_version" != absent ]; then
+        case "$session_method" in
+            homebrew)
+                echo "To roll the binary back to exact $session_old_version with Homebrew:" >&2
+                print_homebrew_rollback_block
+                ;;
+            shell)
+                echo "To roll the binary back with the exact old release installer:" >&2
+                print_shell_rollback_block
+                ;;
+        esac
+    fi
 }
 
 preview_recovery_guidance() {
@@ -464,23 +629,14 @@ preview_recovery_guidance() {
                 print_homebrew_rollback_block
                 ;;
             shell)
-                rollback_installer=car-go-clean-installer-v$session_old_version.sh
                 echo "To roll the binary back with the exact old release installer:" >&2
-                printf '  curl --proto '\''=https'\'' --tlsv1.2 -fsSL -o %s https://github.com/dcchuck/car-go-clean/releases/download/v%s/car-go-clean-installer.sh\n' \
-                    "$rollback_installer" "$session_old_version" >&2
-                rollback_install_dir=$(dirname "$session_binary_path")
-                printf '  sh %s --version %s --install-dir "%s"\n' \
-                    "$rollback_installer" "$session_old_version" "$rollback_install_dir" >&2
-                if [ "$session_state" = active ]; then
-                    echo "Only after a successful rollback, restore the prior state with:" >&2
-                    echo "  car-go-clean service start" >&2
-                fi
+                print_shell_rollback_block
                 ;;
         esac
     fi
     if [ "$session_state" = active ] && [ "$session_old_version" = absent ]; then
         echo "Only after a successful preview/cleanup, restore the prior state with:" >&2
-        echo "  car-go-clean service start" >&2
+        print_native_restore_guidance
     fi
 }
 
@@ -573,12 +729,27 @@ run_preview_phase() {
         "$0" "$session_method" "$review_ids"
 }
 
+refresh_definition_phase() {
+    if [ "$session_state" != absent ]; then
+        if ! "$cgc_binary" service refresh; then
+            echo "car-go-clean service-definition refresh failed while the service was disabled." >&2
+            preview_recovery_guidance
+            return 1
+        fi
+    fi
+    write_session preview_pending none
+}
+
 finalize_executed_session() {
     if [ "$session_state" = active ] && ! service_is_active; then
         if ! restore_active_service; then
             restoration_recovery_guidance
             return 1
         fi
+    fi
+    if ! rm -f "$service_definition_backup"; then
+        echo "Reviewed execution completed, but the obsolete service-definition backup could not be cleared." >&2
+        return 1
     fi
     if ! rm -f "$session_file"; then
         echo "Reviewed execution completed, but the completed upgrade session could not be cleared." >&2
@@ -629,7 +800,23 @@ if [ -e "$session_file" ] || [ -L "$session_file" ]; then
         die "session version does not match requested version"
     [ "$session_method" = "$method" ] ||
         die "session method does not match requested method"
-    validate_resumed_binary
+    if ! validate_resumed_binary; then
+        replacement_recovery_guidance
+        exit 1
+    fi
+    case "$session_phase" in
+        replacement_pending)
+            write_session definition_pending none
+            if ! refresh_definition_phase; then
+                exit 1
+            fi
+            ;;
+        definition_pending)
+            if ! refresh_definition_phase; then
+                exit 1
+            fi
+            ;;
+    esac
     if [ -n "$execute_review" ]; then
         if [ "$session_phase" != preview_pending ] &&
             [ "$session_review" != "$execute_review" ]; then
@@ -726,15 +913,22 @@ case "$state_values" in
     *) die "could not parse v0.2/v0.3 service status output" ;;
 esac
 
-if [ "$original_state" = active ]; then
-    rollback_armed=true
-    stop_active_service
+if [ "$original_state" != absent ]; then
+    backup_installed_service_definition ||
+        die "could not preserve the installed service definition before replacement"
+    if [ "$original_state" = active ]; then
+        rollback_armed=true
+    fi
+    disable_installed_service
+else
+    rm -f "$service_definition_backup"
 fi
 
 case "$method" in
-    homebrew)
+        homebrew)
         brew update
         brew upgrade dcchuck/tap/car-go-clean
+        rollback_armed=false
         hash -r 2>/dev/null || :
         new_binary=$(installed_homebrew_binary) ||
             die "could not resolve the exact upgraded Homebrew binary"
@@ -784,6 +978,7 @@ case "$method" in
         [ "$actual_hash" = "$expected_hash" ] ||
             die "shell-installer checksum verification failed"
         sh "$installer" --version "$version" --install-dir "$install_dir"
+        rollback_armed=false
         new_binary=$(canonical_existing_binary "$old_binary") ||
             die "shell installer did not replace the validated car-go-clean target"
         [ "$new_binary" = "$old_binary" ] ||
@@ -791,19 +986,20 @@ case "$method" in
         ;;
 esac
 
-new_version=$("$new_binary" version 2>&1) ||
-    die "could not validate the replacement car-go-clean binary"
-[ "$new_version" = 0.4.0 ] ||
-    die "expected car-go-clean 0.4.0 after replacement, found $new_version"
-rollback_armed=false
-cgc_binary=$new_binary
-
 session_version=$version
 session_method=$method
 session_old_version=$old_version
 session_state=$original_state
 session_binary_path=$new_binary
-write_session preview_pending none
+write_session replacement_pending none
+if ! validate_resumed_binary; then
+    replacement_recovery_guidance
+    exit 1
+fi
+write_session definition_pending none
+if ! refresh_definition_phase; then
+    exit 1
+fi
 if ! run_preview_phase; then
     exit 1
 fi

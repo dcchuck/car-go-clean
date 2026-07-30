@@ -269,6 +269,7 @@ they do not create, enable, or start a service. Manage it explicitly:
 car-go-clean service install
 car-go-clean service status
 car-go-clean service stop
+car-go-clean service refresh
 car-go-clean service start
 car-go-clean service restart
 car-go-clean service uninstall
@@ -278,12 +279,18 @@ car-go-clean service uninstall
 manager/root environment used by cleanup policy, enables the definition, and
 starts it. Status reports `Installed`, `Enabled`, and `Running` separately.
 `stop` disables and stops persistently; `start` re-enables and starts.
+`refresh` rewrites an existing definition with the current binary and stable
+physical manager-root environment without enabling or starting it.
 `uninstall` removes only the service definition and retains configuration,
 state, logs, and cleanup history.
 
 If the current shell resolves protected roots differently from the captured
-service environment, `status` and `health` warn about the divergence. Re-run
-`car-go-clean service install` to recapture after reviewing the new roots.
+service environment, `status` and `health` warn about the divergence. After
+reviewing the new roots, stop the service and use `service refresh` to
+recapture while leaving it disabled/stopped, or use `service install` only when
+enabling and starting is also intended. Relative or otherwise ambiguous
+manager-root overrides are rejected before policy hashing or definition
+changes.
 
 On Linux, a systemd user service may stop when the login session ends unless
 login lingering is enabled. car-go-clean never enables it automatically. If

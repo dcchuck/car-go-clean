@@ -438,6 +438,68 @@ fn relocated_manager_roots_have_environment_provenance() {
 }
 
 #[test]
+fn manager_root_overrides_must_be_stable_absolute_paths() {
+    let config = test_config(&["/scope"], &[], &[]);
+    for (variable, value) in [
+        ("CARGO_HOME", "relative/cargo"),
+        ("RUSTUP_HOME", "/toolchains/../rustup"),
+        ("COLIMA_HOME", "/containers/./colima"),
+    ] {
+        let environment =
+            TestEnvironment::from_pairs(&[("HOME", "/home/tester"), (variable, value)]);
+        let error = ScopePolicy::build_with_canonicalizer(
+            &config,
+            Path::new("/config.toml"),
+            &environment,
+            &TestCanonicalizer::default(),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains(variable), "{variable}: {error}");
+        assert!(
+            error.contains("absolute physical path"),
+            "{variable}: {error}"
+        );
+    }
+}
+
+#[test]
+fn manager_root_aliases_are_physical_before_policy_hashing() {
+    let config = test_config(&["/scope"], &[], &[]);
+    let alias_environment = TestEnvironment::from_pairs(&[
+        ("HOME", "/home/tester"),
+        ("CARGO_HOME", "/install-shell/cargo"),
+    ]);
+    let physical_environment = TestEnvironment::from_pairs(&[
+        ("HOME", "/home/tester"),
+        ("CARGO_HOME", "/physical/manager/cargo"),
+    ]);
+    let canonicalizer = TestCanonicalizer::default()
+        .maps("/install-shell/cargo", "/physical/manager/cargo")
+        .maps("/physical/manager/cargo", "/physical/manager/cargo");
+
+    let alias = build_with(&config, "/config.toml", &alias_environment, &canonicalizer);
+    let physical = build_with(
+        &config,
+        "/config.toml",
+        &physical_environment,
+        &canonicalizer,
+    );
+
+    assert_eq!(alias.hash(), physical.hash());
+    assert!(alias.diagnostics().protected_roots.iter().any(|root| {
+        root.path == Path::new("/physical/manager/cargo")
+            && root.kind == ProtectedRootKind::Cargo
+            && root.provenance == RootProvenance::Environment("CARGO_HOME".to_string())
+    }));
+    assert!(!alias
+        .diagnostics()
+        .protected_roots
+        .iter()
+        .any(|root| root.path == Path::new("/install-shell/cargo")));
+}
+
+#[test]
 fn scope_and_exclusion_checks_use_canonical_authority_inputs() {
     let config = test_config(&["/scope"], &["/one-off"], &["vendor", "/excluded-alias"]);
     let canonicalizer = TestCanonicalizer::default()

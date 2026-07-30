@@ -313,6 +313,8 @@ enum ServiceCommands {
     Status,
     Start,
     Stop,
+    /// Rewrite an installed definition with this binary without enabling or starting it.
+    Refresh,
     Restart,
     Uninstall,
 }
@@ -394,7 +396,7 @@ pub fn run() -> std::process::ExitCode {
                     None,
                     context.review_id,
                     Vec::new(),
-                    serde_json::Value::Null,
+                    failure_data(&error),
                 );
                 if let Err(serialization_error) = print_json(&report) {
                     eprintln!("Error: could not serialize failure report: {serialization_error:#}");
@@ -413,7 +415,9 @@ fn failure_reason(error: &anyhow::Error) -> &'static str {
                 PlanLoadError::Missing => reason::REVIEW_PLAN_MISSING,
                 PlanLoadError::Expired => reason::REVIEW_PLAN_EXPIRED,
                 PlanLoadError::PolicyMismatch => reason::REVIEW_POLICY_MISMATCH,
-                PlanLoadError::GenerationMismatch => reason::REVIEW_GENERATION_MISMATCH,
+                PlanLoadError::GenerationMismatch | PlanLoadError::Superseded { .. } => {
+                    reason::REVIEW_GENERATION_MISMATCH
+                }
                 PlanLoadError::Storage(_) => reason::COMMAND_FAILED,
             };
         }
@@ -425,6 +429,31 @@ fn failure_reason(error: &anyhow::Error) -> &'static str {
         }
     }
     reason::COMMAND_FAILED
+}
+
+fn failure_data(error: &anyhow::Error) -> serde_json::Value {
+    for cause in error.chain() {
+        let Some(plan_error) = cause.downcast_ref::<PlanLoadError>() else {
+            continue;
+        };
+        let rejection = match plan_error {
+            PlanLoadError::Missing => serde_json::json!({"kind": "missing"}),
+            PlanLoadError::Expired => serde_json::json!({"kind": "expired"}),
+            PlanLoadError::PolicyMismatch => serde_json::json!({"kind": "policy_mismatch"}),
+            PlanLoadError::GenerationMismatch => {
+                serde_json::json!({"kind": "generation_mismatch"})
+            }
+            PlanLoadError::Superseded {
+                replacing_generation_id,
+            } => serde_json::json!({
+                "kind": "generation_mismatch",
+                "replacing_generation": replacing_generation_id,
+            }),
+            PlanLoadError::Storage(_) => return serde_json::Value::Null,
+        };
+        return serde_json::json!({"review_plan_rejection": rejection});
+    }
+    serde_json::Value::Null
 }
 
 fn print_json(value: &impl Serialize) -> Result<()> {
@@ -576,6 +605,7 @@ fn service(command: ServiceCommands) -> Result<()> {
         ServiceCommands::Status => ServiceAction::Status,
         ServiceCommands::Start => ServiceAction::Start,
         ServiceCommands::Stop => ServiceAction::Stop,
+        ServiceCommands::Refresh => ServiceAction::Refresh,
         ServiceCommands::Restart => ServiceAction::Restart,
         ServiceCommands::Uninstall => ServiceAction::Uninstall,
     };
@@ -585,6 +615,7 @@ fn service(command: ServiceCommands) -> Result<()> {
         ServiceAction::Status => manager.status()?,
         ServiceAction::Start => manager.start()?,
         ServiceAction::Stop => manager.stop()?,
+        ServiceAction::Refresh => manager.refresh()?,
         ServiceAction::Restart => manager.restart()?,
         ServiceAction::Uninstall => manager.uninstall()?,
     };

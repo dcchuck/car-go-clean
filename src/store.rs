@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 pub const REVIEW_PLAN_TTL: Duration = Duration::from_secs(30 * 60);
 pub const REVIEW_PLAN_RETENTION: usize = 20;
+pub const REVIEW_PLAN_TOMBSTONE_RETENTION: usize = 20;
 
 pub struct Store {
     conn: Connection,
@@ -219,6 +220,7 @@ pub enum PlanLoadError {
     Expired,
     PolicyMismatch,
     GenerationMismatch,
+    Superseded { replacing_generation_id: i64 },
     Storage(String),
 }
 
@@ -232,6 +234,12 @@ impl fmt::Display for PlanLoadError {
             }
             Self::GenerationMismatch => formatter
                 .write_str("review plan generation is not the current discovery generation"),
+            Self::Superseded {
+                replacing_generation_id,
+            } => write!(
+                formatter,
+                "review plan was superseded by discovery generation {replacing_generation_id}"
+            ),
             Self::Storage(message) => write!(formatter, "review plan storage error: {message}"),
         }
     }
@@ -858,6 +866,38 @@ impl Store {
             tx.execute("INSERT INTO schema_version(version) VALUES (15)", [])?;
             tx.commit()?;
         }
+        let has_review_plan_tombstones =
+            connection_table_exists(&self.conn, "review_plan_tombstones")?;
+        if current < 16 || !has_review_plan_tombstones {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS review_plan_tombstones (
+                    plan_id INTEGER PRIMARY KEY,
+                    reason TEXT NOT NULL
+                        CHECK(reason IN (
+                            'expired',
+                            'policy_mismatch',
+                            'generation_mismatch'
+                        )),
+                    policy_hash TEXT NOT NULL,
+                    generation_id INTEGER NOT NULL,
+                    replacing_generation_id INTEGER,
+                    recorded_at INTEGER NOT NULL,
+                    CHECK(
+                        reason = 'generation_mismatch'
+                        OR replacing_generation_id IS NULL
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_plan_tombstones_recorded
+                    ON review_plan_tombstones(recorded_at, plan_id);
+                ",
+            )?;
+            if current < 16 {
+                tx.execute("INSERT INTO schema_version(version) VALUES (16)", [])?;
+            }
+            tx.commit()?;
+        }
         self.prune_review_plans(SystemTime::now(), None)?;
         Ok(())
     }
@@ -949,19 +989,28 @@ impl Store {
         let now_epoch = to_epoch(now).map_err(plan_storage_error)?;
         let plan = load_review_plan_from_connection(&self.conn, id).map_err(plan_storage_error)?;
         let result = match plan {
-            None => Err(PlanLoadError::Missing),
+            None => Err(load_review_plan_tombstone(
+                &self.conn,
+                id,
+                current_policy_hash,
+                current_generation_id,
+            )
+            .map_err(plan_storage_error)?
+            .unwrap_or(PlanLoadError::Missing)),
             Some(plan) if plan.expires_at <= now => Err(PlanLoadError::Expired),
             Some(plan) if plan.policy_hash != current_policy_hash => {
                 Err(PlanLoadError::PolicyMismatch)
             }
-            Some(plan)
-                if plan.generation_id != current_generation_id
-                    || !generation_is_current(
-                        &self.conn,
-                        current_policy_hash,
-                        current_generation_id,
-                    )
-                    .map_err(plan_storage_error)? =>
+            Some(plan) if plan.generation_id != current_generation_id => {
+                Err(superseded_or_generation_mismatch(current_generation_id))
+            }
+            Some(_)
+                if !generation_is_current(
+                    &self.conn,
+                    current_policy_hash,
+                    current_generation_id,
+                )
+                .map_err(plan_storage_error)? =>
             {
                 Err(PlanLoadError::GenerationMismatch)
             }
@@ -988,6 +1037,7 @@ impl Store {
         current_authority: Option<(&str, i64)>,
     ) -> Result<usize> {
         if !connection_table_exists(&self.conn, "review_plans")?
+            || !connection_table_exists(&self.conn, "review_plan_tombstones")?
             || !connection_table_exists(&self.conn, "discovery_generations")?
             || !connection_column_exists(&self.conn, "discovery_generations", "authority_valid")?
         {
@@ -3999,41 +4049,206 @@ fn load_review_plan_from_connection(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewPlanTombstoneReason {
+    Expired,
+    PolicyMismatch,
+    GenerationMismatch,
+}
+
+impl ReviewPlanTombstoneReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::PolicyMismatch => "policy_mismatch",
+            Self::GenerationMismatch => "generation_mismatch",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrunableReviewPlan {
+    id: i64,
+    expires_at: i64,
+    policy_hash: String,
+    generation_id: i64,
+}
+
+#[derive(Debug)]
+struct ReviewPlanAuthority {
+    policy_hash: String,
+    generation_id: i64,
+    valid: bool,
+}
+
+fn load_review_plan_tombstone(
+    connection: &Connection,
+    id: i64,
+    current_policy_hash: &str,
+    current_generation_id: i64,
+) -> Result<Option<PlanLoadError>> {
+    if !connection_table_exists(connection, "review_plan_tombstones")? {
+        return Ok(None);
+    }
+    let tombstone = connection
+        .query_row(
+            "
+            SELECT reason, policy_hash, generation_id, replacing_generation_id
+            FROM review_plan_tombstones
+            WHERE plan_id = ?1
+            ",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((reason, policy_hash, generation_id, replacing_generation_id)) = tombstone else {
+        return Ok(None);
+    };
+    if reason == "expired" {
+        return Ok(Some(PlanLoadError::Expired));
+    }
+    if policy_hash != current_policy_hash {
+        return Ok(Some(PlanLoadError::PolicyMismatch));
+    }
+    if generation_id != current_generation_id {
+        return Ok(Some(superseded_or_generation_mismatch(
+            current_generation_id,
+        )));
+    }
+    match reason.as_str() {
+        "policy_mismatch" => Ok(Some(PlanLoadError::GenerationMismatch)),
+        "generation_mismatch" => Ok(Some(
+            replacing_generation_id
+                .filter(|replacement| *replacement > 0)
+                .map(|replacing_generation_id| PlanLoadError::Superseded {
+                    replacing_generation_id,
+                })
+                .unwrap_or(PlanLoadError::GenerationMismatch),
+        )),
+        other => bail!("unknown review-plan tombstone reason {other:?}"),
+    }
+}
+
+fn superseded_or_generation_mismatch(current_generation_id: i64) -> PlanLoadError {
+    if current_generation_id > 0 {
+        PlanLoadError::Superseded {
+            replacing_generation_id: current_generation_id,
+        }
+    } else {
+        PlanLoadError::GenerationMismatch
+    }
+}
+
 fn prune_review_plans_in_transaction(
     tx: &Transaction<'_>,
     now_epoch: i64,
     current_authority: Option<(&str, i64)>,
 ) -> Result<usize> {
-    let mut pruned = tx.execute(
-        "
-        DELETE FROM review_plans
-        WHERE expires_at <= ?1
-           OR NOT EXISTS(
-                SELECT 1
-                FROM discovery_generations AS generation
-                WHERE generation.id = review_plans.generation_id
-                  AND generation.policy_hash = review_plans.policy_hash
-                  AND generation.authority_valid = 1
-                  AND generation.id = (
-                      SELECT newest.id
-                      FROM discovery_generations AS newest
-                      ORDER BY newest.id DESC
-                      LIMIT 1
-                  )
-           )
-        ",
-        [now_epoch],
-    )?;
-    if let Some((policy_hash, generation_id)) = current_authority {
-        pruned += tx.execute(
+    let authority = match current_authority {
+        Some((policy_hash, generation_id)) => Some(ReviewPlanAuthority {
+            policy_hash: policy_hash.to_string(),
+            generation_id,
+            valid: generation_is_current(tx, policy_hash, generation_id)?,
+        }),
+        None => tx
+            .query_row(
+                "
+                SELECT policy_hash, id, authority_valid
+                FROM discovery_generations
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+                [],
+                |row| {
+                    Ok(ReviewPlanAuthority {
+                        policy_hash: row.get(0)?,
+                        generation_id: row.get(1)?,
+                        valid: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?,
+    };
+    let plans = {
+        let mut statement = tx.prepare(
             "
-            DELETE FROM review_plans
-            WHERE policy_hash <> ?1 OR generation_id <> ?2
+            SELECT id, expires_at, policy_hash, generation_id
+            FROM review_plans
+            ORDER BY id
             ",
-            params![policy_hash, generation_id],
         )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PrunableReviewPlan {
+                id: row.get(0)?,
+                expires_at: row.get(1)?,
+                policy_hash: row.get(2)?,
+                generation_id: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)?
+    };
+
+    let mut pruned = 0;
+    for plan in plans {
+        let rejection = if plan.expires_at <= now_epoch {
+            Some((ReviewPlanTombstoneReason::Expired, None))
+        } else {
+            match authority.as_ref() {
+                None => Some((ReviewPlanTombstoneReason::GenerationMismatch, None)),
+                Some(authority) if plan.policy_hash != authority.policy_hash => {
+                    Some((ReviewPlanTombstoneReason::PolicyMismatch, None))
+                }
+                Some(authority) if plan.generation_id != authority.generation_id => Some((
+                    ReviewPlanTombstoneReason::GenerationMismatch,
+                    authority.valid.then_some(authority.generation_id),
+                )),
+                Some(authority) if !authority.valid => {
+                    Some((ReviewPlanTombstoneReason::GenerationMismatch, None))
+                }
+                Some(_) => None,
+            }
+        };
+        let Some((reason, replacing_generation_id)) = rejection else {
+            continue;
+        };
+        tx.execute(
+            "
+            INSERT INTO review_plan_tombstones (
+                plan_id,
+                reason,
+                policy_hash,
+                generation_id,
+                replacing_generation_id,
+                recorded_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(plan_id) DO UPDATE SET
+                reason = excluded.reason,
+                policy_hash = excluded.policy_hash,
+                generation_id = excluded.generation_id,
+                replacing_generation_id = excluded.replacing_generation_id,
+                recorded_at = excluded.recorded_at
+            ",
+            params![
+                plan.id,
+                reason.as_str(),
+                plan.policy_hash,
+                plan.generation_id,
+                replacing_generation_id,
+                now_epoch,
+            ],
+        )?;
+        pruned += tx.execute("DELETE FROM review_plans WHERE id = ?1", [plan.id])?;
     }
     pruned += prune_review_plan_retention_in_transaction(tx)?;
+    prune_review_plan_tombstone_retention_in_transaction(tx)?;
     Ok(pruned)
 }
 
@@ -4049,6 +4264,21 @@ fn prune_review_plan_retention_in_transaction(tx: &Transaction<'_>) -> Result<us
         )
         ",
         [i64::try_from(REVIEW_PLAN_RETENTION)?],
+    )?)
+}
+
+fn prune_review_plan_tombstone_retention_in_transaction(tx: &Transaction<'_>) -> Result<usize> {
+    Ok(tx.execute(
+        "
+        DELETE FROM review_plan_tombstones
+        WHERE plan_id IN (
+            SELECT plan_id
+            FROM review_plan_tombstones
+            ORDER BY recorded_at DESC, plan_id DESC
+            LIMIT -1 OFFSET ?1
+        )
+        ",
+        [i64::try_from(REVIEW_PLAN_TOMBSTONE_RETENTION)?],
     )?)
 }
 

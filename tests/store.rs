@@ -8,7 +8,8 @@ use car_go_clean::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSum
 use car_go_clean::store::{
     CleanEvent, DiscoveryOriginKind, ErrorRecord, GenerationReconciliation,
     ObservationReconciliation, OriginReconciliation, PlanLoadError, ScanPublication, Store,
-    WorktreeReconciliation, REVIEW_PLAN_RETENTION, REVIEW_PLAN_TTL,
+    WorktreeReconciliation, REVIEW_PLAN_RETENTION, REVIEW_PLAN_TOMBSTONE_RETENTION,
+    REVIEW_PLAN_TTL,
 };
 fn test_store(path: &Path) -> Store {
     let store = Store::open(path).unwrap();
@@ -187,7 +188,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 15);
+    assert_eq!(schema_version, 16);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1881,7 +1882,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 15);
+        assert_eq!(schema_version, 16);
     }
 }
 
@@ -2048,7 +2049,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 15);
+    assert_eq!(schema_version, 16);
 }
 
 #[test]
@@ -2184,7 +2185,7 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
         .is_empty());
     assert_eq!(
         store.load_review_plan(plan_id, now, "policy-v12", generation_id),
-        Err(PlanLoadError::Missing)
+        Err(PlanLoadError::Expired)
     );
     assert_eq!(store.all_projects().unwrap().len(), 1);
     let inspection = rusqlite::Connection::open(&database).unwrap();
@@ -2194,7 +2195,7 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         inspection
@@ -2402,7 +2403,9 @@ fn discovery_generation_authority_is_global_and_never_resurrects_across_policy_c
             "policy-a",
             returned_policy.id,
         ),
-        Err(PlanLoadError::GenerationMismatch)
+        Err(PlanLoadError::Superseded {
+            replacing_generation_id: returned_policy.id,
+        })
     );
     assert_eq!(store.all_projects().unwrap().len(), 2);
 }
@@ -3073,7 +3076,7 @@ fn version_thirteen_signed_identities_migrate_losslessly_without_revoking_author
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        15
+        16
     );
     for table in ["project_observations", "review_plan_targets"] {
         let storage = inspection
@@ -3524,7 +3527,7 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        15
+        16
     );
 }
 
@@ -4558,7 +4561,21 @@ fn review_plan_load_reports_each_authority_failure_without_fallback() {
             "policy-a",
             superseding_a.id,
         ),
-        Err(PlanLoadError::GenerationMismatch)
+        Err(PlanLoadError::Superseded {
+            replacing_generation_id: superseding_a.id,
+        })
+    );
+    assert_eq!(
+        store.load_review_plan(
+            generation_plan.id,
+            now + Duration::from_secs(4),
+            "policy-a",
+            superseding_a.id,
+        ),
+        Err(PlanLoadError::Superseded {
+            replacing_generation_id: superseding_a.id,
+        }),
+        "the replacing generation must survive destructive plan pruning"
     );
 }
 
@@ -4692,6 +4709,11 @@ fn review_plan_pruning_on_open_removes_expired_or_invalid_authority_and_cascades
     }
 
     let reopened = Store::open(&database).unwrap();
+    assert_eq!(
+        reopened.load_review_plan(expired_plan_id, now, "policy", generation_id),
+        Err(PlanLoadError::Expired),
+        "open-time pruning must preserve an expired-plan diagnosis"
+    );
     drop(reopened);
     let inspection = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
@@ -4738,7 +4760,13 @@ fn review_plan_pruning_on_open_removes_expired_or_invalid_authority_and_cascades
             )
             .unwrap();
     }
-    drop(Store::open(&database).unwrap());
+    let reopened = Store::open(&database).unwrap();
+    assert_eq!(
+        reopened.load_review_plan(invalid_plan_id, now, "policy", generation_id),
+        Err(PlanLoadError::GenerationMismatch),
+        "invalid authority must not collapse to a missing plan after open-time pruning"
+    );
+    drop(reopened);
     let inspection = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
         inspection
@@ -4802,7 +4830,13 @@ fn review_plan_pruning_on_open_removes_expired_or_invalid_authority_and_cascades
             "the fixture must leave an orphan for Store::open to prune"
         );
     }
-    drop(Store::open(&database).unwrap());
+    let reopened = Store::open(&database).unwrap();
+    assert_eq!(
+        reopened.load_review_plan(missing_plan_id, now, "other-policy", missing_generation_id,),
+        Err(PlanLoadError::GenerationMismatch),
+        "orphaned authority must remain distinguishable from an unknown plan"
+    );
+    drop(reopened);
     let inspection = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
         inspection
@@ -4823,6 +4857,65 @@ fn review_plan_pruning_on_open_removes_expired_or_invalid_authority_and_cascades
             )
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn review_plan_tombstones_are_bounded_and_retention_eviction_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = test_store(&database);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(36_000);
+    let generation = review_generation(&store, now, "policy");
+    let mut plan_ids = Vec::new();
+
+    for offset in 0..(REVIEW_PLAN_TOMBSTONE_RETENTION + 2) {
+        let plan = store
+            .create_review_plan(
+                now + Duration::from_secs(offset as u64),
+                "policy",
+                generation.id,
+                false,
+                0,
+                &[],
+            )
+            .unwrap();
+        plan_ids.push(plan.id);
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE review_plans SET expires_at = 0 WHERE id = ?1",
+                    [plan.id],
+                )
+                .unwrap();
+        }
+        store
+            .prune_review_plans(
+                now + Duration::from_secs(offset as u64),
+                Some(("policy", generation.id)),
+            )
+            .unwrap();
+    }
+
+    let inspection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        inspection
+            .query_row("SELECT COUNT(*) FROM review_plan_tombstones", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        REVIEW_PLAN_TOMBSTONE_RETENTION as i64
+    );
+    drop(inspection);
+    assert_eq!(
+        store.load_review_plan(plan_ids[0], now, "policy", generation.id),
+        Err(PlanLoadError::Missing),
+        "bounded tombstone retention must eventually return to missing"
+    );
+    assert_eq!(
+        store.load_review_plan(*plan_ids.last().unwrap(), now, "policy", generation.id,),
+        Err(PlanLoadError::Expired)
     );
 }
 
@@ -4972,7 +5065,7 @@ fn versions_ten_and_eleven_add_review_plans_without_changing_history() {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            15
+            16
         );
     }
 }
@@ -5023,7 +5116,7 @@ fn review_plan_pruning_preserves_run_clean_project_error_and_recovery_history() 
     );
     assert_eq!(
         store.load_review_plan(plan.id, now + REVIEW_PLAN_TTL, "policy", generation.id,),
-        Err(PlanLoadError::Missing)
+        Err(PlanLoadError::Expired)
     );
     assert_eq!(store.all_projects().unwrap().len(), 1);
     assert_eq!(

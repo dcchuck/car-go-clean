@@ -1,9 +1,12 @@
 use crate::policy::{
     Environment, ProcessEnvironment, ProtectedRoot, ProtectedRootKind, RootProvenance,
 };
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,11 @@ fn environment_root(
         return None;
     }
     let mut path = PathBuf::from(value);
+    if validate_absolute_physical_path(variable, &path).is_ok() {
+        if let Ok(physical) = resolve_physical_path(&path) {
+            path = physical;
+        }
+    }
     if let Some(suffix) = suffix {
         path.push(suffix);
     }
@@ -64,6 +72,63 @@ fn environment_root(
         kind,
         RootProvenance::Environment(variable.to_string()),
     ))
+}
+
+pub(crate) fn resolve_manager_root(variable: &str, path: &Path) -> Result<PathBuf> {
+    validate_absolute_physical_path(variable, path)?;
+    resolve_physical_path(path)
+        .with_context(|| format!("resolve {variable} as an absolute physical path"))
+}
+
+pub(crate) fn validate_absolute_physical_path(variable: &str, path: &Path) -> Result<()> {
+    let display = path.display();
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        bail!("{variable} must be a nonempty absolute physical path; got {display}");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+        || path
+            .to_str()
+            .is_some_and(|value| value.contains("/./") || value.ends_with("/."))
+    {
+        bail!(
+            "{variable} must be an absolute physical path without `.` or `..` components; got {display}"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_physical_path(path: &Path) -> io::Result<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(&candidate) {
+            Ok(mut physical) => {
+                for component in missing.iter().rev() {
+                    physical.push(component);
+                }
+                return Ok(physical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => return Err(error),
+                    Ok(_) => return Err(error),
+                    Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {}
+                    Err(metadata_error) => return Err(metadata_error),
+                }
+                let Some(name) = candidate.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = candidate.parent() else {
+                    return Err(error);
+                };
+                candidate = parent.to_path_buf();
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn protected_roots_for(

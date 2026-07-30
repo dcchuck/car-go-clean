@@ -278,10 +278,14 @@ installed, enabled, and running state and report manager-root divergence when
 it can be determined.
 
 `service stop` disables and stops persistently across login and reboot.
+`service refresh` rewrites an installed definition with the current binary and
+recaptures stable absolute physical roots without enabling or starting it.
 `service start` re-enables and starts. `service uninstall` removes only the
 definition and leaves configuration, state, logs, reviews, and history in
-place. Re-run `service install` when you intentionally want to recapture the
-current shell's supported roots.
+place. Use `service stop` followed by `service refresh` after reviewing changed
+roots when the service must remain disabled; use `service install` only when
+enabling and starting is intentional. Relative and otherwise ambiguous root
+overrides are rejected before policy hashing or manager calls.
 
 Linux systemd user services may require lingering to run without an active
 login. car-go-clean does not change that account policy. Enable it manually

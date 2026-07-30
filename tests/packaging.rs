@@ -310,6 +310,7 @@ fn documented_subcommands_are_real_cli_entry_points() {
         &["service", "status", "--help"],
         &["service", "start", "--help"],
         &["service", "stop", "--help"],
+        &["service", "refresh", "--help"],
         &["service", "restart", "--help"],
         &["service", "uninstall", "--help"],
     ];
@@ -934,15 +935,15 @@ esac
         .collect::<Vec<_>>();
     assert_eq!(
         installed,
-        ["no", "yes", "yes", "yes", "yes", "yes", "no", "no"]
+        ["no", "yes", "yes", "yes", "yes", "yes", "yes", "no", "no"]
     );
     assert_eq!(
         enabled,
-        ["no", "yes", "yes", "no", "yes", "yes", "no", "no"]
+        ["no", "yes", "yes", "no", "no", "yes", "yes", "no", "no"]
     );
     assert_eq!(
         running,
-        ["no", "yes", "yes", "no", "yes", "yes", "no", "no"]
+        ["no", "yes", "yes", "no", "no", "yes", "yes", "no", "no"]
     );
     let definition = if cfg!(target_os = "macos") {
         home.join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist")

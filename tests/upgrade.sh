@@ -61,6 +61,18 @@ case "$*" in
         echo "upgrade helper called a v0.2/v0.3 lifecycle verb" >&2
         exit 95
         ;;
+    "service refresh")
+        test "$version" = 0.4.0
+        test "$(cat "$SERVICE_STATE")" != "not installed"
+        test ! -e "$SERVICE_ENABLED"
+        test "$(cat "$SERVICE_STATE")" = stopped
+        {
+            printf '%s\n' '# car-go-clean-service-environment-v1'
+            printf 'binary=%s\n' "$0"
+            printf 'CARGO_HOME=%s\n' "${CARGO_HOME-}"
+            printf 'COLIMA_HOME=%s\n' "${COLIMA_HOME-}"
+        } > "$SERVICE_DEFINITION"
+        ;;
     config)
         if [ "${LEGACY_EXCLUDES-0}" = 1 ]; then
             echo 'warning: `excludes` is deprecated in v0.4' >&2
@@ -106,15 +118,23 @@ cat > "$fake_bin/launchctl" <<'EOF'
 set -eu
 printf 'launchctl %s\n' "$*" >> "$CALL_LOG"
 case "$1" in
+    disable)
+        rm -f "$SERVICE_ENABLED"
+        ;;
+    enable)
+        : > "$SERVICE_ENABLED"
+        ;;
     bootout)
         printf 'stopped\n' > "$SERVICE_STATE"
         ;;
     bootstrap)
         test "${RESTORE_FAIL-0}" != 1
+        test -e "$SERVICE_ENABLED"
         printf 'running\n' > "$SERVICE_STATE"
         ;;
     kickstart)
         test "${RESTORE_FAIL-0}" != 1
+        test -e "$SERVICE_ENABLED"
         printf 'running\n' > "$SERVICE_STATE"
         if [ "${RESTORE_SIGNAL-0}" = 1 ] &&
             [ ! -e "$RESTORE_SIGNAL_MARKER" ]; then
@@ -136,11 +156,13 @@ cat > "$fake_bin/systemctl" <<'EOF'
 set -eu
 printf 'systemctl %s\n' "$*" >> "$CALL_LOG"
 case "$*" in
-    "--user stop car-go-clean.service")
+    "--user disable --now car-go-clean.service")
+        rm -f "$SERVICE_ENABLED"
         printf 'stopped\n' > "$SERVICE_STATE"
         ;;
-    "--user start car-go-clean.service")
+    "--user enable --now car-go-clean.service")
         test "${RESTORE_FAIL-0}" != 1
+        : > "$SERVICE_ENABLED"
         printf 'running\n' > "$SERVICE_STATE"
         ;;
     "--user is-active --quiet car-go-clean.service")
@@ -343,6 +365,16 @@ new_case() {
     call_log="$current_case/calls"
     version_file="$current_case/version"
     service_state="$current_case/service-state"
+    service_enabled="$current_case/service-enabled"
+    case "$platform" in
+        Darwin)
+            service_definition="$home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
+            ;;
+        Linux)
+            service_definition="$home/.config/systemd/user/car-go-clean.service"
+            ;;
+    esac
+    service_definition_backup="$state_dir/upgrade-service-definition"
     executed_review="$current_case/executed-review"
     execute_marker="$current_case/execute-marker"
     restore_signal_marker="$current_case/restore-signal-marker"
@@ -354,11 +386,19 @@ new_case() {
     output_file="$current_case/output"
     binary_path_log="$current_case/binary-paths"
     brew_prefix="$current_case/brew-prefix"
-    mkdir -p "$home" "$state_dir" "$brew_prefix/bin"
+    mkdir -p "$home" "$state_dir" "$brew_prefix/bin" "$(dirname "$service_definition")"
     : > "$call_log"
     : > "$binary_path_log"
     printf '%s\n' "$old_version" > "$version_file"
     printf '%s\n' "$old_state" > "$service_state"
+    rm -f "$service_enabled" "$service_definition"
+    if [ "$old_state" != "not installed" ]; then
+        : > "$service_enabled"
+        {
+            printf '%s\n' '# legacy-car-go-clean-service-definition'
+            printf 'old_version=%s\n' "$old_version"
+        } > "$service_definition"
+    fi
     printf 'dcchuck/tap\n' > "$brew_taps_file"
     printf 'car-go-clean\n' > "$brew_linked_formula"
     printf '%s\n' "$old_version" > "$brew_linked_version_file"
@@ -382,6 +422,8 @@ new_case() {
     TEST_PLATFORM=$platform
     VERSION_FILE=$version_file
     SERVICE_STATE=$service_state
+    SERVICE_ENABLED=$service_enabled
+    SERVICE_DEFINITION=$service_definition
     CALL_LOG=$call_log
     EXECUTED_REVIEW=$executed_review
     CAR_GO_CLEAN_UPGRADE_STATE_DIR=$state_dir
@@ -416,7 +458,11 @@ new_case() {
     RESTORE_FAIL=0
     RESTORE_SIGNAL=0
     RESTORE_SIGNAL_MARKER=$restore_signal_marker
+    CARGO_HOME=$current_case/manager-roots/cargo
+    COLIMA_HOME=$current_case/manager-roots/colima
+    mkdir -p "$CARGO_HOME" "$COLIMA_HOME"
     export USER TEST_PLATFORM VERSION_FILE SERVICE_STATE CALL_LOG EXECUTED_REVIEW
+    export SERVICE_ENABLED SERVICE_DEFINITION CARGO_HOME COLIMA_HOME
     export CAR_GO_CLEAN_UPGRADE_STATE_DIR REVIEW_ID PREVIEW_EXIT PREVIEW_TEXT
     export CONFIG_EXIT EXECUTE_EXIT LEGACY_EXCLUDES BREW_INSTALLED
     export EXECUTE_ERROR RESTORE_FAIL
@@ -501,6 +547,13 @@ assert_session_mode_600() {
     test "$mode" = 600
 }
 
+simulate_manager_recreation() {
+    if [ -e "$service_enabled" ] &&
+        [ "$(cat "$service_state")" != "not installed" ]; then
+        printf 'running\n' > "$service_state"
+    fi
+}
+
 capture_homebrew_rollback() {
     rollback_script="$current_case/homebrew-rollback.sh"
     sed -n \
@@ -533,36 +586,51 @@ complete_upgrade() {
             ;;
         stopped)
             assert_output_has "originally stopped service remains stopped"
-            assert_calls_lack "launchctl bootout"
-            assert_calls_lack "systemctl --user stop car-go-clean.service"
             ;;
         "not installed")
             assert_output_has "No service was installed or started"
             assert_calls_lack "launchctl bootout"
-            assert_calls_lack "systemctl --user stop car-go-clean.service"
+            assert_calls_lack "systemctl --user disable --now car-go-clean.service"
             ;;
     esac
+    if [ "$old_state" != "not installed" ]; then
+        test ! -e "$service_enabled"
+        test -f "$service_definition"
+        test -f "$service_definition_backup"
+        grep -F '# legacy-car-go-clean-service-definition' \
+            "$service_definition_backup" >/dev/null
+        grep -F '# car-go-clean-service-environment-v1' "$service_definition" >/dev/null
+        grep -F "CARGO_HOME=$CARGO_HOME" "$service_definition" >/dev/null
+        simulate_manager_recreation
+        test "$(cat "$service_state")" = stopped
+    fi
     : > "$call_log"
     run_upgrade --version 0.4.0 --method "$method" --execute-review 42
     assert_status 0
     test "$(cat "$executed_review")" = 42
     test ! -e "$state_dir/upgrade-session"
+    test ! -e "$service_definition_backup"
 }
 
 assert_matrix_service_stopped() {
     case "$old_state" in
-        running)
+        running|stopped)
             test "$(cat "$service_state")" = stopped
             if [ "$TEST_PLATFORM" = Darwin ]; then
-                assert_calls_have "launchctl bootout"
+                assert_calls_have "launchctl disable"
+                if [ "$old_state" = running ]; then
+                    assert_calls_have "launchctl bootout"
+                else
+                    assert_calls_lack "launchctl bootout"
+                fi
             else
-                assert_calls_have "systemctl --user stop car-go-clean.service"
+                assert_calls_have "systemctl --user disable --now car-go-clean.service"
             fi
             ;;
-        stopped|"not installed")
+        "not installed")
             test "$(cat "$service_state")" = "$old_state"
-            assert_calls_lack "launchctl bootout"
-            assert_calls_lack "systemctl --user stop car-go-clean.service"
+            assert_calls_lack "launchctl disable"
+            assert_calls_lack "systemctl --user disable --now car-go-clean.service"
             ;;
     esac
 }
@@ -572,12 +640,12 @@ assert_matrix_service_retained() {
         running)
             test "$(cat "$service_state")" = stopped
             assert_calls_lack "launchctl bootstrap"
-            assert_calls_lack "systemctl --user start car-go-clean.service"
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
             ;;
         stopped|"not installed")
             test "$(cat "$service_state")" = "$old_state"
             assert_calls_lack "launchctl bootstrap"
-            assert_calls_lack "systemctl --user start car-go-clean.service"
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
             ;;
     esac
 }
@@ -589,13 +657,13 @@ assert_matrix_service_restored() {
             if [ "$TEST_PLATFORM" = Darwin ]; then
                 assert_calls_have "launchctl bootstrap"
             else
-                assert_calls_have "systemctl --user start car-go-clean.service"
+                assert_calls_have "systemctl --user enable --now car-go-clean.service"
             fi
             ;;
         stopped|"not installed")
             test "$(cat "$service_state")" = "$old_state"
             assert_calls_lack "launchctl bootstrap"
-            assert_calls_lack "systemctl --user start car-go-clean.service"
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
             ;;
     esac
 }
@@ -624,6 +692,12 @@ run_upgrade_outcome_matrix_cell() {
             test "$(session_value phase)" = review_pending
             test "$(session_value review_id)" = 42
             assert_matrix_service_stopped
+            if [ "$old_state" != "not installed" ]; then
+                test ! -e "$service_enabled"
+                test -f "$service_definition"
+                simulate_manager_recreation
+                test "$(cat "$service_state")" = stopped
+            fi
             : > "$call_log"
             run_upgrade --version 0.4.0 --method "$method" --execute-review 42
             assert_review_call_count 1
@@ -794,7 +868,7 @@ do
             if [ "$TEST_PLATFORM" = Darwin ]; then
                 assert_calls_have "launchctl bootstrap"
             else
-                assert_calls_have "systemctl --user start car-go-clean.service"
+                assert_calls_have "systemctl --user enable --now car-go-clean.service"
             fi
             ;;
         stopped)
@@ -830,11 +904,11 @@ do
     case "$state" in
         running)
             test "$(cat "$service_state")" = running
-            assert_calls_have "systemctl --user start car-go-clean.service"
+            assert_calls_have "systemctl --user enable --now car-go-clean.service"
             ;;
         stopped|"not installed")
             test "$(cat "$service_state")" = "$state"
-            assert_calls_lack "systemctl --user start car-go-clean.service"
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
             ;;
     esac
 done
@@ -857,14 +931,19 @@ test "$(cat "$service_state")" = running
 assert_calls_have "launchctl bootout"
 assert_calls_have "launchctl bootstrap"
 
-new_case version-rollback Linux 0.3.0 running homebrew
+new_case wrong-replacement-version Linux 0.3.0 running homebrew
 WRONG_NEW_VERSION=1
 export WRONG_NEW_VERSION
 run_upgrade --version 0.4.0 --method homebrew
 test "$run_status" -ne 0
-test "$(cat "$service_state")" = running
+test "$(cat "$service_state")" = stopped
+test ! -e "$service_enabled"
 assert_output_has "expected car-go-clean 0.4.0"
-assert_calls_have "systemctl --user start car-go-clean.service"
+assert_output_has "rollback"
+assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+test -f "$state_dir/upgrade-session"
+test "$(session_value phase)" = replacement_pending
+test "$(session_value review_id)" = none
 
 # Failures after exact replacement leave the new service stopped with guidance.
 new_case config-failure Darwin 0.2.0 running homebrew
@@ -891,7 +970,11 @@ test "$(session_value review_id)" = none
 test "$(cat "$service_state")" = stopped
 assert_output_has "$upgrade --version 0.4.0 --method homebrew"
 assert_output_has "brew extract --force --version=0.2.0"
-assert_output_has "car-go-clean service start"
+assert_output_has "launchctl enable"
+if grep -F "car-go-clean service start" "$output_file" >/dev/null; then
+    echo "v0.2 rollback guidance used an unsupported lifecycle verb" >&2
+    exit 1
+fi
 
 CONFIG_EXIT=0
 export CONFIG_EXIT
@@ -921,6 +1004,10 @@ run_upgrade --version 0.4.0 --method shell
 test "$run_status" -ne 0
 test "$(session_value phase)" = preview_pending
 assert_output_has "releases/download/v0.3.0/car-go-clean-installer.sh"
+assert_output_has "$service_definition_backup"
+assert_output_has "rollback_version="
+assert_output_has "$fake_bin/car-go-clean"
+assert_output_has "systemctl --user daemon-reload"
 if grep -F "car-go-clean service start" "$output_file" >/dev/null; then
     echo "stopped service received start guidance" >&2
     exit 1
@@ -959,6 +1046,10 @@ do
     : > "$call_log"
     run_captured_homebrew_rollback
     test "$rollback_status" -eq 0
+    if [ "$3" != "not installed" ]; then
+        grep -F '# legacy-car-go-clean-service-definition' \
+            "$service_definition" >/dev/null
+    fi
     test "$(cat "$brew_linked_version_file")" = "$2"
     test "$(cat "$brew_linked_formula")" = \
         "$USER/car-go-clean-rollback/car-go-clean@$2"
@@ -977,17 +1068,19 @@ do
             test "$(cat "$service_state")" = running
             awk '
                 /^car-go-clean version$/ { validated = NR }
-                /^car-go-clean service start$/ {
+                /^launchctl enable / {
                     if (!validated || validated >= NR) exit 1
                     started = 1
                 }
                 END { if (!started) exit 1 }
             ' "$call_log"
+            assert_calls_lack "car-go-clean service start"
             ;;
         stopped|"not installed")
             test "$(cat "$service_state")" = "$3"
             assert_calls_have "car-go-clean version"
             assert_calls_lack "car-go-clean service start"
+            assert_calls_lack "launchctl enable"
             ;;
     esac
 done
@@ -1015,6 +1108,7 @@ do
     test "$rollback_status" -ne 0
     test "$(cat "$service_state")" = stopped
     assert_calls_lack "car-go-clean service start"
+    assert_calls_lack "launchctl enable"
     case "$failure" in
         link) assert_calls_lack "car-go-clean version" ;;
         version) assert_calls_have "car-go-clean version" ;;

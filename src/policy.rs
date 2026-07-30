@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::storage::{protected_roots_for, HostPlatform};
+use crate::storage::{protected_roots_for, validate_absolute_physical_path, HostPlatform};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const POLICY_HASH_FORMAT_VERSION: u32 = 1;
+pub const POLICY_HASH_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum ProtectedRootKind {
@@ -52,6 +52,10 @@ impl Environment for ProcessEnvironment {
 
 pub trait Canonicalizer {
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+
+    fn resolve_physical(&self, path: &Path) -> io::Result<PathBuf> {
+        self.canonicalize(path)
+    }
 }
 
 struct FileSystemCanonicalizer;
@@ -59,6 +63,10 @@ struct FileSystemCanonicalizer;
 impl Canonicalizer for FileSystemCanonicalizer {
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         fs::canonicalize(path)
+    }
+
+    fn resolve_physical(&self, path: &Path) -> io::Result<PathBuf> {
+        crate::storage::resolve_physical_path(path)
     }
 }
 
@@ -151,7 +159,31 @@ impl ScopePolicy {
             .var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
+        let home = if home.as_os_str().is_empty() {
+            home
+        } else {
+            validate_absolute_physical_path("HOME", &home)?;
+            canonicalizer.resolve_physical(&home).with_context(|| {
+                format!(
+                    "resolve HOME as an absolute physical path: {}",
+                    home.display()
+                )
+            })?
+        };
         let mut protected_roots = protected_roots_for(HostPlatform::current(), &home, environment);
+        for root in &mut protected_roots {
+            if let RootProvenance::Environment(variable) = &root.provenance {
+                validate_absolute_physical_path(variable, &root.path)?;
+                root.path = canonicalizer
+                    .resolve_physical(&root.path)
+                    .with_context(|| {
+                        format!(
+                            "resolve {variable} as an absolute physical path: {}",
+                            root.path.display()
+                        )
+                    })?;
+            }
+        }
         sort_and_deduplicate(&mut protected_roots);
 
         let hash_input = PolicyHashInput {

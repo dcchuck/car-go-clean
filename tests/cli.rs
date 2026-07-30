@@ -605,6 +605,7 @@ fn service_help_lists_only_explicit_lifecycle_actions() {
         .stdout(contains("status"))
         .stdout(contains("start"))
         .stdout(contains("stop"))
+        .stdout(contains("refresh"))
         .stdout(contains("restart"))
         .stdout(contains("uninstall"));
 }
@@ -4126,6 +4127,20 @@ fn policy_a_b_a_prunes_an_untouched_a1_plan_without_cargo() {
         .env("PATH", &path)
         .assert()
         .success();
+    let replacement_generation = rusqlite::Connection::open(state.join("state.db"))
+        .unwrap()
+        .query_row(
+            "
+            SELECT id
+            FROM discovery_generations
+            WHERE authority_valid = 1
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
 
     let output = Command::cargo_bin("car-go-clean")
         .unwrap()
@@ -4147,7 +4162,14 @@ fn policy_a_b_a_prunes_an_untouched_a1_plan_without_cargo() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         terminal_report(&output.stdout, "run")["outcome"]["reasons"],
-        serde_json::json!(["review_plan_missing"])
+        serde_json::json!(["review_generation_mismatch"])
+    );
+    assert_eq!(
+        terminal_report(&output.stdout, "run")["data"]["review_plan_rejection"],
+        serde_json::json!({
+            "kind": "generation_mismatch",
+            "replacing_generation": replacement_generation,
+        })
     );
     assert!(!marker.exists());
 }
@@ -4245,6 +4267,10 @@ fn json_review_failures_use_stable_machine_reason_identifiers() {
         terminal_report(&missing.stdout, "run")["outcome"]["reasons"],
         serde_json::json!(["review_plan_missing"])
     );
+    assert_eq!(
+        terminal_report(&missing.stdout, "run")["data"]["review_plan_rejection"],
+        serde_json::json!({"kind": "missing"})
+    );
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
@@ -4256,6 +4282,20 @@ fn json_review_failures_use_stable_machine_reason_identifiers() {
         .env("PATH", &path)
         .assert()
         .success();
+    let replacement_generation = rusqlite::Connection::open(state.join("state.db"))
+        .unwrap()
+        .query_row(
+            "
+            SELECT id
+            FROM discovery_generations
+            WHERE authority_valid = 1
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
     let superseded = Command::cargo_bin("car-go-clean")
         .unwrap()
         .args([
@@ -4275,13 +4315,20 @@ fn json_review_failures_use_stable_machine_reason_identifiers() {
     assert_eq!(superseded.status.code(), Some(1));
     assert_eq!(
         terminal_report(&superseded.stdout, "run")["outcome"]["reasons"],
-        serde_json::json!(["review_plan_missing"])
+        serde_json::json!(["review_generation_mismatch"])
+    );
+    assert_eq!(
+        terminal_report(&superseded.stdout, "run")["data"]["review_plan_rejection"],
+        serde_json::json!({
+            "kind": "generation_mismatch",
+            "replacing_generation": replacement_generation,
+        })
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn pruned_expired_review_maps_to_missing_in_the_cli_contract() {
+fn pruned_expired_review_keeps_text_and_json_expiry_diagnostics() {
     let work = tempfile::tempdir().unwrap();
     let (config, state, home, path) = review_fixture(&work, &["project"]);
     let (review_id, _) = create_review_plan(&config, &state, &home, &path);
@@ -4315,13 +4362,24 @@ fn pruned_expired_review_maps_to_missing_in_the_cli_contract() {
     let report = terminal_report(&output.stdout, "run");
     assert_eq!(
         report["outcome"]["reasons"],
-        serde_json::json!(["review_plan_missing"])
+        serde_json::json!(["review_plan_expired"])
     );
-    assert!(!report["outcome"]["reasons"]
-        .as_array()
+    assert_eq!(
+        report["data"]["review_plan_rejection"],
+        serde_json::json!({"kind": "expired"})
+    );
+
+    Command::cargo_bin("car-go-clean")
         .unwrap()
-        .iter()
-        .any(|reason| reason == "review_plan_expired"));
+        .args(["run", "--review", &review_id.to_string(), "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(1)
+        .stderr(contains("review plan has expired"));
 }
 
 #[cfg(unix)]
@@ -4361,6 +4419,10 @@ fn json_policy_mismatch_has_its_own_reason() {
     assert_eq!(
         terminal_report(&output.stdout, "run")["outcome"]["reasons"],
         serde_json::json!(["review_policy_mismatch"])
+    );
+    assert_eq!(
+        terminal_report(&output.stdout, "run")["data"]["review_plan_rejection"],
+        serde_json::json!({"kind": "policy_mismatch"})
     );
 }
 

@@ -253,16 +253,28 @@ visible binary; it is not a requested migration destination:
   --execute-review REVIEW_ID
 ```
 
-Phase one records old state, stops an active old service with the native
-manager, upgrades through the verified owner, derives and validates the exact
-v0.4.0 binary, validates config, and creates `run --dry-run --all` review
-state. Preview exit `0` and `2` are accepted; exit `1` stops with recovery
-guidance. Its mode-0600 session persists that absolute binary path and makes
-the same phase-one command resumable. Phase two invokes that exact path,
-executes only the supplied persisted ID, accepts reviewed exit `0` or `2`, and
-restores only a service that was originally active. A pre-replacement failure
-rolls an active old service back; an ambiguous post-replacement execution
-fails closed and must not be repeated blindly.
+Phase one records old absent/stopped/active state and persistently disables and
+stops every installed definition with the native manager before replacement.
+It upgrades through the verified owner, disarms automatic old restoration,
+derives and validates the exact v0.4.0 binary, and uses that exact binary to
+refresh the installed definition and physical manager-root environment without
+enabling or starting it. Config validation and `run --dry-run --all` happen
+while disabled. Preview exit `0` and `2` are accepted; exit `1` stops with
+recovery guidance. Its mode-0600 session persists that absolute binary path
+and makes the same phase-one command resumable.
+
+Phase two invokes that exact path and executes only the supplied persisted ID
+while still disabled. After explicit approval and success, it re-enables and
+starts only a service that was originally active; stopped remains
+installed/disabled/stopped and absent remains absent. A pre-replacement
+failure may roll an active old service back. A wrong-version or later
+pre-approval failure persists recovery state and stays disabled/stopped. An
+ambiguous post-replacement execution fails closed and must not be repeated
+blindly. Old-version rollback validates the restored binary, restores the
+saved definition, reloads the manager where needed, and only then performs
+native launchctl/systemd restoration. It never assumes v0.2/v0.3 has
+`service start`. Service uninstall or rollback retains configuration, state,
+logs, and history.
 
 Use `--method shell` consistently in both phases only when the visible old
 binary is shell-owned; use `homebrew` only when the visible old binary resolves

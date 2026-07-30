@@ -424,6 +424,67 @@ fn linux_lifecycle_uses_persistent_enablement_commands_in_order() {
 }
 
 #[test]
+fn refresh_rewrites_an_installed_definition_without_enabling_or_starting_it() {
+    let work = tempfile::tempdir().unwrap();
+    let binary = work.path().join("bin/car-go-clean-v040");
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "legacy definition").unwrap();
+
+    let mut manager = ServiceManager::new_with_environment(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        binary.clone(),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n  \"com.dcchuck.car-go-clean\" => true\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+        ]),
+        &environment(&[
+            ("HOME", work.path().to_str().unwrap()),
+            ("CARGO_HOME", work.path().join("cargo").to_str().unwrap()),
+        ]),
+    );
+
+    assert_eq!(
+        manager.refresh().unwrap(),
+        ServiceStatus {
+            installed: true,
+            enabled: false,
+            active: false,
+        }
+    );
+    let definition = fs::read_to_string(&plist).unwrap();
+    assert!(definition.contains(binary.to_str().unwrap()));
+    assert!(definition.contains("car-go-clean-service-environment-v1"));
+    assert!(definition.contains(work.path().join("cargo").to_str().unwrap()));
+    assert_eq!(
+        call_arguments(&manager.into_runner()),
+        [
+            vec![
+                "print-disabled".to_string(),
+                format!("gui/{}", unsafe { libc::geteuid() }),
+            ],
+            vec![
+                "print".to_string(),
+                format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                    libc::geteuid()
+                }),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn restart_requires_an_installed_and_enabled_definition() {
     let work = tempfile::tempdir().unwrap();
     let mut missing = test_manager(
@@ -795,6 +856,80 @@ fn captured_environment_is_whitelisted_and_round_trips_through_definitions() {
             .unwrap(),
         Some(false)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn service_definition_captures_physical_manager_roots() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempfile::tempdir().unwrap();
+    let physical = work.path().join("physical/cargo");
+    let alias = work.path().join("install-shell/cargo");
+    fs::create_dir_all(&physical).unwrap();
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    symlink(&physical, &alias).unwrap();
+    let physical = fs::canonicalize(&physical).unwrap();
+    let current = environment(&[
+        ("HOME", work.path().to_str().unwrap()),
+        ("CARGO_HOME", alias.to_str().unwrap()),
+    ]);
+    let mut manager = ServiceManager::new_with_environment(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::default(),
+        &current,
+    );
+
+    manager.install().unwrap();
+    let installed = manager.installed_environment().unwrap().unwrap();
+    assert_eq!(
+        installed.values.get("CARGO_HOME"),
+        Some(&physical.as_os_str().to_os_string())
+    );
+    assert!(!fs::read_to_string(
+        work.path()
+            .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist")
+    )
+    .unwrap()
+    .contains(alias.to_str().unwrap()));
+    let physical_environment = environment(&[
+        ("HOME", work.path().to_str().unwrap()),
+        ("CARGO_HOME", physical.to_str().unwrap()),
+    ]);
+    assert_eq!(
+        manager
+            .environment_divergence(&physical_environment)
+            .unwrap(),
+        Some(false)
+    );
+}
+
+#[test]
+fn service_definition_rejects_ambiguous_manager_roots_before_manager_calls() {
+    let work = tempfile::tempdir().unwrap();
+    for (variable, value) in [
+        ("CARGO_HOME", "relative/cargo"),
+        ("RUSTUP_HOME", "/toolchains/../rustup"),
+        ("LIMA_HOME", "/containers/./lima"),
+    ] {
+        let mut manager = ServiceManager::new_with_environment(
+            ServicePlatform::MacOs,
+            work.path().to_path_buf(),
+            work.path().join("bin/car-go-clean"),
+            FakeRunner::default(),
+            &environment(&[("HOME", work.path().to_str().unwrap()), (variable, value)]),
+        );
+
+        let error = manager.install().unwrap_err().to_string();
+        assert!(error.contains(variable), "{variable}: {error}");
+        assert!(
+            error.contains("absolute physical path"),
+            "{variable}: {error}"
+        );
+        assert!(manager.into_runner().calls.is_empty(), "{variable}");
+    }
 }
 
 #[test]

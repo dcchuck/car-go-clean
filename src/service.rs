@@ -4,7 +4,7 @@
 //! `car-go-clean` never needs to find files from a source checkout.
 
 use crate::policy::{Environment, ProcessEnvironment, ProtectedRoot, RootProvenance};
-use crate::storage::{protected_roots_for, HostPlatform};
+use crate::storage::{protected_roots_for, resolve_manager_root, HostPlatform};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::env;
@@ -41,6 +41,7 @@ pub enum ServiceAction {
     Status,
     Start,
     Stop,
+    Refresh,
     Restart,
     Uninstall,
 }
@@ -74,6 +75,16 @@ impl ServiceEnvironment {
             })
             .collect();
         Self { values }
+    }
+
+    fn resolved(&self) -> Result<Self> {
+        let mut values = BTreeMap::new();
+        for (name, value) in &self.values {
+            let path = PathBuf::from(value);
+            let physical = resolve_manager_root(name, &path)?;
+            values.insert(name.clone(), physical.into_os_string());
+        }
+        Ok(Self { values })
     }
 }
 
@@ -153,6 +164,7 @@ impl<R: CommandRunner> ServiceManager<R> {
 
     pub fn install(&mut self) -> Result<ServiceStatus> {
         self.require_absolute_binary()?;
+        self.service_environment = self.service_environment.resolved()?;
         self.validate_definition_rendering()?;
         self.stop_active_service_for_reinstall()?;
         match self.platform {
@@ -271,6 +283,44 @@ impl<R: CommandRunner> ServiceManager<R> {
             installed: true,
             enabled: true,
             active: true,
+        })
+    }
+
+    pub fn refresh(&mut self) -> Result<ServiceStatus> {
+        self.require_absolute_binary()?;
+        self.service_environment = self.service_environment.resolved()?;
+        self.validate_definition_rendering()?;
+        let status = self.status()?;
+        if !status.installed {
+            bail!("car-go-clean service is not installed");
+        }
+        if status.enabled || status.active {
+            self.stop()?;
+        }
+        match self.platform {
+            ServicePlatform::MacOs => {
+                let plist = self.launchd_plist_path();
+                let log_dir = self.home_dir.join("Library/Logs/car-go-clean");
+                fs::create_dir_all(&log_dir)
+                    .with_context(|| format!("could not create {}", log_dir.display()))?;
+                let rendered =
+                    render_launchd_template(&self.binary, &log_dir, &self.service_environment)?;
+                atomic_write(&plist, rendered.as_bytes())?;
+            }
+            ServicePlatform::Linux => {
+                let unit = self.systemd_unit_path();
+                let rendered = render_systemd_template(&self.binary, &self.service_environment)?;
+                atomic_write(&unit, rendered.as_bytes())?;
+                self.run_checked(
+                    Path::new("systemctl"),
+                    &[OsString::from("--user"), OsString::from("daemon-reload")],
+                )?;
+            }
+        }
+        Ok(ServiceStatus {
+            installed: true,
+            enabled: false,
+            active: false,
         })
     }
 
@@ -406,7 +456,8 @@ impl<R: CommandRunner> ServiceManager<R> {
         let Some(installed) = self.installed_environment()? else {
             return Ok(None);
         };
-        let current = ServiceEnvironment::capture(current_environment);
+        let installed = installed.resolved()?;
+        let current = ServiceEnvironment::capture(current_environment).resolved()?;
         let platform = match self.platform {
             ServicePlatform::MacOs => HostPlatform::MacOs,
             ServicePlatform::Linux => HostPlatform::Linux,
@@ -421,6 +472,7 @@ impl<R: CommandRunner> ServiceManager<R> {
         let Some(installed) = self.installed_environment()? else {
             return Ok(None);
         };
+        let installed = installed.resolved()?;
         let platform = match self.platform {
             ServicePlatform::MacOs => HostPlatform::MacOs,
             ServicePlatform::Linux => HostPlatform::Linux,
