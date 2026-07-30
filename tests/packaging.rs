@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -342,9 +343,121 @@ fn ci_runs_release_note_validation_after_installer_validation() {
     let ci = workflow(".github/workflows/ci.yml");
     let steps = workflow_steps(&ci, "verify");
     let installer = step_running(steps, "make test-installer");
+    let upgrade = step_running(steps, "make test-upgrade");
     let release_notes = step_running(steps, "make test-release-notes");
 
-    assert!(installer.0 < release_notes.0);
+    assert!(installer.0 < upgrade.0);
+    assert!(upgrade.0 < release_notes.0);
+
+    let release_setup =
+        YamlLoader::load_from_str(&repo_file(".github/release-build-setup.yml")).unwrap();
+    let release_steps = release_setup[0].as_vec().unwrap();
+    step_running(release_steps, "make test-upgrade");
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_release_assets_are_staged_hashed_attested_and_uploaded_as_one_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let publish = workflow(".github/workflows/publish-shell-installer.yml");
+    let steps = workflow_steps(&publish, "publish-shell-installer");
+    let stage = named_step(steps, "Stage shell release assets");
+    let attest = named_step(steps, "Attest shell release assets");
+    let upload = named_step(steps, "Upload shell release assets");
+    let work = tempdir().unwrap();
+    let release_dir = work.path().join("packaging/release");
+    fs::create_dir_all(&release_dir).unwrap();
+    for asset in ["car-go-clean-installer.sh", "car-go-clean-upgrade.sh"] {
+        fs::copy(
+            root.join("packaging/release").join(asset),
+            release_dir.join(asset),
+        )
+        .unwrap();
+    }
+
+    let stage_output = Command::new("sh")
+        .args(["-eu", "-c", run_command(stage).unwrap()])
+        .current_dir(work.path())
+        .output()
+        .unwrap();
+    assert!(
+        stage_output.status.success(),
+        "asset staging failed: {}",
+        String::from_utf8_lossy(&stage_output.stderr)
+    );
+
+    let manifest_path = work.path().join("car-go-clean-shell-assets.sha256");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let entries = manifest
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next().unwrap();
+            let name = fields.next().unwrap();
+            assert!(fields.next().is_none(), "unexpected checksum fields");
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            name.to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        entries,
+        BTreeSet::from([
+            "car-go-clean-installer.sh".to_string(),
+            "car-go-clean-upgrade.sh".to_string(),
+        ])
+    );
+
+    let attested = attest["with"]["subject-path"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        attested,
+        BTreeSet::from([
+            "car-go-clean-installer.sh".to_string(),
+            "car-go-clean-upgrade.sh".to_string(),
+            "car-go-clean-shell-assets.sha256".to_string(),
+        ])
+    );
+
+    let fake_bin = work.path().join("bin");
+    let gh_log = work.path().join("gh.log");
+    fs::create_dir(&fake_bin).unwrap();
+    let gh = fake_bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" > \"$GH_LOG\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![fake_bin];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let upload_output = Command::new("sh")
+        .args(["-eu", "-c", run_command(upload).unwrap()])
+        .current_dir(work.path())
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .env("TAG", "v0.4.0")
+        .env("GH_LOG", &gh_log)
+        .output()
+        .unwrap();
+    assert!(
+        upload_output.status.success(),
+        "asset upload failed: {}",
+        String::from_utf8_lossy(&upload_output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(gh_log).unwrap(),
+        "release upload v0.4.0 car-go-clean-installer.sh car-go-clean-upgrade.sh car-go-clean-shell-assets.sha256 --clobber\n"
+    );
 }
 
 #[test]

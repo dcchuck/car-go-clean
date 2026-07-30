@@ -26,6 +26,8 @@ jobs:
         run: cargo test --locked
       - name: Check shell installer
         run: make test-installer
+      - name: Check upgrade helper
+        run: make test-upgrade
       - name: Check release notes
         run: make test-release-notes
       - name: Plan release artifacts

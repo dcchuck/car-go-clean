@@ -3,6 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 installer="$root/packaging/release/car-go-clean-installer.sh"
+upgrade="$root/packaging/release/car-go-clean-upgrade.sh"
 work_dir=$(mktemp -d)
 fake_bin="$work_dir/bin"
 fixture_dir="$work_dir/fixture"
@@ -14,6 +15,9 @@ cleanup() {
     rm -rf "$work_dir"
 }
 trap cleanup EXIT HUP INT TERM
+
+sh -n "$installer"
+sh -n "$upgrade"
 
 mkdir -p "$fake_bin" "$fixture_dir" "$work_dir/home"
 printf '%s' 'new binary' > "$fixture_dir/car-go-clean"

@@ -20,13 +20,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Stage installer
-        run: cp packaging/release/car-go-clean-installer.sh car-go-clean-installer.sh
-      - name: Attest installer
+      - name: Stage shell release assets
+        run: |
+          cp packaging/release/car-go-clean-installer.sh car-go-clean-installer.sh
+          cp packaging/release/car-go-clean-upgrade.sh car-go-clean-upgrade.sh
+          sha256sum \
+            car-go-clean-installer.sh \
+            car-go-clean-upgrade.sh \
+            > car-go-clean-shell-assets.sha256
+      - name: Attest shell release assets
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: car-go-clean-installer.sh
-      - name: Upload installer
+          subject-path: |
+            car-go-clean-installer.sh
+            car-go-clean-upgrade.sh
+            car-go-clean-shell-assets.sha256
+      - name: Upload shell release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$TAG" car-go-clean-installer.sh --clobber
+        run: gh release upload "$TAG" car-go-clean-installer.sh car-go-clean-upgrade.sh car-go-clean-shell-assets.sha256 --clobber

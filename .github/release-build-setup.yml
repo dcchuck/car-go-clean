@@ -16,3 +16,5 @@
   run: cargo test --locked
 - name: Check shell installer
   run: make test-installer
+- name: Check upgrade helper
+  run: make test-upgrade
