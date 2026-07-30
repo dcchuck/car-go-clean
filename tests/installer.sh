@@ -20,7 +20,13 @@ sh -n "$installer"
 sh -n "$upgrade"
 
 mkdir -p "$fake_bin" "$fixture_dir" "$work_dir/home"
-printf '%s' 'new binary' > "$fixture_dir/car-go-clean"
+cat > "$fixture_dir/car-go-clean" <<'EOF'
+#!/bin/sh
+case "${1-}" in
+    version) printf '%s\n' 0.2.0 ;;
+    *) exit 64 ;;
+esac
+EOF
 chmod +x "$fixture_dir/car-go-clean"
 tar -C "$fixture_dir" -cJf "$fixture_archive" car-go-clean
 
@@ -129,13 +135,23 @@ done
 
 install_dir="$work_dir/default-install"
 run_installer --install-dir "$install_dir"
-test "$(cat "$install_dir/car-go-clean")" = "new binary"
+cmp "$fixture_dir/car-go-clean" "$install_dir/car-go-clean"
 test "$(cat "$curl_log")" = "latest-meta https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256"
+
+: > "$curl_log"
+run_installer --version 0.2.0
+(
+    PATH="$work_dir/home/.local/bin:$PATH"
+    export PATH
+    hash -r
+    test "$(command -v car-go-clean)" = "$work_dir/home/.local/bin/car-go-clean"
+    test "$(car-go-clean version)" = 0.2.0
+)
 
 : > "$curl_log"
 versioned_dir="$work_dir/versioned-install"
 run_installer --version 0.2.0 --install-dir "$versioned_dir"
-test "$(cat "$versioned_dir/car-go-clean")" = "new binary"
+cmp "$fixture_dir/car-go-clean" "$versioned_dir/car-go-clean"
 grep -qx 'https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-aarch64-apple-darwin.tar.xz.sha256' "$curl_log"
 
 failed_dir="$work_dir/failed-install"
@@ -149,7 +165,7 @@ test "$(cat "$failed_dir/car-go-clean")" = "old binary"
 : > "$curl_log"
 linux_dir="$work_dir/linux-install"
 CHECKSUM_MODE= TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 run_installer --install-dir "$linux_dir"
-test "$(cat "$linux_dir/car-go-clean")" = "new binary"
+cmp "$fixture_dir/car-go-clean" "$linux_dir/car-go-clean"
 test "$(cat "$curl_log")" = "latest-meta https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz https://github.com/dcchuck/car-go-clean/releases/download/v0.2.0/car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256"
 
 : > "$curl_log"

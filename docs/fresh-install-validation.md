@@ -21,7 +21,21 @@ Do not treat the Rust 1.95 pass as proof of Rust 1.88 compatibility.
 
 ## Released binary
 
-Install through one official route:
+This is a fresh-install rehearsal. Verify absence before any replacement
+command; an existing v0.2.0 or v0.3.0 must use the release's state-preserving
+upgrade helper instead.
+
+```sh
+if command -v car-go-clean >/dev/null 2>&1
+then
+  car-go-clean version
+  car-go-clean service status
+  echo "not a fresh-install fixture" >&2
+  exit 1
+fi
+```
+
+On an empty machine, install through one official fresh-install route:
 
 ```sh
 brew install dcchuck/tap/car-go-clean
@@ -32,10 +46,15 @@ or:
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hash -r 2>/dev/null || true
+test "$(command -v car-go-clean)" = "$HOME/.local/bin/car-go-clean"
 ```
 
-Binary installation must not create or start a service. Confirm the version
-and the three service-state dimensions:
+The shell installer does not modify `PATH`; the export and command-cache
+refresh above are required before later bare commands. Binary installation
+must not create or start a service. Confirm the version and the three
+service-state dimensions:
 
 ```sh
 car-go-clean version

@@ -8,18 +8,41 @@
 
 ## Install
 
-On macOS or Linux, install the released binary with Homebrew:
+Before installing anything, determine whether car-go-clean already exists:
+
+```sh
+if command -v car-go-clean >/dev/null 2>&1
+then
+  car-go-clean version
+  car-go-clean service status
+else
+  echo "car-go-clean is not installed"
+fi
+```
+
+If that reports v0.2.0 or v0.3.0, stop here and use the state-preserving
+two-phase [v0.4 upgrade helper](docs/releases/v0.4.0.md#v02v03-upgrade-helper).
+Do not run `brew upgrade`, `brew install`, or the ordinary shell installer
+first; replacing the binary would bypass the helper's old-service detection
+and recovery.
+
+For a fresh macOS or Linux installation only, use Homebrew:
 
 ```sh
 brew install dcchuck/tap/car-go-clean
-brew upgrade car-go-clean
+car-go-clean version
 ```
 
-Or use the checksum-verifying shell installer:
+Or use the checksum-verifying shell installer. It writes to
+`$HOME/.local/bin` by default but does not edit your shell's `PATH`, so make
+that directory discoverable before using bare `car-go-clean` commands:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hash -r 2>/dev/null || true
+car-go-clean version
 ```
 
 The installer supports macOS on Apple Silicon (`aarch64-apple-darwin`) and
@@ -29,22 +52,22 @@ downloads the matching release archive and its `.sha256` file, verifies the
 SHA-256 checksum before replacing the binary, and does not require `sudo`.
 
 By default it installs to `$HOME/.local/bin`. After a release such as `v0.4.0`
-has been published, pin it or choose another location when needed:
+has been published, a fresh installation can pin it:
 
 ```sh
 VERSION=0.4.0
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh \
   | sh -s -- --version "$VERSION" --install-dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+hash -r 2>/dev/null || true
+car-go-clean version
 ```
 
-Both installation paths install or upgrade only the binary, and the installer does not start the daemon.
-Activate daemon management explicitly after installation.
-
-If upgrading a v0.2.0 or v0.3.0 installation, especially one with an installed
-service, use the state-preserving two-phase
-[v0.4 upgrade helper](docs/releases/v0.4.0.md#v02v03-upgrade-helper) instead
-of replacing the binary directly.
+Both fresh-install paths install only the binary and do not start the daemon.
+If another existing version was detected, read the target release's upgrade
+instructions before replacing it. Activate daemon management explicitly only
+after installation.
 
 ## Quick Start
 
@@ -138,17 +161,37 @@ Copy this prompt into your coding agent:
 >
 > Do not use a similarly named package from another repository or registry.
 >
-> First inspect this machine's operating system, architecture, available
-> package manager, Cargo availability, existing `car-go-clean` installation,
-> configuration, current service state, how often Rust projects are built,
-> and whether the user wants one-shot cleanup or an always-on per-user daemon.
-> Recommend Homebrew or the verified shell installer, and recommend one-shot
-> or daemon operation based on those answers. Briefly explain each choice.
-> If the existing binary is v0.2.0 or v0.3.0, follow the repository's v0.4
-> state-preserving upgrade-helper instructions; do not replace it with a plain
-> package-manager upgrade.
+> Before any install or replacement, inspect this machine's operating system,
+> architecture, available package manager, Cargo availability, and whether
+> `car-go-clean` already exists. If it does, run its `version` and
+> `service status` commands before choosing an installation path. Also inspect
+> configuration, how often Rust projects are built, and whether the user wants
+> one-shot cleanup or an always-on per-user daemon.
 >
-> Install or upgrade only the binary, verify the installed version, and run:
+> If the existing binary is v0.2.0 or v0.3.0, stop the ordinary install path
+> and follow the repository's v0.4 state-preserving upgrade-helper
+> instructions. Do not run a plain `brew upgrade`, `brew install`, or ordinary
+> shell installer first. For any other existing version, read the target
+> release's upgrade instructions before replacement. Only when no binary is
+> installed should you use the README's fresh-install Homebrew or verified
+> shell-installer command.
+>
+> If the shell installer is selected, it does not edit `PATH`. After it
+> succeeds, run:
+>
+> ```sh
+> export PATH="$HOME/.local/bin:$PATH"
+> hash -r 2>/dev/null || true
+> command -v car-go-clean
+> car-go-clean version
+> ```
+>
+> Do not use later bare commands until `command -v` resolves the installed
+> binary. Recommend one-shot or daemon operation based on the user's Rust
+> usage and explain the choice.
+>
+> After completing the correct fresh-install or upgrade flow, verify the
+> installed version and run:
 >
 > ```sh
 > car-go-clean version
@@ -331,7 +374,8 @@ Or run from the repository:
 
 ```bash
 cargo run -- scan
-cargo run -- run
+cargo run -- run --dry-run --all
+cargo run -- run --review REVIEW_ID
 cargo run -- stats
 ```
 
