@@ -178,7 +178,8 @@ fn documented_subcommands_are_real_cli_entry_points() {
 
 #[cfg(unix)]
 #[test]
-fn documented_operator_flow_preserves_then_cleans_exact_review() {
+fn documented_commands_execute() {
+    let _owner_tour = include_str!("../docs/v0.4-owner-tour.md");
     let work = tempdir().unwrap();
     let home = work.path().join("home");
     let root = work.path().join("projects");
@@ -188,9 +189,11 @@ fn documented_operator_flow_preserves_then_cleans_exact_review() {
     let state = work.path().join("state");
     let bin = work.path().join("bin");
     let cargo_calls = work.path().join("cargo-calls");
+    let service_state = work.path().join("service-state");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&target).unwrap();
     fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&service_state).unwrap();
     fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
     fs::write(target.join("artifact"), vec![0; 4_096]).unwrap();
     fs::write(
@@ -208,6 +211,78 @@ fn documented_operator_flow_preserves_then_cleans_exact_review() {
             cargo_calls.display()
         ),
     );
+    let (service_manager, service_manager_body) = if cfg!(target_os = "macos") {
+        (
+            "launchctl",
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+  print-disabled)
+    if test -e "$SERVICE_STATE_DIR/disabled"
+    then
+      printf 'disabled services = {\n  "com.dcchuck.car-go-clean" => true\n}\n'
+    else
+      printf 'disabled services = {\n}\n'
+    fi
+    ;;
+  print)
+    test -e "$SERVICE_STATE_DIR/active" || {
+      printf 'Could not find specified service\n' >&2
+      exit 113
+    }
+    ;;
+  enable) rm -f "$SERVICE_STATE_DIR/disabled" ;;
+  disable) : > "$SERVICE_STATE_DIR/disabled" ;;
+  bootstrap|kickstart) : > "$SERVICE_STATE_DIR/active" ;;
+  bootout) rm -f "$SERVICE_STATE_DIR/active" ;;
+  *) printf 'unexpected launchctl command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+        )
+    } else {
+        (
+            "systemctl",
+            r#"#!/bin/sh
+set -eu
+case "$*" in
+  "--user is-enabled car-go-clean.service")
+    if test -e "$SERVICE_STATE_DIR/enabled"
+    then
+      printf 'enabled\n'
+    else
+      printf 'disabled\n'
+      exit 1
+    fi
+    ;;
+  "--user is-active car-go-clean.service")
+    if test -e "$SERVICE_STATE_DIR/active"
+    then
+      printf 'active\n'
+    else
+      printf 'inactive\n'
+      exit 3
+    fi
+    ;;
+  "--user daemon-reload") ;;
+  "--user enable --now car-go-clean.service")
+    : > "$SERVICE_STATE_DIR/enabled"
+    : > "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user disable --now car-go-clean.service")
+    rm -f "$SERVICE_STATE_DIR/enabled" "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user restart car-go-clean.service")
+    : > "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user stop car-go-clean.service")
+    rm -f "$SERVICE_STATE_DIR/active"
+    ;;
+  *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+        )
+    };
+    write_executable(&bin.join(service_manager), service_manager_body);
     let mut path = bin.into_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
@@ -224,6 +299,49 @@ fn documented_operator_flow_preserves_then_cleans_exact_review() {
         .args(["service", "status"])
         .env("HOME", &home)
         .env("PATH", &path)
+        .env("SERVICE_STATE_DIR", &service_state)
+        .output()
+        .unwrap();
+    assert_eq!(service.status.code(), Some(0));
+    let service_stdout = String::from_utf8_lossy(&service.stdout);
+    assert!(service_stdout.contains("Installed: no"));
+    assert!(service_stdout.contains("Enabled: no"));
+    assert!(service_stdout.contains("Running: no"));
+
+    for (command, expected) in [
+        ("install", ("yes", "yes", "yes")),
+        ("status", ("yes", "yes", "yes")),
+        ("stop", ("yes", "no", "no")),
+        ("start", ("yes", "yes", "yes")),
+        ("restart", ("yes", "yes", "yes")),
+        ("uninstall", ("no", "no", "no")),
+    ] {
+        let output = Command::new(binary)
+            .args(["service", command])
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .env("SERVICE_STATE_DIR", &service_state)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "service {command} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("Installed: {}", expected.0))
+                && stdout.contains(&format!("Enabled: {}", expected.1))
+                && stdout.contains(&format!("Running: {}", expected.2)),
+            "service {command} reported unexpected state: {stdout}"
+        );
+    }
+    let service = Command::new(binary)
+        .args(["service", "status"])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .env("SERVICE_STATE_DIR", &service_state)
         .output()
         .unwrap();
     assert_eq!(service.status.code(), Some(0));

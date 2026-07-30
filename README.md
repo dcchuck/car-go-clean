@@ -71,6 +71,10 @@ after installation.
 
 ## Quick Start
 
+For the complete mental model—from discovery authority and service behavior
+through upgrades and release gates—read the
+[Owner’s v0.4 product tour](docs/v0.4-owner-tour.md).
+
 Check the binary and service state before creating a review:
 
 ```sh
