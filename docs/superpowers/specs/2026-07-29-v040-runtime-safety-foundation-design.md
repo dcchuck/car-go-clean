@@ -124,16 +124,19 @@ interface as identity.
 
 - Same boot session: persisted device/inode are authoritative. A mismatch means
   the path was replaced and blocks cleanup for that project.
-- Different boot session (or an unavailable boot ID): device numbers are not
-  comparable. The observation is stale rather than hostile. The project is
-  re-stat'ed, and it may be re-authorized only if it still resolves inside the
-  current `ScopePolicy`, is not excluded, and passes every execution-time
-  check. The refreshed identity replaces the stored one.
+- Known different boot session: device numbers are not comparable. The
+  observation is stale rather than hostile. The project is re-stat'ed, and it
+  may be re-authorized only if it still resolves inside the current
+  `ScopePolicy`, is not excluded, and passes every execution-time check. The
+  refreshed identity replaces the stored one.
+- Unavailable boot ID: exact device/inode equality may continue, but a mismatch
+  is a replacement and fails closed. Missing boot identity cannot authorize a
+  freshly observed replacement inside the same execution.
 - Within a single process, identity captured at review time is always
   authoritative for the pre-Cargo recheck, regardless of boot session. This is
   the check that actually defends against replacement during a run.
 
-Inode mismatch within the same generation always blocks, in both cases.
+Inode mismatch within the same generation always blocks.
 
 ### Scan Scheduling for Migrated or Repolicied State
 

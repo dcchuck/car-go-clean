@@ -246,7 +246,7 @@ fn target_symlink_is_rejected_before_identity_comparison() {}
 fn project_and_target_on_different_devices_are_rejected() {}
 
 #[test]
-fn unavailable_boot_id_treats_persisted_identity_as_stale_not_hostile() {}
+fn unavailable_boot_id_requires_exact_persisted_identity() {}
 ```
 
 Use a fake `IdentityProvider`; never require a mount operation in unit tests.
@@ -302,7 +302,12 @@ pub fn compare_persisted(
 ) -> IdentityComparison;
 ```
 
-Same boot requires exact device/inode. A different or unavailable boot returns `StaleAcrossBoot`; the caller must revalidate scope/exclusions and replace the observation. An inode mismatch captured and checked inside one process always returns `Replaced`.
+Same boot requires exact device/inode. A known different boot returns
+`StaleAcrossBoot`; the caller must revalidate scope/exclusions before replacing
+the observation. When either boot ID is unavailable, exact device/inode equality
+may continue but a mismatch returns `Replaced`. Missing boot identity must never
+authorize a freshly observed replacement inside the same execution. An identity
+mismatch captured and checked inside one process always returns `Replaced`.
 
 - [ ] **Step 5: Add direct-file and same-device validation**
 
