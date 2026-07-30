@@ -29,6 +29,14 @@ hash_file() {
     fi
 }
 
+file_mode() {
+    mode=$(stat -f '%Lp' "$1" 2>/dev/null || :)
+    case "$mode" in
+        ''|*[!0-9]*) mode=$(stat -c '%a' "$1") ;;
+    esac
+    printf '%s\n' "$mode"
+}
+
 run_validator() {
     validation_worktree=$1
     shift
@@ -301,8 +309,102 @@ make_tap_origin() {
     git --git-dir="$fixture_origin" symbolic-ref HEAD refs/heads/main
 }
 
+make_tap_workflow_commit() {
+    fixture_root=$1
+    fixture_source="$fixture_root/source"
+    fixture_origin="$fixture_root/origin.git"
+    mkdir -p "$fixture_source/.github/workflows"
+    printf '%s\n' 'name: appeared-after-inventory' \
+        > "$fixture_source/.github/workflows/ci.yml"
+    git -C "$fixture_source" add .github/workflows/ci.yml
+    git -C "$fixture_source" commit -qm "add workflow after rehearsal inventory"
+    workflow_sha=$(git -C "$fixture_source" rev-parse HEAD)
+    git -C "$fixture_source" push -qu origin \
+        "HEAD:refs/heads/rehearsal-test-workflow-source"
+    git --git-dir="$fixture_origin" update-ref \
+        -d refs/heads/rehearsal-test-workflow-source
+    printf '%s\n' "$workflow_sha"
+}
+
 tap_fake_bin="$work/tap-fake-bin"
 mkdir -p "$tap_fake_bin"
+real_git=$(command -v git)
+real_mv=$(command -v mv)
+cat > "$tap_fake_bin/git" <<'EOF'
+#!/bin/sh
+set -eu
+
+is_push=0
+for argument in "$@"
+do
+    if test "$argument" = push
+    then
+        is_push=1
+    fi
+done
+
+if test "$is_push" -eq 1 &&
+   { test -n "${FAKE_PUSH_LOST_RESPONSE:-}" ||
+     test -n "${FAKE_PUSH_SIGNAL_AFTER_SUCCESS:-}" ||
+     test -n "${FAKE_FAIL_NEXT_STATE_AFTER_PUSH_MARKER:-}"; }
+then
+    "$REAL_GIT" "$@"
+    if test -n "${FAKE_FAIL_NEXT_STATE_AFTER_PUSH_MARKER:-}"
+    then
+        : > "$FAKE_FAIL_NEXT_STATE_AFTER_PUSH_MARKER"
+    fi
+    if test -n "${FAKE_PUSH_SIGNAL_AFTER_SUCCESS:-}"
+    then
+        kill -TERM "$PPID"
+        exit 143
+    fi
+    if test -n "${FAKE_PUSH_LOST_RESPONSE:-}"
+    then
+        exit 1
+    fi
+    exit 0
+fi
+
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$tap_fake_bin/git"
+
+cat > "$tap_fake_bin/mv" <<'EOF'
+#!/bin/sh
+set -eu
+
+if test -n "${FAKE_STATE_WRITE_COUNT_FILE:-}"
+then
+    count=0
+    if test -f "$FAKE_STATE_WRITE_COUNT_FILE"
+    then
+        count=$(cat "$FAKE_STATE_WRITE_COUNT_FILE")
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_STATE_WRITE_COUNT_FILE"
+    if test -n "${FAKE_FAIL_STATE_WRITE_NUMBER:-}" &&
+       test "$count" -eq "$FAKE_FAIL_STATE_WRITE_NUMBER"
+    then
+        exit 1
+    fi
+fi
+
+for marker in \
+    "${FAKE_FAIL_NEXT_STATE_AFTER_PUSH_MARKER:-}" \
+    "${FAKE_FAIL_NEXT_STATE_AFTER_CLOSE_MARKER:-}" \
+    "${FAKE_FAIL_NEXT_STATE_AFTER_DELETE_MARKER:-}"
+do
+    if test -n "$marker" && test -e "$marker"
+    then
+        rm -f "$marker"
+        exit 1
+    fi
+done
+
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$tap_fake_bin/mv"
+
 cat > "$tap_fake_bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
@@ -322,6 +424,11 @@ shift
 method=GET
 endpoint=
 has_jq=0
+jq_expression=
+request_head=
+request_base=
+request_draft=
+request_state=
 while test "$#" -gt 0
 do
     case "$1" in
@@ -335,9 +442,16 @@ do
             ;;
         --jq)
             has_jq=1
+            jq_expression=$2
             shift 2
             ;;
         -f|-F)
+            case "$2" in
+                head=*) request_head=${2#head=} ;;
+                base=*) request_base=${2#base=} ;;
+                draft=*) request_draft=${2#draft=} ;;
+                state=*) request_state=${2#state=} ;;
+            esac
             shift 2
             ;;
         --silent|--paginate)
@@ -357,9 +471,13 @@ do
 done
 
 branch="rehearsal/car-go-clean-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+default_branch=${FAKE_DEFAULT_BRANCH:-main}
+default_ref="refs/heads/$default_branch"
+default_sha=$(git --git-dir="$FAKE_TAP_ORIGIN" rev-parse "$default_ref")
+branch_ref="refs/heads/$branch"
 case "$method:$endpoint" in
     GET:repos/dcchuck/homebrew-tap)
-        printf '%s\n' "${FAKE_DEFAULT_BRANCH:-main}"
+        printf '%s\n' "$default_branch"
         ;;
     GET:repos/dcchuck/homebrew-tap/contents)
         ;;
@@ -389,27 +507,156 @@ case "$method:$endpoint" in
             cat "$FAKE_WORKFLOW_PATHS_FILE"
         fi
         ;;
+    GET:repos/dcchuck/homebrew-tap/git/ref/heads/main)
+        ref_calls=0
+        if test -n "${FAKE_DEFAULT_REF_CALLS:-}" &&
+           test -f "$FAKE_DEFAULT_REF_CALLS"
+        then
+            ref_calls=$(cat "$FAKE_DEFAULT_REF_CALLS")
+        fi
+        ref_calls=$((ref_calls + 1))
+        if test -n "${FAKE_DEFAULT_REF_CALLS:-}"
+        then
+            printf '%s\n' "$ref_calls" > "$FAKE_DEFAULT_REF_CALLS"
+        fi
+        if test "$ref_calls" -ge 2 &&
+           test -n "${FAKE_DEFAULT_SHA_SECOND:-}"
+        then
+            git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
+                "$default_ref" "$FAKE_DEFAULT_SHA_SECOND"
+            default_sha=$FAKE_DEFAULT_SHA_SECOND
+        elif test "$ref_calls" -eq 1 &&
+             test -n "${FAKE_DEFAULT_SHA_FIRST:-}"
+        then
+            default_sha=$FAKE_DEFAULT_SHA_FIRST
+        fi
+        case "$jq_expression" in
+            .object.sha) printf '%s\n' "$default_sha" ;;
+            .ref) printf '%s\n' "$default_ref" ;;
+            *) printf '{"ref":"%s","object":{"sha":"%s"}}\n' \
+                   "$default_ref" "$default_sha" ;;
+        esac
+        ;;
+    GET:repos/dcchuck/homebrew-tap/git/matching-refs/heads/*)
+        matching_calls=0
+        if test -n "${FAKE_BRANCH_REF_CALLS:-}" &&
+           test -f "$FAKE_BRANCH_REF_CALLS"
+        then
+            matching_calls=$(cat "$FAKE_BRANCH_REF_CALLS")
+        fi
+        matching_calls=$((matching_calls + 1))
+        if test -n "${FAKE_BRANCH_REF_CALLS:-}"
+        then
+            printf '%s\n' "$matching_calls" > "$FAKE_BRANCH_REF_CALLS"
+        fi
+        if test "$matching_calls" -ge 2 &&
+           test -n "${FAKE_RETARGET_BRANCH_SHA:-}" &&
+           git --git-dir="$FAKE_TAP_ORIGIN" show-ref --verify --quiet "$branch_ref"
+        then
+            git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
+                "$branch_ref" "$FAKE_RETARGET_BRANCH_SHA"
+        fi
+        if git --git-dir="$FAKE_TAP_ORIGIN" show-ref --verify --quiet "$branch_ref"
+        then
+            branch_sha=$(git --git-dir="$FAKE_TAP_ORIGIN" rev-parse "$branch_ref")
+            printf '[{"ref":"refs/heads/%s","object":{"sha":"%s"}}]\n' \
+                "$branch" "$branch_sha"
+        else
+            printf '%s\n' '[]'
+        fi
+        ;;
     GET:repos/dcchuck/homebrew-tap/git/ref/heads/*)
         git --git-dir="$FAKE_TAP_ORIGIN" show-ref --verify --quiet \
-            "refs/heads/$branch"
-        printf 'refs/heads/%s\n' "$branch"
+            "$branch_ref"
+        branch_sha=$(git --git-dir="$FAKE_TAP_ORIGIN" rev-parse "$branch_ref")
+        case "$jq_expression" in
+            .object.sha) printf '%s\n' "$branch_sha" ;;
+            .ref) printf 'refs/heads/%s\n' "$branch" ;;
+            *) printf '{"ref":"refs/heads/%s","object":{"sha":"%s"}}\n' \
+                   "$branch" "$branch_sha" ;;
+        esac
         ;;
     POST:repos/dcchuck/homebrew-tap/pulls)
         git --git-dir="$FAKE_TAP_ORIGIN" show-ref --verify --quiet \
-            "refs/heads/$branch"
+            "$branch_ref"
+        test "$request_head" = "$branch"
+        test "$request_base" = "$default_branch"
+        test "$request_draft" = true
         git --git-dir="$FAKE_TAP_ORIGIN" diff-tree \
-            --no-commit-id --name-only -r "refs/heads/$branch" \
+            --no-commit-id --name-only -r "$branch_ref" \
             > "$FAKE_PR_FILES"
+        git --git-dir="$FAKE_TAP_ORIGIN" rev-parse "$branch_ref" \
+            > "$FAKE_PR_HEAD_SHA_FILE"
         printf '%s\n' open-draft > "$FAKE_PR_STATE"
+        if test -n "${FAKE_PR_SIGNAL_AFTER_SUCCESS:-}"
+        then
+            kill -TERM "$PPID"
+            exit 143
+        fi
+        if test -n "${FAKE_PR_LOST_RESPONSE:-}"
+        then
+            exit 1
+        fi
         printf '%s\n' 73
+        ;;
+    GET:repos/dcchuck/homebrew-tap/pulls)
+        test "$request_head" = "dcchuck:$branch"
+        test "$request_base" = "$default_branch"
+        test "$request_state" = all
+        if test ! -f "$FAKE_PR_STATE"
+        then
+            printf '%s\n' '[]'
+            exit 0
+        fi
+        pr_state=$(cat "$FAKE_PR_STATE")
+        case "$pr_state" in
+            open-draft) api_state=open ;;
+            closed) api_state=closed ;;
+            *) exit 1 ;;
+        esac
+        branch_sha=${FAKE_PR_HEAD_SHA_OVERRIDE:-$(cat "$FAKE_PR_HEAD_SHA_FILE")}
+        printf '[{"number":73,"draft":true,"state":"%s",' "$api_state"
+        printf '"head":{"ref":"%s","sha":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}},' \
+            "$branch" "$branch_sha"
+        if test -n "${FAKE_DUPLICATE_PR:-}"
+        then
+            printf '"base":{"ref":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}}},' \
+                "$default_branch"
+            printf '{"number":74,"draft":true,"state":"open",'
+            printf '"head":{"ref":"%s","sha":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}},' \
+                "$branch" "$branch_sha"
+            printf '"base":{"ref":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}}}]\n' \
+                "$default_branch"
+        else
+            printf '"base":{"ref":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}}}]\n' \
+                "$default_branch"
+        fi
         ;;
     GET:repos/dcchuck/homebrew-tap/pulls/73)
         if test -n "${FAIL_PR_VERIFY:-}"
         then
             exit 1
         fi
-        printf '73\ttrue\topen\t%s\t%s\n' \
-            "$branch" "${FAKE_DEFAULT_BRANCH:-main}"
+        pr_state=$(cat "$FAKE_PR_STATE")
+        case "$pr_state" in
+            open-draft) api_state=open ;;
+            closed) api_state=closed ;;
+            *) exit 1 ;;
+        esac
+        branch_sha=${FAKE_PR_HEAD_SHA_OVERRIDE:-$(cat "$FAKE_PR_HEAD_SHA_FILE")}
+        case "$jq_expression" in
+            '')
+                printf '{"number":73,"draft":true,"state":"%s",' "$api_state"
+                printf '"head":{"ref":"%s","sha":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}},' \
+                    "$branch" "$branch_sha"
+                printf '"base":{"ref":"%s","repo":{"full_name":"dcchuck/homebrew-tap"}}}\n' \
+                    "$default_branch"
+                ;;
+            *)
+                printf '73\ttrue\t%s\t%s\t%s\n' \
+                    "$api_state" "$branch" "$default_branch"
+                ;;
+        esac
         ;;
     PATCH:repos/dcchuck/homebrew-tap/pulls/73)
         if test -n "${FAIL_CLOSE_ONCE_FILE:-}" &&
@@ -419,14 +666,18 @@ case "$method:$endpoint" in
             exit 1
         fi
         printf '%s\n' closed > "$FAKE_PR_STATE"
+        if test -n "${FAKE_FAIL_NEXT_STATE_AFTER_CLOSE_MARKER:-}"
+        then
+            : > "$FAKE_FAIL_NEXT_STATE_AFTER_CLOSE_MARKER"
+        fi
         ;;
     DELETE:repos/dcchuck/homebrew-tap/git/refs/heads/*)
-        if test -n "${FAIL_STATE_DIR:-}"
-        then
-            chmod 700 "$FAIL_STATE_DIR"
-        fi
         git --git-dir="$FAKE_TAP_ORIGIN" update-ref \
-            -d "refs/heads/$branch"
+            -d "$branch_ref"
+        if test -n "${FAKE_FAIL_NEXT_STATE_AFTER_DELETE_MARKER:-}"
+        then
+            : > "$FAKE_FAIL_NEXT_STATE_AFTER_DELETE_MARKER"
+        fi
         ;;
     *)
         echo "unexpected fake gh call: $method $endpoint" >&2
@@ -452,8 +703,39 @@ run_tap_rehearsal() {
         GH_LOG="$tap_case/gh.log" \
         FAKE_PR_FILES="$tap_case/pr-files" \
         FAKE_PR_STATE="$tap_case/pr-state" \
+        FAKE_PR_HEAD_SHA_FILE="$tap_case/pr-head-sha" \
+        FAKE_DEFAULT_REF_CALLS="$tap_case/default-ref-calls" \
+        FAKE_BRANCH_REF_CALLS="$tap_case/branch-ref-calls" \
+        FAKE_STATE_WRITE_COUNT_FILE="$tap_case/state-write-count" \
+        REAL_GIT="$real_git" \
+        REAL_MV="$real_mv" \
         "$@" \
         "$tap_rehearsal"
+}
+
+run_tap_cleanup_hook() {
+    tap_case=$1
+    shift
+    env \
+        PATH="$tap_fake_bin:$PATH" \
+        HOMEBREW_TAP_TOKEN='tap-secret-must-not-appear' \
+        EXPECTED_TOKEN='tap-secret-must-not-appear' \
+        GITHUB_RUN_ID=4242 \
+        GITHUB_RUN_ATTEMPT=3 \
+        GITHUB_WORKSPACE="$repo_root" \
+        RUNNER_TEMP="$tap_case/runner-temp" \
+        FAKE_TAP_ORIGIN="$tap_case/origin.git" \
+        GH_LOG="$tap_case/gh.log" \
+        FAKE_PR_FILES="$tap_case/pr-files" \
+        FAKE_PR_STATE="$tap_case/pr-state" \
+        FAKE_PR_HEAD_SHA_FILE="$tap_case/pr-head-sha" \
+        FAKE_DEFAULT_REF_CALLS="$tap_case/default-ref-calls" \
+        FAKE_BRANCH_REF_CALLS="$tap_case/branch-ref-calls" \
+        FAKE_STATE_WRITE_COUNT_FILE="$tap_case/state-write-count" \
+        REAL_GIT="$real_git" \
+        REAL_MV="$real_mv" \
+        "$@" \
+        "$tap_case/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
 }
 
 tap_success="$work/tap-success"
@@ -474,7 +756,12 @@ test "$(git --git-dir="$tap_success/origin.git" for-each-ref \
 grep -Fq 'api --method GET repos/dcchuck/homebrew-tap' "$tap_success/gh.log"
 grep -Fq 'api --method GET repos/dcchuck/homebrew-tap/contents' "$tap_success/gh.log"
 grep -Fq 'api --method GET repos/dcchuck/homebrew-tap/branches' "$tap_success/gh.log"
-grep -Fq 'api --method GET repos/dcchuck/homebrew-tap/git/trees/main?recursive=1' \
+grep -Fq "api --method GET repos/dcchuck/homebrew-tap/git/trees/$tap_main_before?recursive=1" \
+    "$tap_success/gh.log"
+grep -Fq 'api --method GET repos/dcchuck/homebrew-tap/git/ref/heads/main' \
+    "$tap_success/gh.log"
+grep -Fq \
+    'api --method GET repos/dcchuck/homebrew-tap/git/matching-refs/heads/rehearsal/car-go-clean-4242-3' \
     "$tap_success/gh.log"
 grep -Fq 'api --method POST repos/dcchuck/homebrew-tap/pulls' \
     "$tap_success/gh.log"
@@ -560,25 +847,15 @@ test ! -e "$tap_truncated_tree/pr-state"
 tap_state_failure="$work/tap-state-failure"
 mkdir -p "$tap_state_failure/runner-temp"
 make_tap_origin "$tap_state_failure"
-cat > "$tap_state_failure/origin.git/hooks/post-receive" <<'EOF'
-#!/bin/sh
-set -eu
-if test -n "${FAIL_STATE_DIR:-}"
-then
-    chmod 500 "$FAIL_STATE_DIR"
-fi
-EOF
-chmod +x "$tap_state_failure/origin.git/hooks/post-receive"
 state_failure_output="$tap_state_failure/output"
 if run_tap_rehearsal \
     "$tap_state_failure" \
-    FAIL_STATE_DIR="$tap_state_failure/runner-temp" \
+    FAKE_FAIL_NEXT_STATE_AFTER_PUSH_MARKER="$tap_state_failure/fail-next-state" \
     > "$state_failure_output" 2>&1
 then
     echo "unexpected success: state persistence failure after branch push" >&2
     exit 1
 fi
-chmod 700 "$tap_state_failure/runner-temp"
 test -z "$(
     git --git-dir="$tap_state_failure/origin.git" for-each-ref \
         --format='%(refname)' refs/heads/rehearsal
@@ -597,14 +874,50 @@ then
     echo "unexpected success: PR verification failure" >&2
     exit 1
 fi
-test "$(cat "$tap_verify_failure/pr-state")" = closed
-test -z "$(
+test "$(cat "$tap_verify_failure/pr-state")" = open-draft
+test -n "$(
     git --git-dir="$tap_verify_failure/origin.git" for-each-ref \
         --format='%(refname)' refs/heads/rehearsal
 )"
+test -f "$tap_verify_failure/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_verify_failure/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+grep -Fq 'Manual inspection required' "$verify_output"
+if grep -Eq 'api --method (PATCH|DELETE)' "$tap_verify_failure/gh.log"
+then
+    echo "unverified rehearsal resources were mutated" >&2
+    exit 1
+fi
 if grep -Fq 'tap-secret-must-not-appear' "$verify_output"
 then
     echo "tap failure output exposed the token" >&2
+    exit 1
+fi
+
+tap_pr_head_mismatch="$work/tap-pr-head-mismatch"
+mkdir -p "$tap_pr_head_mismatch/runner-temp"
+make_tap_origin "$tap_pr_head_mismatch"
+wrong_pr_head=$(git --git-dir="$tap_pr_head_mismatch/origin.git" \
+    rev-parse refs/heads/main)
+pr_head_mismatch_output="$tap_pr_head_mismatch/output"
+if run_tap_rehearsal \
+    "$tap_pr_head_mismatch" \
+    FAKE_PR_HEAD_SHA_OVERRIDE="$wrong_pr_head" \
+    > "$pr_head_mismatch_output" 2>&1
+then
+    echo "unexpected success: draft PR head SHA mismatch" >&2
+    exit 1
+fi
+test "$(cat "$tap_pr_head_mismatch/pr-state")" = open-draft
+test -n "$(
+    git --git-dir="$tap_pr_head_mismatch/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$tap_pr_head_mismatch/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_pr_head_mismatch/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+grep -Fq 'Manual inspection required' "$pr_head_mismatch_output"
+if grep -Eq 'api --method (PATCH|DELETE)' "$tap_pr_head_mismatch/gh.log"
+then
+    echo "mismatched PR authority triggered cleanup mutation" >&2
     exit 1
 fi
 
@@ -621,27 +934,16 @@ then
     exit 1
 fi
 test "$(cat "$tap_retry/pr-state")" = open-draft
-test -z "$(
+test -n "$(
     git --git-dir="$tap_retry/origin.git" for-each-ref \
         --format='%(refname)' refs/heads/rehearsal
 )"
 grep -Fq "gh api --method PATCH 'repos/dcchuck/homebrew-tap/pulls/73' -f state=closed" \
     "$retry_output"
 test -x "$tap_retry/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
-env \
-    PATH="$tap_fake_bin:$PATH" \
-    HOMEBREW_TAP_TOKEN='tap-secret-must-not-appear' \
-    EXPECTED_TOKEN='tap-secret-must-not-appear' \
-    GITHUB_RUN_ID=4242 \
-    GITHUB_RUN_ATTEMPT=3 \
-    GITHUB_WORKSPACE="$repo_root" \
-    RUNNER_TEMP="$tap_retry/runner-temp" \
-    FAKE_TAP_ORIGIN="$tap_retry/origin.git" \
-    GH_LOG="$tap_retry/gh.log" \
-    FAKE_PR_FILES="$tap_retry/pr-files" \
-    FAKE_PR_STATE="$tap_retry/pr-state" \
-    FAIL_CLOSE_ONCE_FILE="$tap_retry/close-failed-once" \
-    "$tap_retry/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+run_tap_cleanup_hook \
+    "$tap_retry" \
+    FAIL_CLOSE_ONCE_FILE="$tap_retry/close-failed-once"
 test "$(cat "$tap_retry/pr-state")" = closed
 test ! -e "$tap_retry/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
 test "$(grep -F -c 'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
@@ -651,3 +953,229 @@ then
     echo "tap cleanup failure exposed the token" >&2
     exit 1
 fi
+
+tap_clone_api_mismatch="$work/tap-clone-api-mismatch"
+mkdir -p "$tap_clone_api_mismatch/runner-temp"
+make_tap_origin "$tap_clone_api_mismatch"
+clone_api_output="$tap_clone_api_mismatch/output"
+if run_tap_rehearsal \
+    "$tap_clone_api_mismatch" \
+    FAKE_DEFAULT_SHA_FIRST=ffffffffffffffffffffffffffffffffffffffff \
+    > "$clone_api_output" 2>&1
+then
+    echo "unexpected success: cloned parent differs from GitHub default ref" >&2
+    exit 1
+fi
+test -z "$(
+    git --git-dir="$tap_clone_api_mismatch/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test ! -e "$tap_clone_api_mismatch/pr-state"
+
+tap_default_changed="$work/tap-default-changed-before-pr"
+mkdir -p "$tap_default_changed/runner-temp"
+make_tap_origin "$tap_default_changed"
+default_before=$(git --git-dir="$tap_default_changed/origin.git" rev-parse refs/heads/main)
+workflow_sha=$(make_tap_workflow_commit "$tap_default_changed")
+default_changed_output="$tap_default_changed/output"
+if run_tap_rehearsal \
+    "$tap_default_changed" \
+    FAKE_DEFAULT_SHA_SECOND="$workflow_sha" \
+    > "$default_changed_output" 2>&1
+then
+    echo "unexpected success: default ref changed before PR creation" >&2
+    exit 1
+fi
+test "$default_before" != "$workflow_sha"
+test "$(git --git-dir="$tap_default_changed/origin.git" rev-parse refs/heads/main)" = \
+    "$workflow_sha"
+test ! -e "$tap_default_changed/pr-state"
+test -z "$(
+    git --git-dir="$tap_default_changed/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+
+tap_branch_retarget="$work/tap-branch-retarget"
+mkdir -p "$tap_branch_retarget/runner-temp"
+make_tap_origin "$tap_branch_retarget"
+retarget_sha=$(git --git-dir="$tap_branch_retarget/origin.git" rev-parse refs/heads/main)
+retarget_output="$tap_branch_retarget/output"
+if run_tap_rehearsal \
+    "$tap_branch_retarget" \
+    FAKE_RETARGET_BRANCH_SHA="$retarget_sha" \
+    > "$retarget_output" 2>&1
+then
+    echo "unexpected success: rehearsal branch was retargeted before PR" >&2
+    exit 1
+fi
+test "$(git --git-dir="$tap_branch_retarget/origin.git" rev-parse \
+    refs/heads/rehearsal/car-go-clean-4242-3)" = "$retarget_sha"
+test ! -e "$tap_branch_retarget/pr-state"
+test -f "$tap_branch_retarget/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_branch_retarget/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(file_mode "$tap_branch_retarget/runner-temp/car-go-clean-tap-rehearsal-state")" = 600
+test "$(file_mode "$tap_branch_retarget/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh")" = 700
+grep -Fq 'Manual inspection required' "$retarget_output"
+grep -Fq \
+    'repos/dcchuck/homebrew-tap/git/matching-refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$retarget_output"
+if grep -Fq \
+    'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_branch_retarget/gh.log"
+then
+    echo "retargeted rehearsal branch was deleted" >&2
+    exit 1
+fi
+
+for lost_push_case in lost-response signal-after-success
+do
+    tap_lost_push="$work/tap-push-$lost_push_case"
+    mkdir -p "$tap_lost_push/runner-temp"
+    make_tap_origin "$tap_lost_push"
+    lost_push_output="$tap_lost_push/output"
+    case "$lost_push_case" in
+        lost-response)
+            lost_push_flag="FAKE_PUSH_LOST_RESPONSE=1"
+            ;;
+        signal-after-success)
+            lost_push_flag="FAKE_PUSH_SIGNAL_AFTER_SUCCESS=1"
+            ;;
+    esac
+    if run_tap_rehearsal \
+        "$tap_lost_push" \
+        "$lost_push_flag" \
+        > "$lost_push_output" 2>&1
+    then
+        echo "unexpected success: accepted push $lost_push_case" >&2
+        exit 1
+    fi
+    test -z "$(
+        git --git-dir="$tap_lost_push/origin.git" for-each-ref \
+            --format='%(refname)' refs/heads/rehearsal
+    )"
+    test ! -e "$tap_lost_push/pr-state"
+    test ! -e "$tap_lost_push/runner-temp/car-go-clean-tap-rehearsal-state"
+    test ! -e "$tap_lost_push/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+done
+
+for lost_pr_case in lost-response signal-after-success
+do
+    tap_lost_pr="$work/tap-pr-$lost_pr_case"
+    mkdir -p "$tap_lost_pr/runner-temp"
+    make_tap_origin "$tap_lost_pr"
+    lost_pr_output="$tap_lost_pr/output"
+    case "$lost_pr_case" in
+        lost-response)
+            lost_pr_flag="FAKE_PR_LOST_RESPONSE=1"
+            ;;
+        signal-after-success)
+            lost_pr_flag="FAKE_PR_SIGNAL_AFTER_SUCCESS=1"
+            ;;
+    esac
+    if run_tap_rehearsal \
+        "$tap_lost_pr" \
+        "$lost_pr_flag" \
+        > "$lost_pr_output" 2>&1
+    then
+        echo "unexpected success: accepted PR $lost_pr_case" >&2
+        exit 1
+    fi
+    test "$(cat "$tap_lost_pr/pr-state")" = closed
+    test -z "$(
+        git --git-dir="$tap_lost_pr/origin.git" for-each-ref \
+            --format='%(refname)' refs/heads/rehearsal
+    )"
+    test ! -e "$tap_lost_pr/runner-temp/car-go-clean-tap-rehearsal-state"
+    test ! -e "$tap_lost_pr/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+done
+
+tap_ambiguous_pr="$work/tap-ambiguous-pr"
+mkdir -p "$tap_ambiguous_pr/runner-temp"
+make_tap_origin "$tap_ambiguous_pr"
+ambiguous_pr_output="$tap_ambiguous_pr/output"
+if run_tap_rehearsal \
+    "$tap_ambiguous_pr" \
+    FAKE_PR_LOST_RESPONSE=1 \
+    FAKE_DUPLICATE_PR=1 \
+    > "$ambiguous_pr_output" 2>&1
+then
+    echo "unexpected success: ambiguous matching rehearsal PRs" >&2
+    exit 1
+fi
+test "$(cat "$tap_ambiguous_pr/pr-state")" = open-draft
+test -n "$(
+    git --git-dir="$tap_ambiguous_pr/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$tap_ambiguous_pr/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_ambiguous_pr/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(file_mode "$tap_ambiguous_pr/runner-temp/car-go-clean-tap-rehearsal-state")" = 600
+test "$(file_mode "$tap_ambiguous_pr/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh")" = 700
+grep -Fq 'Manual inspection required' "$ambiguous_pr_output"
+if grep -Eq 'api --method (PATCH|DELETE)' "$tap_ambiguous_pr/gh.log"
+then
+    echo "ambiguous rehearsal resources were mutated" >&2
+    exit 1
+fi
+
+tap_close_checkpoint="$work/tap-close-checkpoint"
+mkdir -p "$tap_close_checkpoint/runner-temp"
+make_tap_origin "$tap_close_checkpoint"
+close_checkpoint_output="$tap_close_checkpoint/output"
+if run_tap_rehearsal \
+    "$tap_close_checkpoint" \
+    FAKE_FAIL_NEXT_STATE_AFTER_CLOSE_MARKER="$tap_close_checkpoint/fail-next-state" \
+    > "$close_checkpoint_output" 2>&1
+then
+    echo "unexpected success: state checkpoint failed after closing PR" >&2
+    exit 1
+fi
+test "$(cat "$tap_close_checkpoint/pr-state")" = closed
+test -n "$(
+    git --git-dir="$tap_close_checkpoint/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(file_mode "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state")" = 600
+test "$(file_mode "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh")" = 700
+run_tap_cleanup_hook "$tap_close_checkpoint"
+test ! -e "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_close_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test -z "$(
+    git --git-dir="$tap_close_checkpoint/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test "$(grep -F -c 'api --method PATCH repos/dcchuck/homebrew-tap/pulls/73' \
+    "$tap_close_checkpoint/gh.log")" -eq 1
+test "$(grep -F -c 'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_close_checkpoint/gh.log")" -eq 1
+
+tap_delete_checkpoint="$work/tap-delete-checkpoint"
+mkdir -p "$tap_delete_checkpoint/runner-temp"
+make_tap_origin "$tap_delete_checkpoint"
+delete_checkpoint_output="$tap_delete_checkpoint/output"
+if run_tap_rehearsal \
+    "$tap_delete_checkpoint" \
+    FAKE_FAIL_NEXT_STATE_AFTER_DELETE_MARKER="$tap_delete_checkpoint/fail-next-state" \
+    > "$delete_checkpoint_output" 2>&1
+then
+    echo "unexpected success: state checkpoint failed after deleting branch" >&2
+    exit 1
+fi
+test "$(cat "$tap_delete_checkpoint/pr-state")" = closed
+test -z "$(
+    git --git-dir="$tap_delete_checkpoint/origin.git" for-each-ref \
+        --format='%(refname)' refs/heads/rehearsal
+)"
+test -f "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test -x "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(file_mode "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state")" = 600
+test "$(file_mode "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh")" = 700
+run_tap_cleanup_hook "$tap_delete_checkpoint"
+test ! -e "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-state"
+test ! -e "$tap_delete_checkpoint/runner-temp/car-go-clean-tap-rehearsal-cleanup.sh"
+test "$(grep -F -c 'api --method PATCH repos/dcchuck/homebrew-tap/pulls/73' \
+    "$tap_delete_checkpoint/gh.log")" -eq 1
+test "$(grep -F -c 'api --method DELETE repos/dcchuck/homebrew-tap/git/refs/heads/rehearsal/car-go-clean-4242-3' \
+    "$tap_delete_checkpoint/gh.log")" -eq 1
