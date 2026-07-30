@@ -430,6 +430,25 @@ excludes = [
     assert!(load(&path).unwrap().warnings().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn migration_rejects_a_symlink_without_changing_link_or_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("operator.toml");
+    let link = dir.path().join("config.toml");
+    let original = "scan_dirs = [\"/tmp/work\"]\nexcludes = [\"vendor\"]\n";
+    fs::write(&target, original).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = format!("{:#}", prepare_migration(&link).unwrap_err());
+
+    assert!(error.contains("symlink"), "{error}");
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+}
+
 #[test]
 fn migration_is_a_noop_without_a_legacy_key() {
     let dir = tempfile::tempdir().unwrap();

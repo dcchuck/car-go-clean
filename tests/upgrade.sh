@@ -67,12 +67,42 @@ case "$*" in
         test "$(cat "$SERVICE_STATE")" != "not installed"
         test ! -e "$SERVICE_ENABLED"
         test "$(cat "$SERVICE_STATE")" = stopped
-        {
-            printf '%s\n' '# car-go-clean-service-environment-v1'
-            printf 'binary=%s\n' "$0"
-            printf 'CARGO_HOME=%s\n' "${CARGO_HOME-}"
-            printf 'COLIMA_HOME=%s\n' "${COLIMA_HOME-}"
-        } > "$SERVICE_DEFINITION"
+        case "$TEST_PLATFORM" in
+            Darwin)
+                {
+                    printf '%s\n' \
+                        '<?xml version="1.0" encoding="UTF-8"?>' \
+                        '<plist version="1.0">' \
+                        '<dict>' \
+                        '<key>ProgramArguments</key>' \
+                        '<array>' \
+                        "<string>$0</string>" \
+                        '<string>daemon</string>' \
+                        '</array>' \
+                        '<!-- # car-go-clean-service-environment-v1 -->' \
+                        '<key>EnvironmentVariables</key>' \
+                        '<dict>' \
+                        '<key>CARGO_HOME</key>' \
+                        "<string>${CARGO_HOME-}</string>" \
+                        '<key>COLIMA_HOME</key>' \
+                        "<string>${COLIMA_HOME-}</string>" \
+                        '</dict>' \
+                        "<!-- CARGO_HOME=${CARGO_HOME-} -->" \
+                        '</dict>' \
+                        '</plist>'
+                } > "$SERVICE_DEFINITION"
+                ;;
+            Linux)
+                {
+                    printf '%s\n' \
+                        '[Service]' \
+                        "ExecStart=\"$0\" daemon" \
+                        '# car-go-clean-service-environment-v1' \
+                        "Environment=\"CARGO_HOME=${CARGO_HOME-}\"" \
+                        "Environment=\"COLIMA_HOME=${COLIMA_HOME-}\""
+                } > "$SERVICE_DEFINITION"
+                ;;
+        esac
         ;;
     config)
         if [ "${LEGACY_EXCLUDES-0}" = 1 ]; then
@@ -104,6 +134,55 @@ case "$*" in
         fi
         if [ "${EXECUTE_SIGNAL-0}" = 1 ]; then
             kill -TERM "$PPID"
+        fi
+        if [ "${EXECUTE_MUTATE_BINARY-0}" = 1 ]; then
+            printf '%s\n' '# changed during reviewed execution' >> "$0"
+        fi
+        if [ "${EXECUTE_MUTATE_DEFINITION-0}" = 1 ]; then
+            printf '%s\n' '# changed during reviewed execution' >> "$SERVICE_DEFINITION"
+        fi
+        if [ "${4-}" = --json ]; then
+            if [ "${EXECUTE_TARGET_EVENT-0}" = 1 ]; then
+                printf '%s\n' \
+                    '{"format_version":1,"event":"target","data":{"project":"/tmp/project","target":"/tmp/project/target"}}'
+            fi
+            case "${EXECUTE_REJECTION-}" in
+                missing)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_plan_missing"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"missing"}}}\n' "$review"
+                    exit 1
+                    ;;
+                expired)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_plan_expired"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"expired"}}}\n' "$review"
+                    exit 1
+                    ;;
+                policy)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_policy_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"policy_mismatch"}}}\n' "$review"
+                    exit 1
+                    ;;
+                generation)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_generation_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"generation_mismatch","replacing_generation":43}}}\n' "$review"
+                    exit 1
+                    ;;
+                malformed)
+                    printf '%s\n' '{"format_version":1,"command":"run"'
+                    exit 1
+                    ;;
+                missing-terminal)
+                    exit 1
+                    ;;
+                unknown)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["command_failed"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":null}\n' "$review"
+                    exit 1
+                    ;;
+            esac
+            case "${EXECUTE_EXIT-0}" in
+                0)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":0,"kind":"complete","reasons":[]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":1,"skipped":0,"bytes_recovered":1,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":false}}\n' "$review"
+                    ;;
+                2)
+                    printf '{"format_version":1,"command":"run","outcome":{"code":2,"kind":"incomplete","reasons":["scan_incomplete"]},"policy_hash":"fixture","generation":1,"review_id":%s,"scan_errors":[],"data":{"run_id":1,"cleaned":1,"skipped":0,"bytes_recovered":1,"errors":0,"cargo_failures":0,"measurement_failures":0,"cleanup_failures":0,"coverage_incomplete":true}}\n' "$review"
+                    ;;
+            esac
         fi
         exit "${EXECUTE_EXIT-0}"
         ;;
@@ -782,6 +861,10 @@ EOF
     EXECUTE_FIFO=
     EXECUTE_MARKER=
     EXECUTE_SIGNAL=0
+    EXECUTE_REJECTION=
+    EXECUTE_TARGET_EVENT=0
+    EXECUTE_MUTATE_BINARY=0
+    EXECUTE_MUTATE_DEFINITION=0
     BREW_ROLLBACK_FIXTURE=0
     ROLLBACK_SHADOW_DIR=
     BREW_TAPS_FILE=$brew_taps_file
@@ -836,6 +919,8 @@ EOF
     export CONFIG_EXIT EXECUTE_EXIT LEGACY_EXCLUDES BREW_INSTALLED
     export EXECUTE_ERROR RESTORE_FAIL
     export EXECUTE_FIFO EXECUTE_MARKER EXECUTE_SIGNAL
+    export EXECUTE_REJECTION EXECUTE_TARGET_EVENT
+    export EXECUTE_MUTATE_BINARY EXECUTE_MUTATE_DEFINITION
     export BREW_ROLLBACK_FIXTURE BREW_TAPS_FILE BREW_LINKED_FORMULA
     export ROLLBACK_SHADOW_DIR
     export BREW_LINKED_VERSION_FILE BREW_EXTRACTED_VERSION_FILE
@@ -929,7 +1014,7 @@ assert_historical_definition() {
 
 assert_review_call_count() {
     expected=$1
-    actual=$(grep -c '^car-go-clean run --review 42$' "$call_log" || :)
+    actual=$(grep -c '^car-go-clean run --review 42 --json$' "$call_log" || :)
     test "$actual" -eq "$expected" || {
         echo "expected $expected reviewed executions, got $actual" >&2
         cat "$call_log" >&2
@@ -1325,6 +1410,90 @@ fi
 assert_status 0
 assert_review_call_count 1
 test "$(sort -u "$binary_path_log")" = "$persisted_binary"
+
+# A replacement changed before reviewed execution may coincide with external
+# manager recreation. Validation failure must best-effort disable and stop it
+# without executing the review, while retaining both recovery artifacts.
+for fixture in \
+    changed-before-execution-macos:Darwin \
+    changed-before-execution-linux:Linux
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    persisted_binary=$(session_value binary_path)
+    printf '%s\n' '# changed before reviewed execution' >> "$persisted_binary"
+    : > "$service_enabled"
+    printf 'running\n' > "$service_state"
+    : > "$call_log"
+
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+
+    test "$run_status" -ne 0
+    assert_review_call_count 0
+    test ! -e "$service_enabled"
+    test "$(cat "$service_state")" = stopped
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+done
+
+# The binary and refreshed definition authenticated by phase one remain part of
+# the reviewed session. A change during reviewed execution must be detected
+# immediately before manager convergence for both complete outcomes.
+for fixture in \
+    final-auth-binary-macos-zero:Darwin:0 \
+    final-auth-binary-macos-two:Darwin:2 \
+    final-auth-binary-linux-zero:Linux:0 \
+    final-auth-binary-linux-two:Linux:2 \
+    final-auth-definition-macos-zero:Darwin:0 \
+    final-auth-definition-macos-two:Darwin:2 \
+    final-auth-definition-linux-two:Linux:2 \
+    final-auth-definition-linux-zero:Linux:0
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    test -n "$(session_value binary_sha256)"
+    test -n "$(session_value refreshed_definition_sha256)"
+    case "$1" in
+        *binary*) EXECUTE_MUTATE_BINARY=1 ;;
+        *definition*) EXECUTE_MUTATE_DEFINITION=1 ;;
+    esac
+    EXECUTE_EXIT=$3
+    export EXECUTE_EXIT EXECUTE_MUTATE_BINARY EXECUTE_MUTATE_DEFINITION
+    : > "$call_log"
+
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+
+    test "$run_status" -ne 0
+    test "$(session_value phase)" = executed
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    test ! -e "$service_enabled"
+    test "$(cat "$service_state")" = stopped
+    case "$2" in
+        Darwin)
+            assert_calls_lack "launchctl enable"
+            assert_calls_lack "launchctl bootstrap"
+            assert_calls_lack "launchctl kickstart"
+            ;;
+        Linux)
+            assert_calls_lack "systemctl --user enable --now car-go-clean.service"
+            assert_calls_lack "systemctl --user enable car-go-clean.service"
+            assert_calls_lack "systemctl --user start car-go-clean.service"
+            ;;
+    esac
+done
 
 # v0.2/v0.3 and active/stopped/absent states stay exact across both platforms.
 for fixture in \
@@ -2115,6 +2284,95 @@ assert_status 0
 assert_output_has "legacy \`excludes\`"
 assert_output_has "car-go-clean config migrate"
 
+# Exact machine envelopes prove that these review rejections happened before
+# any target event. They return to a retryable preview state without claiming
+# cleanup, while retaining service recovery evidence.
+for fixture in \
+    pre-execution-missing:Darwin:missing \
+    pre-execution-expired:Linux:expired \
+    pre-execution-policy:Darwin:policy \
+    pre-execution-generation:Linux:generation
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    EXECUTE_REJECTION=$3
+    export EXECUTE_REJECTION
+    : > "$call_log"
+
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+
+    test "$run_status" -ne 0
+    assert_review_call_count 1
+    test "$(session_value phase)" = preview_pending
+    test "$(session_value review_id)" = none
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    assert_output_has "new preview"
+    case "$2" in
+        Darwin)
+            assert_calls_lack "launchctl enable"
+            assert_calls_lack "launchctl bootstrap"
+            ;;
+        Linux)
+            assert_calls_lack "systemctl --user enable"
+            assert_calls_lack "systemctl --user start"
+            ;;
+    esac
+
+    EXECUTE_REJECTION=
+    export EXECUTE_REJECTION
+    : > "$call_log"
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    test "$(session_value phase)" = review_pending
+    test "$(session_value review_id)" = 42
+    assert_calls_lack "run --review"
+done
+
+# A target event, malformed or absent terminal envelope, and an unknown
+# structured failure can all follow execution; each remains ambiguous.
+for fixture in \
+    ambiguous-target:expired:1 \
+    ambiguous-malformed:malformed:0 \
+    ambiguous-missing-terminal:missing-terminal:0 \
+    ambiguous-unknown:unknown:0
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" Linux 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    EXECUTE_REJECTION=$2
+    EXECUTE_TARGET_EVENT=$3
+    export EXECUTE_REJECTION EXECUTE_TARGET_EVENT
+    : > "$call_log"
+
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+
+    test "$run_status" -ne 0
+    assert_review_call_count 1
+    test "$(session_value phase)" = executing
+    test "$(session_value review_id)" = 42
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    test -f "$state_dir/upgrade-session"
+    test -f "$service_definition_backup"
+    assert_output_has "will not run review 42 again"
+    assert_calls_lack "systemctl --user enable"
+    assert_calls_lack "systemctl --user start"
+done
+
 # Execution is resumable, exact-ID bound, and never repeats replacement/preview.
 new_case execute-failure Linux 0.2.0 running homebrew
 run_upgrade --version 0.4.0 --method homebrew
@@ -2401,7 +2659,7 @@ EXECUTE_SIGNAL=0
 export EXECUTE_SIGNAL
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 test "$run_status" -ne 0
-test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test "$(grep -c '^car-go-clean run --review 42 --json$' "$call_log")" -eq 1
 test "$(cat "$service_state")" = stopped
 test "$(session_value phase)" = executing
 assert_output_has "will not run review 42 again"
@@ -2421,7 +2679,7 @@ RESTORE_SIGNAL=0
 export RESTORE_SIGNAL
 run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 assert_status 0
-test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test "$(grep -c '^car-go-clean run --review 42 --json$' "$call_log")" -eq 1
 test "$(grep -c '^launchctl bootstrap ' "$call_log")" -eq 1
 test ! -e "$state_dir/upgrade-session"
 
@@ -2471,7 +2729,7 @@ fi
 test "$first_resume_status" -eq 0
 test "$second_resume_status" -ne 0
 assert_output_has "already in progress"
-test "$(grep -c '^car-go-clean run --review 42$' "$call_log")" -eq 1
+test "$(grep -c '^car-go-clean run --review 42 --json$' "$call_log")" -eq 1
 test ! -e "$state_dir/upgrade-session"
 
 # Missing, malformed, symlinked, and broadly readable sessions fail closed.

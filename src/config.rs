@@ -158,6 +158,7 @@ impl ConfigMigration {
     }
 
     pub fn apply(self) -> Result<()> {
+        reject_symlink_migration_path(&self.path)?;
         let current = fs::read_to_string(&self.path)
             .with_context(|| format!("re-read {}", self.path.display()))?;
         if current != self.before {
@@ -208,12 +209,14 @@ fn parse_config(path: &Path, body: &str) -> Result<Config> {
 
 pub fn prepare_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigration>> {
     let path = path.as_ref();
+    reject_symlink_migration_path(path)?;
     let before = read_required(path)?;
     prepare_migration_from_contents(path, before)
 }
 
 pub fn prepare_default_migration(path: impl AsRef<Path>) -> Result<Option<ConfigMigration>> {
     let path = path.as_ref();
+    reject_symlink_migration_path(path)?;
     let Some(before) = read_optional_default(path)? else {
         return Ok(None);
     };
@@ -256,6 +259,19 @@ fn prepare_migration_from_contents(path: &Path, before: String) -> Result<Option
         before,
         after,
     }))
+}
+
+fn reject_symlink_migration_path(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "refusing to migrate symlink configuration path {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn read_required(path: &Path) -> Result<String> {

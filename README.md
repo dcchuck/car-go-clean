@@ -190,11 +190,20 @@ Copy this prompt into your coding agent:
 > shell installer first. Choose the helper method that owns the existing
 > visible command, not a desired migration method; the helper will verify
 > Homebrew formula ownership or a safe shell-owned binary before any service
-> stop. Cross-method migration requires a separate explicit uninstall and
-> fresh install. For any other existing version, read the target release's
-> upgrade instructions before replacement. Only when no binary is installed
-> should you use the README's fresh-install Homebrew or verified shell-installer
-> command.
+> stop. Before invoking helper phase one, use the legacy `service status`
+> result: if it is running, explain that phase one persistently stops and
+> disables it, replaces the binary, and creates the helper preview that opens
+> the bounded review window. Ask approval to enter that window and to restore
+> the originally running service after reviewed execution or cancellation.
+> Invoke helper phase one only after that approval. If the legacy service is
+> already stopped or absent, make no service-state change outside the helper.
+> Treat the helper's preview as the review window described below; inspect it
+> and ask separately before invoking helper phase two with its exact review ID.
+> Do not create a second bare-command preview during this helper flow.
+> Cross-method migration requires a separate explicit uninstall and fresh
+> install. For any other existing version, read the target release's upgrade
+> instructions before replacement. Only when no binary is installed should you
+> use the README's fresh-install Homebrew or verified shell-installer command.
 >
 > If the shell installer is selected, it does not edit `PATH`. After it
 > succeeds, run:
@@ -219,7 +228,8 @@ Copy this prompt into your coding agent:
 > car-go-clean health
 > ```
 >
-> If the daemon is running, do not preview yet. Explain that `service stop`
+> Outside the legacy upgrade-helper flow, if the daemon is running, do not
+> preview yet. Explain that `service stop`
 > persistently disables it across login and reboot, then ask approval for this
 > bounded review window: stop it, create and inspect a preview, leave it stopped
 > while asking separately for reviewed execution approval, and restore the
@@ -239,11 +249,13 @@ Copy this prompt into your coding agent:
 > plan lasts 30 minutes, is one of at most 20 retained plans, and execution
 > can remove newly unsafe targets but never add new ones.
 >
-> Inspection, installation or upgrade, health checks, and the dry run are
-> authorized by this prompt. Ask before:
+> Inspection, installation or upgrade, health checks, and a preview are
+> authorized by this prompt, except that an active legacy service still
+> requires the approval above before helper phase one persistently stops it.
+> Ask before:
 >
-> - Executing the exact preview with
->   `car-go-clean run --review REVIEW_ID`.
+> - Executing the exact preview with either helper phase two or
+>   `car-go-clean run --review REVIEW_ID`, as appropriate to the flow.
 > - Installing or enabling the background service.
 > - Changing configuration or exclusions.
 > - Using `--force`, `--include-active`, or `--include-managed-cache`.

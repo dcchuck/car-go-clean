@@ -102,9 +102,12 @@ session_state=
 session_phase=
 session_review=
 session_binary_path=
+session_binary_sha256=
 session_old_binary_path=
 session_definition_backup_sha256=
 session_definition_binary_path=
+session_refreshed_definition_sha256=
+session_refreshed_definition_binary_path=
 carriage_return=$(printf '\r')
 
 validate_line_value() {
@@ -490,6 +493,47 @@ authenticate_service_definition() {
     printf '%s\n' "$resolved_definition_binary"
 }
 
+authenticate_replacement_binary() {
+    binary_path=$1
+    expected_digest=$2
+    binary_version=
+    resolved_binary=$(canonical_existing_binary "$binary_path") || return 1
+    [ "$resolved_binary" = "$binary_path" ] || return 1
+    binary_metadata_before=$(portable_file_metadata "$binary_path") || return 1
+    binary_digest_before=$(sha256_file "$binary_path") || return 1
+    [ "$binary_digest_before" = "$expected_digest" ] || return 1
+    binary_version=$("$binary_path" version 2>&1) || return 1
+    [ "$binary_version" = 0.4.0 ] || return 1
+    binary_digest_after=$(sha256_file "$binary_path") || return 1
+    binary_metadata_after=$(portable_file_metadata "$binary_path") || return 1
+    [ "$binary_digest_after" = "$expected_digest" ] || return 1
+    [ "$binary_metadata_after" = "$binary_metadata_before" ] || return 1
+}
+
+validate_final_artifacts() {
+    authenticate_replacement_binary \
+        "$session_binary_path" "$session_binary_sha256" || {
+        echo "car-go-clean upgrade: replacement binary changed before service convergence" >&2
+        return 1
+    }
+    if [ "$session_state" != absent ]; then
+        definition_path=$(installed_service_definition) || return 1
+        refreshed_definition_binary=$(
+            authenticate_service_definition \
+                "$definition_path" "$session_refreshed_definition_sha256"
+        ) || {
+            echo "car-go-clean upgrade: refreshed service definition changed before service convergence" >&2
+            return 1
+        }
+        [ "$refreshed_definition_binary" = \
+            "$session_refreshed_definition_binary_path" ] &&
+            [ "$refreshed_definition_binary" = "$session_binary_path" ] || {
+            echo "car-go-clean upgrade: refreshed service definition no longer resolves to the authenticated replacement binary" >&2
+            return 1
+        }
+    fi
+}
+
 launchd_target() {
     uid=$(id -u) || return 1
     printf 'gui/%s/com.dcchuck.car-go-clean\n' "$uid"
@@ -669,12 +713,14 @@ keep_service_disabled_and_stopped() {
 
 converge_final_service_state() {
     if [ "$session_state" = absent ]; then
-        return 0
+        validate_final_artifacts
+        return
     fi
 
     enabled_state=$(service_enabled_state) || return 1
     activity_state=$(service_activity_state)
     [ "$activity_state" != error ] || return 1
+    validate_final_artifacts || return 1
 
     case "$session_state" in
         active)
@@ -834,9 +880,12 @@ load_session() {
     session_phase=
     session_review=
     session_binary_path=
+    session_binary_sha256=
     session_old_binary_path=
     session_definition_backup_sha256=
     session_definition_binary_path=
+    session_refreshed_definition_sha256=
+    session_refreshed_definition_binary_path=
     seen_format=false
     seen_version=false
     seen_method=false
@@ -845,9 +894,12 @@ load_session() {
     seen_phase=false
     seen_review=false
     seen_binary_path=false
+    seen_binary_sha256=false
     seen_old_binary_path=false
     seen_definition_backup_sha256=false
     seen_definition_binary_path=false
+    seen_refreshed_definition_sha256=false
+    seen_refreshed_definition_binary_path=false
     malformed=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
@@ -891,6 +943,11 @@ load_session() {
                 seen_binary_path=true
                 session_binary_path=${line#binary_path=}
                 ;;
+            binary_sha256=*)
+                [ "$seen_binary_sha256" = false ] || malformed=true
+                seen_binary_sha256=true
+                session_binary_sha256=${line#binary_sha256=}
+                ;;
             old_binary_path=*)
                 [ "$seen_old_binary_path" = false ] || malformed=true
                 seen_old_binary_path=true
@@ -905,6 +962,16 @@ load_session() {
                 [ "$seen_definition_binary_path" = false ] || malformed=true
                 session_definition_binary_path=${line#definition_binary_path=}
                 seen_definition_binary_path=true
+                ;;
+            refreshed_definition_sha256=*)
+                [ "$seen_refreshed_definition_sha256" = false ] || malformed=true
+                session_refreshed_definition_sha256=${line#refreshed_definition_sha256=}
+                seen_refreshed_definition_sha256=true
+                ;;
+            refreshed_definition_binary_path=*)
+                [ "$seen_refreshed_definition_binary_path" = false ] || malformed=true
+                session_refreshed_definition_binary_path=${line#refreshed_definition_binary_path=}
+                seen_refreshed_definition_binary_path=true
                 ;;
             *)
                 malformed=true
@@ -925,7 +992,26 @@ load_session() {
         [ "$seen_definition_backup_sha256" = true ] &&
         [ "$seen_definition_binary_path" = true ] ||
         die "upgrade session is malformed"
-    [ "$session_format" = 6 ] || die "upgrade session is malformed"
+    case "$session_format" in
+        6)
+            [ "$seen_binary_sha256" = false ] &&
+                [ "$seen_refreshed_definition_sha256" = false ] &&
+                [ "$seen_refreshed_definition_binary_path" = false ] ||
+                die "upgrade session is malformed"
+            session_binary_sha256=unresolved
+            session_refreshed_definition_sha256=none
+            session_refreshed_definition_binary_path=none
+            ;;
+        7)
+            [ "$seen_binary_sha256" = true ] &&
+                [ "$seen_refreshed_definition_sha256" = true ] &&
+                [ "$seen_refreshed_definition_binary_path" = true ] ||
+                die "upgrade session is malformed"
+            ;;
+        *)
+            die "upgrade session is malformed"
+            ;;
+    esac
     [ "$session_version" = 0.4.0 ] || die "upgrade session is malformed"
     case "$session_method" in homebrew|shell) ;; *) die "upgrade session is malformed" ;; esac
     case "$session_old_version" in
@@ -962,16 +1048,32 @@ load_session() {
         replacement_attempt)
             [ "$session_binary_path" = unresolved ] ||
                 die "upgrade session is malformed"
+            [ "$session_binary_sha256" = unresolved ] ||
+                die "upgrade session is malformed"
             [ "$session_review" = none ] || die "upgrade session is malformed"
             ;;
         replacement_pending|definition_pending|preview_pending)
             validate_absolute_path_value "$session_binary_path" ||
                 die "upgrade session is malformed"
+            if [ "$session_format" = 7 ]; then
+                case "$session_binary_sha256" in
+                    *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
+                esac
+                [ "${#session_binary_sha256}" -eq 64 ] ||
+                    die "upgrade session is malformed"
+            fi
             [ "$session_review" = none ] || die "upgrade session is malformed"
             ;;
         review_pending|executing|executed)
             validate_absolute_path_value "$session_binary_path" ||
                 die "upgrade session is malformed"
+            if [ "$session_format" = 7 ]; then
+                case "$session_binary_sha256" in
+                    *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
+                esac
+                [ "${#session_binary_sha256}" -eq 64 ] ||
+                    die "upgrade session is malformed"
+            fi
             case "$session_review" in
                 ''|*[!0-9]*) die "upgrade session is malformed" ;;
                 *) [ "$session_review" -gt 0 ] || die "upgrade session is malformed" ;;
@@ -987,6 +1089,36 @@ load_session() {
         [ "$resolved_session_binary" = "$session_binary_path" ] ||
             die "upgrade session binary path is no longer exact"
     fi
+    if [ "$session_format" = 7 ]; then
+        case "$session_phase:$session_state" in
+            replacement_pending:*|definition_pending:*)
+                [ "$session_refreshed_definition_sha256" = none ] &&
+                    [ "$session_refreshed_definition_binary_path" = none ] ||
+                    die "upgrade session is malformed"
+                ;;
+            preview_pending:absent|review_pending:absent|executing:absent|executed:absent)
+                [ "$session_refreshed_definition_sha256" = none ] &&
+                    [ "$session_refreshed_definition_binary_path" = none ] ||
+                    die "upgrade session is malformed"
+                ;;
+            preview_pending:*|review_pending:*|executing:*|executed:*)
+                case "$session_refreshed_definition_sha256" in
+                    *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
+                esac
+                [ "${#session_refreshed_definition_sha256}" -eq 64 ] ||
+                    die "upgrade session is malformed"
+                validate_absolute_path_value \
+                    "$session_refreshed_definition_binary_path" ||
+                    die "upgrade session is malformed"
+                ;;
+            replacement_attempt:*)
+                ;;
+        esac
+    fi
+    if [ "$session_format" = 6 ] &&
+        [ "$session_phase" != replacement_attempt ]; then
+        die "upgrade session predates authenticated v0.4 recovery state; retain it for manual recovery and create a new preview"
+    fi
 }
 
 write_session() {
@@ -998,7 +1130,7 @@ write_session() {
     chmod 600 "$session_temp" ||
         die "could not secure upgrade session"
     if ! {
-        printf 'format=6\n'
+        printf 'format=7\n'
         printf 'version=%s\n' "$session_version"
         printf 'method=%s\n' "$session_method"
         printf 'old_version=%s\n' "$session_old_version"
@@ -1006,9 +1138,14 @@ write_session() {
         printf 'phase=%s\n' "$next_phase"
         printf 'review_id=%s\n' "$next_review"
         printf 'binary_path=%s\n' "$session_binary_path"
+        printf 'binary_sha256=%s\n' "$session_binary_sha256"
         printf 'old_binary_path=%s\n' "$session_old_binary_path"
         printf 'definition_backup_sha256=%s\n' "$session_definition_backup_sha256"
         printf 'definition_binary_path=%s\n' "$session_definition_binary_path"
+        printf 'refreshed_definition_sha256=%s\n' \
+            "$session_refreshed_definition_sha256"
+        printf 'refreshed_definition_binary_path=%s\n' \
+            "$session_refreshed_definition_binary_path"
     } > "$session_temp"; then
         die "could not write upgrade session"
     fi
@@ -1021,14 +1158,15 @@ write_session() {
 
 validate_resumed_binary() {
     cgc_binary=$session_binary_path
-    resumed_version=$("$cgc_binary" version 2>&1) || {
-        echo "car-go-clean upgrade: could not validate the replacement car-go-clean binary" >&2
+    authenticate_replacement_binary \
+        "$session_binary_path" "$session_binary_sha256" || {
+        if [ -n "$binary_version" ] && [ "$binary_version" != 0.4.0 ]; then
+            echo "car-go-clean upgrade: expected car-go-clean 0.4.0, found $binary_version" >&2
+        else
+            echo "car-go-clean upgrade: could not validate the replacement car-go-clean binary" >&2
+        fi
         return 1
     }
-    if [ "$resumed_version" != 0.4.0 ]; then
-        echo "car-go-clean upgrade: expected car-go-clean 0.4.0, found $resumed_version" >&2
-        return 1
-    fi
 }
 
 # shellcheck disable=SC2016 # These helpers are emitted for the operator's rollback shell.
@@ -1354,6 +1492,95 @@ ambiguous_execution_guidance() {
     echo "Session retained at $session_file." >&2
 }
 
+pre_execution_rejection_guidance() {
+    echo "Review $session_review was rejected before execution; no cleanup outcome is claimed." >&2
+    echo "The session returned to preview-pending state and recovery evidence remains at $session_file." >&2
+    echo "Create and inspect a new preview with exactly:" >&2
+    printf '  %s --version 0.4.0 --method %s\n' \
+        "$0" "$session_method" >&2
+}
+
+classify_pre_execution_rejection() {
+    rejection_output=$1
+    rejection_review=$2
+    validate_line_value "$rejection_output" || return 1
+    for rejection_kind in missing expired policy_mismatch
+    do
+        case "$rejection_kind" in
+            missing) rejection_reason=review_plan_missing ;;
+            expired) rejection_reason=review_plan_expired ;;
+            policy_mismatch) rejection_reason=review_policy_mismatch ;;
+        esac
+        expected_rejection=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["%s"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"%s"}}}' \
+            "$rejection_reason" "$rejection_review" "$rejection_kind")
+        if [ "$rejection_output" = "$expected_rejection" ]; then
+            return 0
+        fi
+    done
+
+    expected_rejection=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_generation_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"generation_mismatch"}}}' \
+        "$rejection_review")
+    [ "$rejection_output" != "$expected_rejection" ] || return 0
+
+    generation_prefix=$(printf '{"format_version":1,"command":"run","outcome":{"code":1,"kind":"failed","reasons":["review_generation_mismatch"]},"policy_hash":null,"generation":null,"review_id":%s,"scan_errors":[],"data":{"review_plan_rejection":{"kind":"generation_mismatch","replacing_generation":' \
+        "$rejection_review")
+    generation_suffix='}}}'
+    case "$rejection_output" in
+        "$generation_prefix"*"$generation_suffix")
+            replacing_generation=${rejection_output#"$generation_prefix"}
+            replacing_generation=${replacing_generation%"$generation_suffix"}
+            case "$replacing_generation" in
+                ''|*[!0-9]*) return 1 ;;
+                *) [ "$replacing_generation" -gt 0 ] ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+validate_completed_review_output() {
+    completed_output=$1
+    completed_status=$2
+    completed_review=$3
+    [ -n "$completed_output" ] || return 1
+    completed_terminal=$(printf '%s\n' "$completed_output" | tail -n 1)
+    validate_line_value "$completed_terminal" || return 1
+    case "$completed_status" in
+        0)
+            completed_prefix='{"format_version":1,"command":"run","outcome":{"code":0,"kind":"complete","reasons":['
+            ;;
+        2)
+            completed_prefix='{"format_version":1,"command":"run","outcome":{"code":2,"kind":"incomplete","reasons":['
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    case "$completed_terminal" in
+        "$completed_prefix"*',"review_id":'"$completed_review"',"scan_errors":['*'],"data":{"run_id":'*',"cleaned":'*',"skipped":'*',"bytes_recovered":'*',"errors":'*',"cargo_failures":'*',"measurement_failures":'*',"cleanup_failures":'*',"coverage_incomplete":'*'}}')
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    completed_events=$(printf '%s\n' "$completed_output" | sed '$d')
+    if [ -n "$completed_events" ]; then
+        printf '%s\n' "$completed_events" |
+            while IFS= read -r completed_event; do
+                case "$completed_event" in
+                    '{"format_version":1,"event":"target","data":{"project":'*',"target":'*'}}')
+                        ;;
+                    *)
+                        exit 1
+                        ;;
+                esac
+            done
+    fi
+}
+
 restoration_recovery_guidance() {
     echo "Reviewed execution completed, but service restoration did not; the service remains stopped." >&2
     printf 'Resume restoration without repeating cleanup with exactly:\n  %s --version 0.4.0 --method %s --execute-review %s\n' \
@@ -1440,6 +1667,31 @@ refresh_definition_phase() {
             preview_recovery_guidance
             return 1
         fi
+        definition_path=$(installed_service_definition) || return 1
+        session_refreshed_definition_sha256=$(
+            sha256_file "$definition_path"
+        ) || {
+            echo "car-go-clean upgrade: could not fingerprint the refreshed service definition" >&2
+            preview_recovery_guidance
+            return 1
+        }
+        session_refreshed_definition_binary_path=$(
+            authenticate_service_definition \
+                "$definition_path" "$session_refreshed_definition_sha256"
+        ) || {
+            echo "car-go-clean upgrade: could not authenticate the refreshed service definition" >&2
+            preview_recovery_guidance
+            return 1
+        }
+        if [ "$session_refreshed_definition_binary_path" != \
+            "$session_binary_path" ]; then
+            echo "car-go-clean upgrade: refreshed service definition does not resolve to the authenticated replacement binary" >&2
+            preview_recovery_guidance
+            return 1
+        fi
+    else
+        session_refreshed_definition_sha256=none
+        session_refreshed_definition_binary_path=none
     fi
     write_session preview_pending none
 }
@@ -1470,12 +1722,36 @@ execute_review_session() {
         review_pending)
             write_session executing "$session_review"
             set +e
-            "$cgc_binary" run --review "$session_review"
+            review_output=$(
+                "$cgc_binary" run --review "$session_review" --json
+            )
             review_status=$?
             set -e
+            if [ -n "$review_output" ]; then
+                printf '%s\n' "$review_output"
+            fi
             case "$review_status" in
                 0|2)
-                    write_session executed "$session_review"
+                    if validate_completed_review_output \
+                        "$review_output" "$review_status" "$session_review"; then
+                        write_session executed "$session_review"
+                    else
+                        ambiguous_execution_guidance
+                        return 1
+                    fi
+                    ;;
+                1)
+                    if classify_pre_execution_rejection \
+                        "$review_output" "$session_review"; then
+                        rejected_review=$session_review
+                        write_session preview_pending none
+                        session_review=$rejected_review
+                        pre_execution_rejection_guidance
+                        session_review=none
+                        return 1
+                    fi
+                    ambiguous_execution_guidance
+                    return 1
                     ;;
                 *)
                     ambiguous_execution_guidance
@@ -1510,6 +1786,9 @@ if [ -e "$session_file" ] || [ -L "$session_file" ]; then
         exit 1
     fi
     if ! validate_resumed_binary; then
+        if [ "$session_state" != absent ]; then
+            keep_service_disabled_and_stopped >/dev/null 2>&1 || :
+        fi
         replacement_recovery_guidance
         exit 1
     fi
@@ -1627,7 +1906,10 @@ session_method=$method
 session_old_version=$old_version
 session_state=$original_state
 session_binary_path=unresolved
+session_binary_sha256=unresolved
 session_old_binary_path=$old_binary
+session_refreshed_definition_sha256=none
+session_refreshed_definition_binary_path=none
 
 if [ "$original_state" != absent ]; then
     backup_installed_service_definition ||
@@ -1715,9 +1997,14 @@ case "$method" in
 esac
 
 session_binary_path=$new_binary
+session_binary_sha256=$(sha256_file "$new_binary") ||
+    die "could not fingerprint the exact replacement car-go-clean binary"
 write_session replacement_pending none
 replacement_recovery_armed=false
 if ! validate_resumed_binary; then
+    if [ "$session_state" != absent ]; then
+        keep_service_disabled_and_stopped >/dev/null 2>&1 || :
+    fi
     replacement_recovery_guidance
     exit 1
 fi

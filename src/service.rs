@@ -59,6 +59,25 @@ pub struct ServiceStatus {
     pub active: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemdActivityState {
+    Active,
+    Reloading,
+    Refreshing,
+    Inactive,
+    Failed,
+    Activating,
+    Deactivating,
+    Maintenance,
+    Unknown,
+}
+
+impl SystemdActivityState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active | Self::Reloading | Self::Refreshing)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ServiceEnvironment {
     pub values: BTreeMap<String, OsString>,
@@ -290,15 +309,15 @@ impl<R: CommandRunner> ServiceManager<R> {
         self.require_absolute_binary()?;
         self.service_environment = self.service_environment.resolved()?;
         self.validate_definition_rendering()?;
-        let status = self.status()?;
-        if !status.installed {
-            bail!("car-go-clean service is not installed");
-        }
-        if status.enabled || status.active {
-            self.stop()?;
-        }
         match self.platform {
             ServicePlatform::MacOs => {
+                let status = self.status_macos()?;
+                if !status.installed {
+                    bail!("car-go-clean service is not installed");
+                }
+                if status.enabled || status.active {
+                    self.stop()?;
+                }
                 let plist = self.launchd_plist_path();
                 let log_dir = self.home_dir.join("Library/Logs/car-go-clean");
                 fs::create_dir_all(&log_dir)
@@ -308,6 +327,31 @@ impl<R: CommandRunner> ServiceManager<R> {
                 atomic_write(&plist, rendered.as_bytes())?;
             }
             ServicePlatform::Linux => {
+                let (status, activity) = self.status_linux_with_activity()?;
+                if !status.installed {
+                    bail!("car-go-clean service is not installed");
+                }
+                let activity = activity.expect("installed systemd unit has an activity state");
+                if status.enabled || activity != SystemdActivityState::Inactive {
+                    self.run_checked(
+                        Path::new("systemctl"),
+                        &[
+                            OsString::from("--user"),
+                            OsString::from("disable"),
+                            OsString::from("--now"),
+                            OsString::from(UNIT),
+                        ],
+                    )?;
+                    let (stopped, stopped_activity) = self.status_linux_with_activity()?;
+                    if !stopped.installed
+                        || stopped.enabled
+                        || stopped_activity != Some(SystemdActivityState::Inactive)
+                    {
+                        bail!(
+                            "systemd service did not reach disabled, terminal inactive state before refresh"
+                        );
+                    }
+                }
                 let unit = self.systemd_unit_path();
                 let rendered = render_systemd_template(&self.binary, &self.service_environment)?;
                 atomic_write(&unit, rendered.as_bytes())?;
@@ -490,19 +534,15 @@ impl<R: CommandRunner> ServiceManager<R> {
     }
 
     fn stop_active_service_for_reinstall(&mut self) -> Result<()> {
-        let definition_exists = match self.platform {
-            ServicePlatform::MacOs => self.launchd_plist_path().exists(),
-            ServicePlatform::Linux => self.systemd_unit_path().exists(),
-        };
-        if !definition_exists {
-            return Ok(());
-        }
-        let status = self.status()?;
-        if !status.active {
-            return Ok(());
-        }
         match self.platform {
             ServicePlatform::MacOs => {
+                if !self.launchd_plist_path().exists() {
+                    return Ok(());
+                }
+                let status = self.status_macos()?;
+                if !status.active {
+                    return Ok(());
+                }
                 let args = [
                     OsString::from("bootout"),
                     OsString::from(self.launchd_domain()),
@@ -514,6 +554,13 @@ impl<R: CommandRunner> ServiceManager<R> {
                 }
             }
             ServicePlatform::Linux => {
+                if !self.systemd_unit_path().exists() {
+                    return Ok(());
+                }
+                let (_status, activity) = self.status_linux_with_activity()?;
+                if activity == Some(SystemdActivityState::Inactive) {
+                    return Ok(());
+                }
                 self.run_checked(
                     Path::new("systemctl"),
                     &[
@@ -522,6 +569,10 @@ impl<R: CommandRunner> ServiceManager<R> {
                         OsString::from(UNIT),
                     ],
                 )?;
+                let (_status, stopped_activity) = self.status_linux_with_activity()?;
+                if stopped_activity != Some(SystemdActivityState::Inactive) {
+                    bail!("systemd service did not reach terminal inactive state before reinstall");
+                }
             }
         }
         Ok(())
@@ -648,12 +699,22 @@ impl<R: CommandRunner> ServiceManager<R> {
     }
 
     fn status_linux(&mut self) -> Result<ServiceStatus> {
+        self.status_linux_with_activity()
+            .map(|(status, _activity)| status)
+    }
+
+    fn status_linux_with_activity(
+        &mut self,
+    ) -> Result<(ServiceStatus, Option<SystemdActivityState>)> {
         if !self.systemd_unit_path().exists() {
-            return Ok(ServiceStatus {
-                installed: false,
-                enabled: false,
-                active: false,
-            });
+            return Ok((
+                ServiceStatus {
+                    installed: false,
+                    enabled: false,
+                    active: false,
+                },
+                None,
+            ));
         }
         self.require_systemd_user()?;
         let enabled_args = [
@@ -684,12 +745,15 @@ impl<R: CommandRunner> ServiceManager<R> {
                 &active_output,
             ));
         }
-        let active = parse_systemd_active(&active_output)?;
-        Ok(ServiceStatus {
-            installed: true,
-            enabled,
-            active,
-        })
+        let activity = parse_systemd_active(&active_output)?;
+        Ok((
+            ServiceStatus {
+                installed: true,
+                enabled,
+                active: activity.is_active(),
+            },
+            Some(activity),
+        ))
     }
 
     fn require_absolute_binary(&self) -> Result<()> {
@@ -1171,13 +1235,18 @@ fn parse_systemd_enabled(output: &CommandOutput) -> Result<bool> {
     }
 }
 
-fn parse_systemd_active(output: &CommandOutput) -> Result<bool> {
+fn parse_systemd_active(output: &CommandOutput) -> Result<SystemdActivityState> {
     let value = output.stdout.trim();
     match value {
-        "active" | "reloading" | "refreshing" => Ok(true),
-        "inactive" | "failed" | "activating" | "deactivating" | "maintenance" | "unknown" => {
-            Ok(false)
-        }
+        "active" => Ok(SystemdActivityState::Active),
+        "reloading" => Ok(SystemdActivityState::Reloading),
+        "refreshing" => Ok(SystemdActivityState::Refreshing),
+        "inactive" => Ok(SystemdActivityState::Inactive),
+        "failed" => Ok(SystemdActivityState::Failed),
+        "activating" => Ok(SystemdActivityState::Activating),
+        "deactivating" => Ok(SystemdActivityState::Deactivating),
+        "maintenance" => Ok(SystemdActivityState::Maintenance),
+        "unknown" => Ok(SystemdActivityState::Unknown),
         _ => bail!("malformed systemctl is-active output: {value:?}"),
     }
 }

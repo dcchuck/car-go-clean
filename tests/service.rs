@@ -188,6 +188,9 @@ fn reinstall_transiently_stops_an_active_service_before_loading_new_environment(
             CommandOutput::new(true, "active\n".to_string(), String::new()),
             CommandOutput::new(true, String::new(), String::new()),
             CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
             CommandOutput::new(true, String::new(), String::new()),
             CommandOutput::new(true, String::new(), String::new()),
         ]),
@@ -196,9 +199,47 @@ fn reinstall_transiently_stops_an_active_service_before_loading_new_environment(
     linux.install().unwrap();
     let linux_calls = call_arguments(&linux.into_runner());
     assert_eq!(linux_calls[3], ["--user", "stop", "car-go-clean.service"]);
-    assert_eq!(linux_calls[5], ["--user", "daemon-reload"]);
+    assert_eq!(linux_calls[8], ["--user", "daemon-reload"]);
     assert_eq!(
-        linux_calls[6],
+        linux_calls[9],
+        ["--user", "enable", "--now", "car-go-clean.service"]
+    );
+}
+
+#[test]
+fn linux_reinstall_stops_and_verifies_activating_service_before_rewrite() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "legacy definition").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "activating\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+
+    manager.install().unwrap();
+
+    let calls = call_arguments(&manager.into_runner());
+    assert_eq!(calls[3], ["--user", "stop", "car-go-clean.service"]);
+    assert_eq!(calls[7], ["--user", "show-environment"]);
+    assert_eq!(calls[8], ["--user", "daemon-reload"]);
+    assert_eq!(
+        calls[9],
         ["--user", "enable", "--now", "car-go-clean.service"]
     );
 }
@@ -482,6 +523,97 @@ fn refresh_rewrites_an_installed_definition_without_enabling_or_starting_it() {
             ],
         ]
     );
+}
+
+#[test]
+fn linux_refresh_stops_and_verifies_every_noninactive_activity_state_before_rewrite() {
+    for (state, success) in [
+        ("active", true),
+        ("reloading", true),
+        ("refreshing", true),
+        ("activating", false),
+        ("deactivating", false),
+        ("failed", false),
+        ("maintenance", false),
+        ("unknown", false),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let unit = work
+            .path()
+            .join(".config/systemd/user/car-go-clean.service");
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, format!("legacy definition for {state}")).unwrap();
+        let binary = work.path().join("bin/car-go-clean-v040");
+        let mut manager = ServiceManager::new(
+            ServicePlatform::Linux,
+            work.path().to_path_buf(),
+            binary.clone(),
+            FakeRunner::with_outputs([
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+                CommandOutput::new(success, format!("{state}\n"), String::new()),
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+                CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+                CommandOutput::new(true, String::new(), String::new()),
+            ]),
+        );
+
+        manager
+            .refresh()
+            .unwrap_or_else(|error| panic!("{state}: {error:#}"));
+
+        let calls = call_arguments(&manager.into_runner());
+        assert_eq!(
+            calls[3],
+            [
+                "--user".to_string(),
+                "disable".to_string(),
+                "--now".to_string(),
+                "car-go-clean.service".to_string(),
+            ],
+            "{state}"
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &["--user".to_string(), "daemon-reload".to_string(),],
+            "{state}"
+        );
+        let definition = fs::read_to_string(&unit).unwrap();
+        assert!(definition.contains(binary.to_str().unwrap()), "{state}");
+        assert!(!definition.contains("legacy definition"), "{state}");
+    }
+}
+
+#[test]
+fn linux_refresh_does_not_rewrite_when_activity_cannot_be_verified_inactive() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    let original = "legacy definition";
+    fs::write(&unit, original).unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean-v040"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "activating\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, String::new(), "query failed".to_string()),
+        ]),
+    );
+
+    let error = format!("{:#}", manager.refresh().unwrap_err());
+
+    assert!(error.contains("query failed"), "{error}");
+    assert_eq!(fs::read_to_string(&unit).unwrap(), original);
 }
 
 #[test]
@@ -1423,7 +1555,11 @@ fn matrix_status(state: MatrixState) -> ServiceStatus {
     }
 }
 
-fn matrix_runner(platform: ServicePlatform, state: MatrixState) -> FakeRunner {
+fn matrix_runner(
+    platform: ServicePlatform,
+    state: MatrixState,
+    action: MatrixAction,
+) -> FakeRunner {
     if state == MatrixState::Absent {
         return FakeRunner::default();
     }
@@ -1456,27 +1592,41 @@ fn matrix_runner(platform: ServicePlatform, state: MatrixState) -> FakeRunner {
                 )
             },
         ]),
-        ServicePlatform::Linux => FakeRunner::with_outputs([
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(
-                enabled,
-                if enabled {
-                    "enabled\n".to_string()
-                } else {
-                    "disabled\n".to_string()
-                },
-                String::new(),
-            ),
-            CommandOutput::new(
-                active,
-                if active {
-                    "active\n".to_string()
-                } else {
-                    "inactive\n".to_string()
-                },
-                String::new(),
-            ),
-        ]),
+        ServicePlatform::Linux => {
+            let enabled_output = || {
+                CommandOutput::new(
+                    enabled,
+                    if enabled {
+                        "enabled\n".to_string()
+                    } else {
+                        "disabled\n".to_string()
+                    },
+                    String::new(),
+                )
+            };
+            let mut outputs = vec![
+                CommandOutput::new(true, String::new(), String::new()),
+                enabled_output(),
+                CommandOutput::new(
+                    active,
+                    if active {
+                        "active\n".to_string()
+                    } else {
+                        "inactive\n".to_string()
+                    },
+                    String::new(),
+                ),
+            ];
+            if matches!(action, MatrixAction::Install) && active {
+                outputs.extend([
+                    CommandOutput::new(true, String::new(), String::new()),
+                    CommandOutput::new(true, String::new(), String::new()),
+                    enabled_output(),
+                    CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+                ]);
+            }
+            FakeRunner::with_outputs(outputs)
+        }
     }
 }
 
@@ -1597,6 +1747,7 @@ fn matrix_action_calls(
         (ServicePlatform::Linux, MatrixAction::Install) => {
             if active {
                 calls.push(stop());
+                calls.extend(matrix_status_calls(platform, state));
             }
             calls.extend([show_environment(), daemon_reload(), enable_now()]);
         }
@@ -1679,7 +1830,7 @@ fn lifecycle_matrix_covers_every_definition_enablement_and_activity_state() {
                     platform,
                     work.path().to_path_buf(),
                     work.path().join("bin/car-go-clean"),
-                    matrix_runner(platform, state),
+                    matrix_runner(platform, state, action),
                 );
 
                 let result = match action {
