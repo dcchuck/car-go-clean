@@ -44,13 +44,13 @@ jobs:
       - name: Set up Homebrew on Linux
         if: ${{ runner.os == 'Linux' }}
         uses: Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168
-      - name: Verify public install paths
+        with:
+          brew-gh-api-token: ""
+      - name: Download and verify public release assets
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           VERSION: ${{ inputs.version }}
-          TARGET: ${{ matrix.target }}
           EXPECTED_UNAME: ${{ matrix.expected_uname }}
           ASSET_DIR: ${{ runner.temp }}/public-release-assets
           ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-public-smoke
@@ -105,6 +105,14 @@ jobs:
           scripts/verify-shell-release-assets.sh "$ASSET_DIR" \
             > "$RUNNER_TEMP/public-shell-inventory.tsv"
 
+      - name: Verify public release attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          ASSET_DIR: ${{ runner.temp }}/public-release-assets
+        run: |
+          set -euo pipefail
           archive="car-go-clean-$TARGET.tar.xz"
           for attested_asset in \
             "$archive" \
@@ -120,6 +128,22 @@ jobs:
               --repo "$GITHUB_REPOSITORY"
           done
 
+      - name: Verify public install paths
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          ASSET_DIR: ${{ runner.temp }}/public-release-assets
+          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-public-smoke
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$TAG" = "v$VERSION"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          archive="car-go-clean-$TARGET.tar.xz"
           tar -xJf "$ASSET_DIR/$archive" -C "$ISOLATED_ROOT/extracted"
           binary=$(find "$ISOLATED_ROOT/extracted" -type f -name car-go-clean -perm -111)
           test "$(printf '%s\n' "$binary" | awk 'NF {count++} END {print count + 0}')" -eq 1

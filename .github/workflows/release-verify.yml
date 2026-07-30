@@ -142,6 +142,8 @@ jobs:
       - name: Set up Homebrew on Linux
         if: ${{ runner.os == 'Linux' }}
         uses: Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168
+        with:
+          brew-gh-api-token: ""
       - name: Download authenticated draft assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -163,25 +165,28 @@ jobs:
             --pattern 'source.tar.gz' \
             --pattern 'source.tar.gz.sha256' \
             --dir "$ASSET_DIR"
-      - name: Verify authenticated draft install paths
+      - name: Verify authenticated draft assets
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           PLAN: ${{ inputs.plan }}
-          TARGET: ${{ matrix.target }}
           EXPECTED_UNAME: ${{ matrix.expected_uname }}
           ASSET_DIR: ${{ runner.temp }}/draft-release-assets
-          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-draft-smoke
         run: |
           set -euo pipefail
           TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
-          VERSION="${TAG#v}"
           test "$(uname -m)" = "$EXPECTED_UNAME"
           scripts/verify-release-assets.sh "$TAG" "$ASSET_DIR" \
             > "$RUNNER_TEMP/draft-release-inventory.tsv"
           scripts/verify-shell-release-assets.sh "$ASSET_DIR" \
             > "$RUNNER_TEMP/draft-shell-inventory.tsv"
-
+      - name: Verify authenticated draft attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          ASSET_DIR: ${{ runner.temp }}/draft-release-assets
+        run: |
+          set -euo pipefail
           archive="car-go-clean-$TARGET.tar.xz"
           for attested_asset in \
             "$archive" \
@@ -196,7 +201,21 @@ jobs:
             gh attestation verify "$ASSET_DIR/$attested_asset" \
               --repo "$GITHUB_REPOSITORY"
           done
+      - name: Verify authenticated draft install paths
+        shell: bash
+        env:
+          PLAN: ${{ inputs.plan }}
+          TARGET: ${{ matrix.target }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          ASSET_DIR: ${{ runner.temp }}/draft-release-assets
+          ISOLATED_ROOT: ${{ runner.temp }}/car-go-clean-draft-smoke
+        run: |
+          set -euo pipefail
+          TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
+          VERSION="${TAG#v}"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
 
+          archive="car-go-clean-$TARGET.tar.xz"
           rm -rf "$ISOLATED_ROOT"
           mkdir -p \
             "$ISOLATED_ROOT/extracted" \

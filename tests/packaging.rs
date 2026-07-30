@@ -1917,13 +1917,35 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
         .len(),
         1
     );
-    let run = run_command(named_step(steps, "Verify public install paths")).unwrap();
+    let download = named_step(steps, "Download and verify public release assets");
+    let attest = named_step(steps, "Verify public release attestations");
+    let install = named_step(steps, "Verify public install paths");
+    let download_run = run_command(download).unwrap();
+    let attest_run = run_command(attest).unwrap();
+    let install_run = run_command(install).unwrap();
+    let positions = [download, attest, install].map(|selected| {
+        steps
+            .iter()
+            .position(|step| std::ptr::eq(step, selected))
+            .unwrap()
+    });
+    assert!(
+        positions[0] < positions[1] && positions[1] < positions[2],
+        "public assets must be checked and attested before candidate execution"
+    );
     for fragment in [
         "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/$asset",
         "curl --proto '=https'",
         "scripts/verify-release-assets.sh",
         "scripts/verify-shell-release-assets.sh",
-        "gh attestation verify",
+    ] {
+        assert!(
+            download_run.contains(fragment),
+            "hosted public download is missing `{fragment}`"
+        );
+    }
+    assert!(attest_run.contains("gh attestation verify"));
+    for fragment in [
         "sh ./car-go-clean-installer.sh",
         "test \"$version_output\" = \"$VERSION\"",
         "health --skip-cargo",
@@ -1935,7 +1957,7 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
         "brew test car-go-clean",
     ] {
         assert!(
-            run.contains(fragment),
+            install_run.contains(fragment),
             "hosted smoke is missing `{fragment}`"
         );
     }
@@ -1945,11 +1967,11 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
         "aarch64-unknown-linux-musl",
         "x86_64-unknown-linux-musl",
     ] {
-        assert!(run.contains(target), "hosted smoke omits {target}");
+        assert!(download_run.contains(target), "hosted smoke omits {target}");
     }
-    assert!(!run.contains("gh release download"));
-    assert!(!run.contains("--download-base-url"));
-    assert!(!run.contains("file://$ASSET_DIR"));
+    assert!(!download_run.contains("gh release download"));
+    assert!(!install_run.contains("--download-base-url"));
+    assert!(!install_run.contains("file://$ASSET_DIR"));
     assert!(!repo_file(".github/workflows/hosted-release-smoke.yml").contains("homebrew-tap"));
 }
 
@@ -2014,6 +2036,15 @@ fn every_release_gate_installs_and_tests_homebrew_on_both_linux_architectures() 
             Some("${{ runner.os == 'Linux' }}"),
             "{workflow_path} must not replace the preinstalled Homebrew on macOS"
         );
+        assert_eq!(
+            setup[0]["with"]["brew-gh-api-token"].as_str(),
+            Some(""),
+            "{workflow_path} must prevent setup-homebrew from exporting github.token"
+        );
+        assert!(
+            setup[0]["with"]["token"].is_badvalue(),
+            "{workflow_path} must not pass a checkout token to setup-homebrew"
+        );
 
         let verification = named_step(steps, verification_step);
         let setup_index = steps
@@ -2060,6 +2091,93 @@ fn every_release_gate_installs_and_tests_homebrew_on_both_linux_architectures() 
 }
 
 #[test]
+fn release_gate_candidate_execution_never_inherits_github_token() {
+    let gates = [
+        (
+            ".github/workflows/rehearse-release.yml",
+            "Smoke actual installer and formula",
+            BTreeSet::new(),
+        ),
+        (
+            ".github/workflows/release-verify.yml",
+            "Verify authenticated draft install paths",
+            BTreeSet::from([
+                "Download authenticated draft assets",
+                "Verify authenticated draft attestations",
+            ]),
+        ),
+        (
+            ".github/workflows/hosted-release-smoke.yml",
+            "Verify public install paths",
+            BTreeSet::from(["Verify public release attestations"]),
+        ),
+    ];
+
+    for (workflow_path, candidate_step_name, expected_token_steps) in gates {
+        let document = workflow(workflow_path);
+        let steps = workflow_steps(&document, "smoke");
+        let candidate = named_step(steps, candidate_step_name);
+        for token_name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                candidate["env"][token_name].is_badvalue(),
+                "{workflow_path} exports {token_name} to candidate execution"
+            );
+        }
+        assert!(
+            candidate["env"]
+                .as_hash()
+                .unwrap()
+                .values()
+                .all(|value| value.as_str() != Some("${{ github.token }}")),
+            "{workflow_path} exports github.token under another candidate environment name"
+        );
+
+        let token_steps = steps
+            .iter()
+            .filter(|step| step["env"]["GH_TOKEN"].as_str() == Some("${{ github.token }}"))
+            .collect::<Vec<_>>();
+        let actual_names = token_steps
+            .iter()
+            .map(|step| step["name"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_names, expected_token_steps,
+            "{workflow_path} does not confine github.token to reviewed API steps"
+        );
+        for step in token_steps {
+            let run = run_command(step).expect("token-bearing step must be a shell API step");
+            assert!(
+                run.contains("gh "),
+                "{} receives github.token without invoking the GitHub API",
+                step["name"].as_str().unwrap()
+            );
+            for forbidden in [
+                "brew ",
+                "sh ./car-go-clean-installer.sh",
+                "health --skip-cargo",
+                "\"$binary\" version",
+            ] {
+                assert!(
+                    !run.contains(forbidden),
+                    "{} mixes token-bearing API work with candidate execution `{forbidden}`",
+                    step["name"].as_str().unwrap()
+                );
+            }
+        }
+    }
+
+    let verify = workflow(".github/workflows/release-verify.yml");
+    assert_eq!(verify["permissions"]["contents"].as_str(), Some("write"));
+    for job in ["inventory", "smoke"] {
+        assert_eq!(
+            verify["jobs"][job]["permissions"]["contents"].as_str(),
+            Some("write"),
+            "{job} must retain authenticated draft-read permission"
+        );
+    }
+}
+
+#[test]
 fn authenticated_draft_verification_requires_all_fifteen_assets() {
     let verify = workflow(".github/workflows/release-verify.yml");
     assert_eq!(verify["permissions"]["contents"].as_str(), Some("write"));
@@ -2098,18 +2216,18 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
 
     let smoke_steps = workflow_steps(&verify, "smoke");
     let download = named_step(smoke_steps, "Download authenticated draft assets");
+    let verify_assets = named_step(smoke_steps, "Verify authenticated draft assets");
+    let attest = named_step(smoke_steps, "Verify authenticated draft attestations");
     let verify_paths = named_step(smoke_steps, "Verify authenticated draft install paths");
-    let download_index = smoke_steps
-        .iter()
-        .position(|step| std::ptr::eq(step, download))
-        .unwrap();
-    let verify_index = smoke_steps
-        .iter()
-        .position(|step| std::ptr::eq(step, verify_paths))
-        .unwrap();
+    let positions = [download, verify_assets, attest, verify_paths].map(|selected| {
+        smoke_steps
+            .iter()
+            .position(|step| std::ptr::eq(step, selected))
+            .unwrap()
+    });
     assert!(
-        download_index < verify_index,
-        "authenticated verification must consume the preceding download"
+        positions[0] < positions[1] && positions[1] < positions[2] && positions[2] < positions[3],
+        "authenticated assets must be checked and attested before candidate execution"
     );
     let download_run = run_command(download).unwrap();
     let selected_patterns = download_run
@@ -2120,8 +2238,10 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
                 .map(|(pattern, _)| pattern)
         })
         .collect::<BTreeSet<_>>();
+    let asset_run = run_command(verify_assets).unwrap();
+    let attestation_run = run_command(attest).unwrap();
     let smoke_run = run_command(verify_paths).unwrap();
-    let attested_assets = smoke_run
+    let attested_assets = attestation_run
         .split("for attested_asset in \\")
         .nth(1)
         .expect("authenticated verification lacks an attestation loop")
@@ -2151,12 +2271,8 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
     assert!(source.contains("gh attestation verify"));
     assert!(source.contains("scripts/verify-shell-release-assets.sh"));
     assert!(source.contains("scripts/render-local-homebrew-formula.sh"));
-    assert!(
-        smoke_run
-            .find("scripts/verify-shell-release-assets.sh")
-            .unwrap()
-            < smoke_run.find("gh attestation verify").unwrap()
-    );
+    assert!(asset_run.contains("scripts/verify-shell-release-assets.sh"));
+    assert!(attestation_run.contains("gh attestation verify"));
     assert!(smoke_run.contains("brew tap --custom-remote"));
     assert!(smoke_run.contains("brew install car-go-clean/release-smoke/car-go-clean"));
     assert!(!source.contains("homebrew-tap"));
@@ -2701,14 +2817,20 @@ fn cargo_dist_global_assets_are_attested_and_publicly_smoked() {
     );
 
     let hosted = workflow(".github/workflows/hosted-release-smoke.yml");
-    let run = run_command(named_step(
-        workflow_steps(&hosted, "smoke"),
-        "Verify public install paths",
+    let hosted_steps = workflow_steps(&hosted, "smoke");
+    let download_run = run_command(named_step(
+        hosted_steps,
+        "Download and verify public release assets",
+    ))
+    .unwrap();
+    let attestation_run = run_command(named_step(
+        hosted_steps,
+        "Verify public release attestations",
     ))
     .unwrap();
     for asset in assets {
         assert!(
-            run.matches(asset).count() >= 2,
+            download_run.contains(asset) && attestation_run.contains(asset),
             "public smoke must both download and attest {asset}"
         );
     }

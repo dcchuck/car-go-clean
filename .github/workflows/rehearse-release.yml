@@ -407,6 +407,8 @@ jobs:
       - name: Set up Homebrew on Linux
         if: ${{ runner.os == 'Linux' }}
         uses: Homebrew/actions/setup-homebrew@9651e3cfa42dae9ae90ca79eaa6d36dcd8569168
+        with:
+          brew-gh-api-token: ""
       - id: download
         name: Download all target archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
