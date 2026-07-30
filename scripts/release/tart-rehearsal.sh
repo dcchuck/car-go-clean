@@ -154,8 +154,10 @@ for name, expected_hash in seen.items():
 for target in ("aarch64-apple-darwin", "aarch64-unknown-linux-gnu"):
     binary = f"rustup-init-{target}"
     proof = artifacts / f"{binary}.sha256"
+    # rustup currently emits `*./rustup-init`; retain the historical
+    # no-prefix spelling while rejecting any other path.
     match = re.fullmatch(
-        r"([0-9a-f]{64}) [ *]rustup-init\n?",
+        r"([0-9a-f]{64}) [ *](?:\./)?rustup-init\n?",
         proof.read_text(),
     )
     if not match or match.group(1) != seen[binary]:

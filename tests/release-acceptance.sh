@@ -393,7 +393,14 @@ for target in aarch64-apple-darwin aarch64-unknown-linux-gnu; do
     rustup=rustup-init-$target
     printf '#!/bin/sh\nexit 0\n' > "$artifacts/$rustup"
     rustup_hash=$(shasum -a 256 "$artifacts/$rustup" | awk '{ print $1 }')
-    printf '%s  rustup-init\n' "$rustup_hash" > "$artifacts/$rustup.sha256"
+    case "$target" in
+        aarch64-apple-darwin)
+            printf '%s *./rustup-init\n' "$rustup_hash"
+            ;;
+        aarch64-unknown-linux-gnu)
+            printf '%s  rustup-init\n' "$rustup_hash"
+            ;;
+    esac > "$artifacts/$rustup.sha256"
 done
 
 apple_hash=$(shasum -a 256 \
@@ -549,7 +556,12 @@ assert_rehearsal_rejected_before_pull "$work_dir/reject-rustup-proof"
 assert_contains "$output_file" "official rustup checksum proof"
 rustup_hash=$(shasum -a 256 \
     "$artifacts/rustup-init-aarch64-apple-darwin" | awk '{ print $1 }')
-printf '%s  rustup-init\n' "$rustup_hash" \
+printf '%s *../rustup-init\n' "$rustup_hash" \
+    > "$artifacts/rustup-init-aarch64-apple-darwin.sha256"
+refresh_closed_manifest
+assert_rehearsal_rejected_before_pull "$work_dir/reject-rustup-proof-path"
+assert_contains "$output_file" "official rustup checksum proof"
+printf '%s *./rustup-init\n' "$rustup_hash" \
     > "$artifacts/rustup-init-aarch64-apple-darwin.sha256"
 cp "$work_dir/SHA256SUMS.saved" "$artifacts/SHA256SUMS"
 
