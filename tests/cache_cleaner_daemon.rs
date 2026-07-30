@@ -43,6 +43,14 @@ fn authoritative_scanner(options: ScannerOptions) -> Scanner {
     bind_test_authority(scanner, &options)
 }
 
+fn authoritative_scanner_with_identity(
+    options: ScannerOptions,
+    identity: Arc<dyn IdentityProvider>,
+) -> Scanner {
+    let scanner = Scanner::new(options.clone());
+    bind_test_authority_with_identity(scanner, &options, identity)
+}
+
 fn authoritative_scanner_with_resolver(
     options: ScannerOptions,
     resolver: Arc<dyn GitWorktreeResolver>,
@@ -52,6 +60,14 @@ fn authoritative_scanner_with_resolver(
 }
 
 fn bind_test_authority(scanner: Scanner, options: &ScannerOptions) -> Scanner {
+    bind_test_authority_with_identity(scanner, options, Arc::new(SystemIdentityProvider))
+}
+
+fn bind_test_authority_with_identity(
+    scanner: Scanner,
+    options: &ScannerOptions,
+    identity: Arc<dyn IdentityProvider>,
+) -> Scanner {
     let config_dir = tempfile::tempdir().unwrap();
     let config_path = config_dir.path().join("config.toml");
     let body = format!(
@@ -68,7 +84,7 @@ fn bind_test_authority(scanner: Scanner, options: &ScannerOptions) -> Scanner {
         &EmptyEnvironment,
     )
     .unwrap();
-    scanner.with_authority(policy, Arc::new(SystemIdentityProvider))
+    scanner.with_authority(policy, identity)
 }
 
 fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
@@ -1285,6 +1301,59 @@ impl IdentityProvider for SwitchableIdentityProvider {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FixedBootSystemIdentityProvider;
+
+impl IdentityProvider for FixedBootSystemIdentityProvider {
+    fn boot_session(&self) -> anyhow::Result<Option<BootSessionId>> {
+        Ok(Some(BootSessionId("test-boot".to_string())))
+    }
+
+    fn identity(&self, path: &Path) -> anyhow::Result<FilesystemIdentity> {
+        SystemIdentityProvider.identity(path)
+    }
+}
+
+struct UnavailableBootIdentityProvider {
+    boot_available: AtomicUsize,
+    target_revision: AtomicUsize,
+}
+
+impl UnavailableBootIdentityProvider {
+    fn new(boot_available: bool) -> Self {
+        Self {
+            boot_available: AtomicUsize::new(usize::from(boot_available)),
+            target_revision: AtomicUsize::new(0),
+        }
+    }
+
+    fn make_boot_unavailable(&self) {
+        self.boot_available.store(0, Ordering::SeqCst);
+    }
+
+    fn replace_target(&self) {
+        self.target_revision.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl IdentityProvider for UnavailableBootIdentityProvider {
+    fn boot_session(&self) -> anyhow::Result<Option<BootSessionId>> {
+        Ok((self.boot_available.load(Ordering::SeqCst) != 0)
+            .then(|| BootSessionId("test-boot".to_string())))
+    }
+
+    fn identity(&self, path: &Path) -> anyhow::Result<FilesystemIdentity> {
+        Ok(FilesystemIdentity {
+            device: 7,
+            inode: if path.file_name() == Some(OsStr::new("target")) {
+                20 + self.target_revision.load(Ordering::SeqCst) as u64
+            } else {
+                10
+            },
+        })
+    }
+}
+
 struct EmptyEnvironment;
 
 impl Environment for EmptyEnvironment {
@@ -2018,14 +2087,18 @@ fn same_generation_target_identity_replacement_is_rejected_before_cargo() {
         delete_target: true,
         ..FakeRunner::default()
     };
+    let identity = Arc::new(FixedBootSystemIdentityProvider);
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        authoritative_scanner(ScannerOptions {
-            roots: vec![root.path().to_path_buf()],
-            project_dirs: vec![],
-            excludes: vec![],
-        }),
+        authoritative_scanner_with_identity(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            identity,
+        ),
         Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
         DaemonOptions {
             target_quiet_period: Duration::ZERO,
@@ -2052,6 +2125,66 @@ fn same_generation_target_identity_replacement_is_rejected_before_cargo() {
     assert_eq!(result.skipped, 1);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(project.join("target/replacement.bin").exists());
+}
+
+fn dynamic_generation_rejects_replaced_target_with_boot_availability(initially_available: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let identity = Arc::new(UnavailableBootIdentityProvider::new(initially_available));
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner_with_identity(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            identity.clone(),
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    identity.make_boot_unavailable();
+    identity.replace_target();
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
+}
+
+#[test]
+fn dynamic_generation_rejects_replaced_target_when_both_boot_ids_are_unavailable() {
+    dynamic_generation_rejects_replaced_target_with_boot_availability(false);
+}
+
+#[test]
+fn dynamic_generation_rejects_replaced_target_when_current_boot_id_is_unavailable() {
+    dynamic_generation_rejects_replaced_target_with_boot_availability(true);
 }
 
 #[test]
@@ -6437,7 +6570,23 @@ fn exact_review_execution_removes_replaced_target_without_cargo() {
     write_file(&project.join("Cargo.toml"), b"[workspace]\n");
     write_file(&project.join("target/blob.bin"), &[0; 2048]);
     let project = project.canonicalize().unwrap();
-    let review = cleanable_review(&project);
+    let identity = Arc::new(FixedBootSystemIdentityProvider);
+    let review = review_project_with_identity_provider(
+        &project,
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        },
+        identity.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
     fs::rename(project.join("target"), project.join("target-reviewed")).unwrap();
     write_file(&project.join("target/replacement.bin"), &[0; 2048]);
 
@@ -6448,11 +6597,14 @@ fn exact_review_execution_removes_replaced_target_without_cargo() {
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
-        authoritative_scanner(ScannerOptions {
-            roots: vec![root.path().to_path_buf()],
-            project_dirs: vec![],
-            excludes: vec![],
-        }),
+        authoritative_scanner_with_identity(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            identity,
+        ),
         Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
         DaemonOptions {
             target_quiet_period: Duration::ZERO,
@@ -6479,4 +6631,83 @@ fn exact_review_execution_removes_replaced_target_without_cargo() {
     assert_eq!(result.skipped, 1);
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(project.join("target/replacement.bin").exists());
+}
+
+fn exact_review_rejects_replaced_target_with_boot_availability(initially_available: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let project = project.canonicalize().unwrap();
+    let identity = Arc::new(UnavailableBootIdentityProvider::new(initially_available));
+    let review = review_project_with_identity_provider(
+        &project,
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        },
+        identity.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+
+    identity.make_boot_unavailable();
+    identity.replace_target();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner_with_identity(
+            ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            },
+            identity,
+        ),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            vec![review],
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
+}
+
+#[test]
+fn exact_review_rejects_replaced_target_when_both_boot_ids_are_unavailable() {
+    exact_review_rejects_replaced_target_with_boot_availability(false);
+}
+
+#[test]
+fn exact_review_rejects_replaced_target_when_current_boot_id_is_unavailable() {
+    exact_review_rejects_replaced_target_with_boot_availability(true);
 }

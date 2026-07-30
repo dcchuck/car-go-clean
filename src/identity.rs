@@ -45,7 +45,9 @@ pub fn compare_persisted(
                 IdentityComparison::Replaced
             }
         }
-        _ => IdentityComparison::StaleAcrossBoot,
+        (Some(_), Some(_)) => IdentityComparison::StaleAcrossBoot,
+        _ if observed == current => IdentityComparison::Matches,
+        _ => IdentityComparison::Replaced,
     }
 }
 

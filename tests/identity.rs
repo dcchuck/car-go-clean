@@ -282,7 +282,7 @@ fn cleanable_review_captures_exact_identity_and_boot_session() {
 }
 
 #[test]
-fn unavailable_boot_id_treats_persisted_identity_as_stale_not_hostile() {
+fn unavailable_boot_id_requires_exact_persisted_identity() {
     let project = Path::new("/scope/project");
     let provider = FakeIdentityProvider::with_boot(None).with_identity(project, 200, 300);
     let current_boot = provider.boot_session().unwrap();
@@ -292,9 +292,26 @@ fn unavailable_boot_id_treats_persisted_identity_as_stale_not_hostile() {
         compare_persisted(
             Some(&BootSessionId("boot-a".to_string())),
             current_boot.as_ref(),
+            &current,
+            &current,
+        ),
+        IdentityComparison::Matches
+    );
+    assert_eq!(
+        compare_persisted(
+            Some(&BootSessionId("boot-a".to_string())),
+            current_boot.as_ref(),
             &identity(8, 20),
             &current,
         ),
-        IdentityComparison::StaleAcrossBoot
+        IdentityComparison::Replaced
+    );
+    assert_eq!(
+        compare_persisted(None, current_boot.as_ref(), &current, &current),
+        IdentityComparison::Matches
+    );
+    assert_eq!(
+        compare_persisted(None, current_boot.as_ref(), &identity(8, 20), &current),
+        IdentityComparison::Replaced
     );
 }
