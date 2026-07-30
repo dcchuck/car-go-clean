@@ -862,73 +862,53 @@ session_mode() {
     return 1
 }
 
-migrate_format6_session() {
-    migrated_binary_sha256=$(sha256_file "$session_binary_path") || {
-        echo "car-go-clean upgrade: could not fingerprint the format-6 replacement binary" >&2
-        return 1
-    }
-    authenticate_replacement_binary \
-        "$session_binary_path" "$migrated_binary_sha256" || {
-        echo "car-go-clean upgrade: could not authenticate the format-6 replacement binary" >&2
-        return 1
-    }
+# shellcheck disable=SC2016 # Literal archive commands are emitted for the operator.
+format6_manual_recovery_guidance() {
+    archive_dir=$state_dir/upgrade-format6-manual-archive
+    archive_dir_word=$(quote_shell_word "$archive_dir")
+    session_file_word=$(quote_shell_word "$session_file")
+    service_definition_backup_word=$(
+        quote_shell_word "$service_definition_backup"
+    )
 
-    if [ "$session_state" != absent ]; then
-        migrated_backup_binary=$(
-            authenticate_service_definition \
-                "$service_definition_backup" \
-                "$session_definition_backup_sha256"
-        ) || {
-            echo "car-go-clean upgrade: could not authenticate the format-6 service-definition backup" >&2
-            return 1
-        }
-        [ "$migrated_backup_binary" = "$session_definition_binary_path" ] || {
-            echo "car-go-clean upgrade: format-6 service-definition backup no longer resolves to its recorded binary" >&2
-            return 1
-        }
-    fi
-
-    case "$session_phase:$session_state" in
-        replacement_pending:*|definition_pending:*)
-            migrated_definition_sha256=none
-            migrated_definition_binary=none
+    echo "This format-6 session has no independent binary or service-definition digest, so the helper refuses to trust or resume its recorded artifacts." >&2
+    case "$session_phase" in
+        executing)
+            echo "The executing review may already have run cleanup. Do not run review $session_review again; manually verify car-go-clean status, logs, and review history first." >&2
             ;;
-        preview_pending:absent|review_pending:absent|executing:absent|executed:absent)
-            migrated_definition_sha256=none
-            migrated_definition_binary=none
+        executed)
+            echo "The recorded executed state is unauthenticated. Manually verify car-go-clean status, logs, and review history; do not run review $session_review again." >&2
             ;;
-        preview_pending:*|review_pending:*|executing:*|executed:*)
-            migrated_definition_path=$(installed_service_definition) || return 1
-            migrated_definition_sha256=$(
-                sha256_file "$migrated_definition_path"
-            ) || {
-                echo "car-go-clean upgrade: could not fingerprint the format-6 refreshed service definition" >&2
-                return 1
-            }
-            migrated_definition_binary=$(
-                authenticate_service_definition \
-                    "$migrated_definition_path" \
-                    "$migrated_definition_sha256"
-            ) || {
-                echo "car-go-clean upgrade: could not authenticate the format-6 refreshed service definition" >&2
-                return 1
-            }
-            [ "$migrated_definition_binary" = "$session_binary_path" ] || {
-                echo "car-go-clean upgrade: format-6 refreshed service definition does not resolve to the replacement binary" >&2
-                return 1
-            }
+        review_pending|reviewed)
+            echo "Do not execute review $session_review from this unauthenticated session." >&2
             ;;
         *)
-            return 1
+            echo "Do not continue this unauthenticated format-6 phase automatically." >&2
             ;;
     esac
-
-    session_binary_sha256=$migrated_binary_sha256
-    session_refreshed_definition_sha256=$migrated_definition_sha256
-    session_refreshed_definition_binary_path=$migrated_definition_binary
-    write_session "$session_phase" "$session_review"
-    session_format=7
-    echo "Authenticated and migrated the resumable upgrade session from format 6 to format 7." >&2
+    echo "The service has been left disabled and stopped best-effort. The session and service-definition backup remain unchanged." >&2
+    echo "No fresh preview is possible while the format-6 session remains at $session_file." >&2
+    echo "Before resetting the helper, manually recover and independently verify the intended binary and service definition, and confirm the service is disabled and stopped." >&2
+    echo "Only after that manual recovery and verification, archive the evidence without overwriting or deleting it:" >&2
+    printf '  archive_dir=%s\n' "$archive_dir_word" >&2
+    echo '  if [ -e "$archive_dir" ]; then' >&2
+    echo '    echo "Archive destination already exists; inspect it and choose a different exact path. Do not overwrite it." >&2' >&2
+    echo '    exit 1' >&2
+    echo '  fi' >&2
+    echo '  mkdir -m 700 "$archive_dir" || exit 1' >&2
+    if [ "$session_state" != absent ]; then
+        printf '  test ! -L %s && test -f %s || exit 1\n' \
+            "$service_definition_backup_word" \
+            "$service_definition_backup_word" >&2
+        printf '  mv -- %s "$archive_dir/upgrade-service-definition" || exit 1\n' \
+            "$service_definition_backup_word" >&2
+    fi
+    printf '  test ! -L %s && test -f %s || exit 1\n' \
+        "$session_file_word" "$session_file_word" >&2
+    printf '  mv -- %s "$archive_dir/upgrade-session" || exit 1\n' \
+        "$session_file_word" >&2
+    echo "The live session path is moved last. If an earlier step fails, it continues blocking a fresh preview." >&2
+    echo "After verified artifact recovery and successful archival, run this helper without --execute-review to create and inspect a fresh preview." >&2
 }
 
 load_session() {
@@ -1133,9 +1113,13 @@ load_session() {
             fi
             [ "$session_review" = none ] || die "upgrade session is malformed"
             ;;
-        review_pending|executing|executed)
+        review_pending|reviewed|executing|executed)
             validate_absolute_path_value "$session_binary_path" ||
                 die "upgrade session is malformed"
+            if [ "$session_phase" = reviewed ] &&
+                [ "$session_format" != 6 ]; then
+                die "upgrade session is malformed"
+            fi
             if [ "$session_format" = 7 ]; then
                 case "$session_binary_sha256" in
                     *[!0-9a-f]*|'') die "upgrade session is malformed" ;;
@@ -1160,12 +1144,11 @@ load_session() {
     fi
     if [ "$session_format" = 6 ] &&
         [ "$session_phase" != replacement_attempt ]; then
-        if ! migrate_format6_session; then
-            if [ "$session_state" != absent ]; then
-                keep_service_disabled_and_stopped >/dev/null 2>&1 || :
-            fi
-            die "format-6 session artifacts could not be authenticated; the session remains unchanged for manual recovery"
+        if [ "$session_state" != absent ]; then
+            keep_service_disabled_and_stopped >/dev/null 2>&1 || :
         fi
+        format6_manual_recovery_guidance
+        exit 1
     fi
     if [ "$session_format" = 7 ]; then
         case "$session_phase:$session_state" in

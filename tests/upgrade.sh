@@ -2822,51 +2822,80 @@ assert_output_has "already in progress"
 test "$(grep -c '^car-go-clean run --review 42 --json$' "$call_log")" -eq 1
 test ! -e "$state_dir/upgrade-session"
 
-# Canonical unreleased format-6 sessions can be rebound to authenticated
-# format-7 artifacts. A pending review remains pending, an ambiguous execution
-# remains fail-closed, and an already executed review only finalizes.
-new_case format6-review-pending Darwin 0.3.0 running homebrew
-run_upgrade --version 0.4.0 --method homebrew
-assert_status 0
-downgrade_session_to_format6 review_pending 42
-: > "$call_log"
-run_upgrade --version 0.4.0 --method homebrew
-test "$run_status" -ne 0
-test "$(session_value format)" = 7
-test "$(session_value phase)" = review_pending
-test "$(session_value review_id)" = 42
-test "$(cat "$service_state")" = stopped
-test ! -e "$service_enabled"
-assert_calls_lack "run --review"
+# Format 6 never bound the replacement binary or refreshed definition to
+# independent digests. Even plausible 0.4 artifacts must not be blessed into
+# format 7. Every post-replacement phase preserves evidence and requires
+# explicit manual recovery before a no-overwrite archive/reset.
+for fixture in \
+    format6-review-pending:Darwin:review_pending \
+    format6-reviewed:Linux:reviewed \
+    format6-executing:Darwin:executing \
+    format6-executed:Linux:executed
+do
+    old_ifs=$IFS
+    IFS=:
+    # shellcheck disable=SC2086 # Intentional splitting of colon-delimited fixture fields.
+    set -- $fixture
+    IFS=$old_ifs
+    new_case "$1" "$2" 0.3.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    downgrade_session_to_format6 "$3" 42
+    persisted_binary=$(session_value binary_path)
+    printf '%s\n' '# untrusted replacement still reports 0.4.0' \
+        >> "$persisted_binary"
+    printf '%s\n' '# altered refreshed definition' >> "$service_definition"
+    format6_session_before=$current_case/format6-session-before
+    format6_backup_before=$current_case/format6-backup-before
+    format6_binary_before=$current_case/format6-binary-before
+    format6_definition_before=$current_case/format6-definition-before
+    cp "$state_dir/upgrade-session" "$format6_session_before"
+    cp "$service_definition_backup" "$format6_backup_before"
+    cp "$persisted_binary" "$format6_binary_before"
+    cp "$service_definition" "$format6_definition_before"
+    format6_archive_dir=$state_dir/upgrade-format6-manual-archive
+    if [ "$3" = reviewed ]; then
+        mkdir -m 700 "$format6_archive_dir"
+    fi
+    : > "$service_enabled"
+    printf 'running\n' > "$service_state"
+    : > "$call_log"
 
-new_case format6-executing Linux 0.3.0 running homebrew
-run_upgrade --version 0.4.0 --method homebrew
-assert_status 0
-downgrade_session_to_format6 executing 42
-: > "$call_log"
-run_upgrade --version 0.4.0 --method homebrew --execute-review 42
-test "$run_status" -ne 0
-test "$(session_value format)" = 7
-test "$(session_value phase)" = executing
-test "$(session_value review_id)" = 42
-test "$(cat "$service_state")" = stopped
-test ! -e "$service_enabled"
-assert_output_has "will not run review 42 again"
-assert_calls_lack "run --review"
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
 
-new_case format6-executed Darwin 0.3.0 running homebrew
-run_upgrade --version 0.4.0 --method homebrew
-assert_status 0
-downgrade_session_to_format6 executed 42
-: > "$call_log"
-run_upgrade --version 0.4.0 --method homebrew --execute-review 42
-assert_status 0
-test "$(cat "$service_state")" = running
-test -e "$service_enabled"
-test ! -e "$state_dir/upgrade-session"
-test ! -e "$service_definition_backup"
-assert_calls_lack "run --review"
-assert_calls_have "launchctl bootstrap"
+    test "$run_status" -ne 0
+    cmp "$format6_session_before" "$state_dir/upgrade-session"
+    cmp "$format6_backup_before" "$service_definition_backup"
+    cmp "$format6_binary_before" "$persisted_binary"
+    cmp "$format6_definition_before" "$service_definition"
+    test "$(session_value format)" = 6
+    test "$(session_value phase)" = "$3"
+    test "$(session_value review_id)" = 42
+    test "$(cat "$service_state")" = stopped
+    test ! -e "$service_enabled"
+    assert_output_has "no independent binary or service-definition digest"
+    assert_output_has "No fresh preview is possible while the format-6 session remains"
+    assert_output_has "manually recover and independently verify"
+    assert_output_has "archive_dir='$format6_archive_dir'"
+    assert_output_has "Archive destination already exists; inspect it and choose a different exact path. Do not overwrite it."
+    assert_output_has "mv -- '$service_definition_backup' \"\$archive_dir/upgrade-service-definition\""
+    assert_output_has "mv -- '$state_dir/upgrade-session' \"\$archive_dir/upgrade-session\""
+    case "$3" in
+        executing)
+            assert_output_has "may already have run cleanup"
+            assert_output_has "status, logs, and review history"
+            ;;
+    esac
+    assert_calls_lack "car-go-clean version"
+    assert_calls_lack "__validate-upgrade-review-output"
+    assert_calls_lack "run --review"
+    assert_calls_lack "service refresh"
+    assert_calls_lack "launchctl enable"
+    assert_calls_lack "launchctl bootstrap"
+    assert_calls_lack "launchctl kickstart"
+    assert_calls_lack "systemctl --user enable"
+    assert_calls_lack "systemctl --user start"
+done
 
 # Missing, malformed, symlinked, and broadly readable sessions fail closed.
 new_case missing-session Darwin 0.4.0 stopped homebrew
