@@ -2842,6 +2842,9 @@ do
     assert_status 0
     downgrade_session_to_format6 "$3" 42
     persisted_binary=$(session_value binary_path)
+    persisted_old_binary=$(session_value old_binary_path)
+    persisted_old_version=$(session_value old_version)
+    persisted_service_state=$(session_value service_state)
     printf '%s\n' '# untrusted replacement still reports 0.4.0' \
         >> "$persisted_binary"
     printf '%s\n' '# altered refreshed definition' >> "$service_definition"
@@ -2875,11 +2878,36 @@ do
     test ! -e "$service_enabled"
     assert_output_has "no independent binary or service-definition digest"
     assert_output_has "No fresh preview is possible while the format-6 session remains"
-    assert_output_has "manually recover and independently verify"
+    assert_output_has "The helper will not recover, refresh, enable, or start the service automatically."
+    assert_output_has "Branch A: restore and independently verify the exact recorded old release"
+    assert_output_has "exact recorded old binary '$persisted_old_binary'"
+    assert_output_has "exact recorded old version '$persisted_old_version'"
+    assert_output_has "saved old definition '$service_definition_backup'"
+    assert_output_has "installed definition '$service_definition'"
+    assert_output_has "manually restore and verify the recorded original service state '$persisted_service_state'"
+    assert_output_has "helper accepts only an independently verified v0.2.0 or v0.3.0 binary at fresh entry"
+    assert_output_has "Only in Branch A, after successful archival, rerun the helper without --execute-review:"
+    assert_output_has "'$upgrade' --version '0.4.0' --method 'homebrew'"
+    assert_output_has "Branch B: independently authenticate the recorded v0.4 binary"
+    assert_output_has "format-6 session does not authenticate '$persisted_binary'"
+    assert_output_has "verify or regenerate the installed definition '$service_definition'"
+    assert_output_has "Keep the service disabled and stopped"
+    assert_output_has "'$persisted_binary' run --dry-run --all"
+    assert_output_has "'$persisted_binary' run --review REVIEW_ID"
+    assert_output_has "Only after reviewed execution or explicit cancellation, refresh the definition"
+    assert_output_has "'$persisted_binary' service refresh"
+    assert_output_has "'$persisted_binary' service start"
+    assert_output_has "Do not rerun the upgrade helper in Branch B."
     assert_output_has "archive_dir='$format6_archive_dir'"
     assert_output_has "Archive destination already exists; inspect it and choose a different exact path. Do not overwrite it."
     assert_output_has "mv -- '$service_definition_backup' \"\$archive_dir/upgrade-service-definition\""
     assert_output_has "mv -- '$state_dir/upgrade-session' \"\$archive_dir/upgrade-session\""
+    if grep -F \
+        "After verified artifact recovery and successful archival, run this helper without --execute-review" \
+        "$output_file" >/dev/null; then
+        echo "format-6 guidance gave an unconditional helper restart" >&2
+        exit 1
+    fi
     case "$3" in
         executing)
             assert_output_has "may already have run cleanup"

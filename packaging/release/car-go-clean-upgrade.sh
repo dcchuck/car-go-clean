@@ -867,9 +867,19 @@ format6_manual_recovery_guidance() {
     archive_dir=$state_dir/upgrade-format6-manual-archive
     archive_dir_word=$(quote_shell_word "$archive_dir")
     session_file_word=$(quote_shell_word "$session_file")
+    helper_word=$(quote_shell_word "$0")
+    method_word=$(quote_shell_word "$session_method")
+    version_word=$(quote_shell_word "$session_version")
+    old_binary_word=$(quote_shell_word "$session_old_binary_path")
+    old_version_word=$(quote_shell_word "$session_old_version")
+    replacement_binary_word=$(quote_shell_word "$session_binary_path")
     service_definition_backup_word=$(
         quote_shell_word "$service_definition_backup"
     )
+    if [ "$session_state" != absent ]; then
+        service_definition_path=$(installed_service_definition)
+        service_definition_word=$(quote_shell_word "$service_definition_path")
+    fi
 
     echo "This format-6 session has no independent binary or service-definition digest, so the helper refuses to trust or resume its recorded artifacts." >&2
     case "$session_phase" in
@@ -888,8 +898,31 @@ format6_manual_recovery_guidance() {
     esac
     echo "The service has been left disabled and stopped best-effort. The session and service-definition backup remain unchanged." >&2
     echo "No fresh preview is possible while the format-6 session remains at $session_file." >&2
-    echo "Before resetting the helper, manually recover and independently verify the intended binary and service definition, and confirm the service is disabled and stopped." >&2
-    echo "Only after that manual recovery and verification, archive the evidence without overwriting or deleting it:" >&2
+    echo "Choose exactly one manual recovery branch. The helper will not recover, refresh, enable, or start the service automatically." >&2
+    echo "Branch A: restore and independently verify the exact recorded old release." >&2
+    printf '  Restore and authenticate the exact recorded old binary %s and confirm its output is the exact recorded old version %s; a version string alone is not authentication.\n' \
+        "$old_binary_word" "$old_version_word" >&2
+    if [ "$session_state" != absent ]; then
+        printf '  Independently verify the saved old definition %s (recorded digest %s and recorded binary %s), restore it at the installed definition %s, then manually restore and verify the recorded original service state %s.\n' \
+            "$service_definition_backup_word" \
+            "$session_definition_backup_sha256" \
+            "$session_definition_binary_path" \
+            "$service_definition_word" \
+            "$(quote_shell_word "$session_state")" >&2
+    else
+        echo "  Independently verify that the recorded original service state 'absent' is still correct; this session recorded no saved service definition." >&2
+    fi
+    echo "  The helper accepts only an independently verified v0.2.0 or v0.3.0 binary at fresh entry. Do not use Branch A unless the exact recorded old binary and version above have been restored." >&2
+    echo "Branch B: independently authenticate the recorded v0.4 binary." >&2
+    printf '  The format-6 session does not authenticate %s. Independently authenticate that exact file as v0.4.0; its version output alone is not proof.\n' \
+        "$replacement_binary_word" >&2
+    if [ "$session_state" != absent ]; then
+        printf '  Independently verify or regenerate the installed definition %s so it resolves to the exact authenticated v0.4 binary. Keep the service disabled and stopped throughout recovery and review.\n' \
+            "$service_definition_word" >&2
+    else
+        echo "  The recorded original service state is 'absent'. Do not create, enable, or start a service as part of recovery." >&2
+    fi
+    echo "After completing every prerequisite for the selected branch, archive the evidence without overwriting or deleting it:" >&2
     printf '  archive_dir=%s\n' "$archive_dir_word" >&2
     echo '  if [ -e "$archive_dir" ]; then' >&2
     echo '    echo "Archive destination already exists; inspect it and choose a different exact path. Do not overwrite it." >&2' >&2
@@ -908,7 +941,28 @@ format6_manual_recovery_guidance() {
     printf '  mv -- %s "$archive_dir/upgrade-session" || exit 1\n' \
         "$session_file_word" >&2
     echo "The live session path is moved last. If an earlier step fails, it continues blocking a fresh preview." >&2
-    echo "After verified artifact recovery and successful archival, run this helper without --execute-review to create and inspect a fresh preview." >&2
+    echo "Only in Branch A, after successful archival, rerun the helper without --execute-review:" >&2
+    printf '  %s --version %s --method %s\n' \
+        "$helper_word" "$version_word" "$method_word" >&2
+    echo "Do not rerun the upgrade helper in Branch B. After successful archival, use the exact independently authenticated v0.4 binary for a fresh preview:" >&2
+    printf '  %s run --dry-run --all\n' "$replacement_binary_word" >&2
+    echo "Inspect the complete preview and its review ID. Only after approving that review, follow the normal bounded review flow:" >&2
+    printf '  %s run --review REVIEW_ID\n' "$replacement_binary_word" >&2
+    if [ "$session_state" != absent ]; then
+        echo "Only after reviewed execution or explicit cancellation, refresh the definition; refresh leaves the service disabled and stopped:" >&2
+        printf '  %s service refresh\n' "$replacement_binary_word" >&2
+        case "$session_state" in
+            active)
+                echo "Because the recorded original service state was active, restore it only after that review decision and refresh:" >&2
+                printf '  %s service start\n' "$replacement_binary_word" >&2
+                ;;
+            stopped)
+                echo "Because the recorded original service state was stopped, do not run service start." >&2
+                ;;
+        esac
+    else
+        echo "Because the recorded original service state was absent, do not run service refresh or service start." >&2
+    fi
 }
 
 load_session() {
