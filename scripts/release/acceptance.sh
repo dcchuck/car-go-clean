@@ -45,8 +45,8 @@ test "${#exact_sha}" -eq 40 ||
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 mkdir -p "$evidence_dir"
 chmod 700 "$evidence_dir"
-raw_log=$evidence_dir/.transcript.raw
-transcript=$evidence_dir/transcript.log
+raw_log=$evidence_dir/.$phase-transcript.raw
+transcript=$evidence_dir/$phase-transcript.log
 milestones=$evidence_dir/milestones.tsv
 work_root=$HOME/car-go-clean-v040-acceptance-work
 session_marker=$work_root/pre-reboot-complete
@@ -88,12 +88,17 @@ trap on_exit EXIT HUP INT TERM
 record_step() {
     step=$1
     shift
+    current_acceptance_step=$step
     printf 'BEGIN %s\n' "$step" >> "$raw_log"
-    if "$@" >> "$raw_log" 2>&1; then
-        step_status=0
-    else
-        step_status=$?
-    fi
+    set +e
+    (
+        set -e
+        fault_checkpoint early
+        "$@"
+        fault_checkpoint late
+    ) >> "$raw_log" 2>&1
+    step_status=$?
+    set -e
     if test "$step_status" -eq 0; then
         printf '%s\tPASS\n' "$step" >> "$milestones"
         printf 'PASS %s\n' "$step" >> "$raw_log"
@@ -104,11 +109,76 @@ record_step() {
     return "$step_status"
 }
 
+fault_checkpoint() {
+    position=$1
+    if test "${CAR_GO_CLEAN_ACCEPTANCE_FAULT-}" = \
+        "$current_acceptance_step:$position"; then
+        echo "injected acceptance failure: $current_acceptance_step:$position" >&2
+        return 97
+    fi
+}
+
 required_file() {
-    test -f "$artifact_dir/$1" || {
+    test -f "$artifact_dir/$1" && test ! -L "$artifact_dir/$1" || {
         echo "required copied artifact is missing: $1" >&2
         return 1
     }
+}
+
+verify_artifact_set() {
+    python3 - "$artifact_dir" <<'PY'
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected = {
+    "acceptance.sh",
+    "car-go-clean-installer.sh",
+    "car-go-clean-upgrade.sh",
+    "car-go-clean-shell-assets.sha256",
+    "car-go-clean.rb",
+    "car-go-clean-aarch64-apple-darwin.tar.xz",
+    "car-go-clean-aarch64-apple-darwin.tar.xz.sha256",
+    "car-go-clean-aarch64-unknown-linux-musl.tar.xz",
+    "car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256",
+    "car-go-clean-v0.2.0-aarch64-apple-darwin",
+    "car-go-clean-v0.3.0-aarch64-apple-darwin",
+    "car-go-clean-v0.2.0-aarch64-unknown-linux-musl",
+    "car-go-clean-v0.3.0-aarch64-unknown-linux-musl",
+    "rustup-init-aarch64-apple-darwin",
+    "rustup-init-aarch64-apple-darwin.sha256",
+    "rustup-init-aarch64-unknown-linux-gnu",
+    "rustup-init-aarch64-unknown-linux-gnu.sha256",
+}
+actual = set()
+for entry in os.scandir(root):
+    mode = entry.stat(follow_symlinks=False).st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise SystemExit(f"artifact is not a regular non-symlink file: {entry.name}")
+    actual.add(entry.name)
+if actual != expected | {"SHA256SUMS"}:
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected - {"SHA256SUMS"})
+    raise SystemExit(f"artifact set mismatch; missing={missing}, extra={extra}")
+
+manifest = root / "SHA256SUMS"
+seen = {}
+for line_number, line in enumerate(manifest.read_text().splitlines(), 1):
+    match = re.fullmatch(r"([0-9a-f]{64}) [ *]([^\r\n/]+)", line)
+    if not match or match.group(2) in seen:
+        raise SystemExit(f"malformed, nested, or duplicate SHA256SUMS line {line_number}")
+    seen[match.group(2)] = match.group(1)
+if set(seen) != expected:
+    raise SystemExit("SHA256SUMS names do not equal the closed artifact allowlist")
+for name, expected_hash in seen.items():
+    digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+    if digest != expected_hash:
+        raise SystemExit(f"SHA256 mismatch for {name}")
+PY
 }
 
 assert_output_has() {
@@ -180,6 +250,7 @@ step_shell_install() {
         --version "$version" \
         --install-dir "$work_root/shell/bin" \
         --download-base-url "file://$artifact_dir"
+    fault_checkpoint middle
     test -x "$shell_binary"
     test "$("$shell_binary" version)" = "$version"
 }
@@ -233,6 +304,7 @@ else:
         raise SystemExit("formula did not contain exactly one CarGoClean class")
 pathlib.Path(destination).write_text(text)
 PY
+    fault_checkpoint middle
     case "$platform" in
         Darwin)
             command -v brew >/dev/null 2>&1 || {
@@ -247,11 +319,7 @@ PY
             brew uninstall --force car-go-clean
             ;;
         Linux)
-            command -v ruby >/dev/null 2>&1 || {
-                echo "Ruby is required to validate the local formula on Linux" >&2
-                return 1
-            }
-            ruby -c "$local_formula"
+            echo "Linux guest: Homebrew formula execution is not applicable; hosted smoke evidence is aggregate-bound."
             grep -F -- "sha256" "$local_formula" >/dev/null
             ;;
     esac
@@ -262,6 +330,7 @@ step_version_health() {
     mkdir -p "$empty_root"
     write_config "$empty_root"
     test "$("$shell_binary" version)" = "$version"
+    fault_checkpoint middle
     health_output=$("$shell_binary" health --skip-cargo \
         --config "$config" --state-dir "$state_dir")
     assert_output_has "$health_output" "Cleanup authority"
@@ -276,6 +345,7 @@ step_disposable_build() {
     }
     mkdir -p "$project_root"
     cargo new "$project_root/sample"
+    fault_checkpoint middle
     cargo build --manifest-path "$project_root/sample/Cargo.toml"
     sleep 1
     test -d "$project_root/sample/target"
@@ -287,6 +357,7 @@ step_dry_run() {
     capture_status "$preview" "$shell_binary" run --dry-run --all \
         --config "$config" --state-dir "$state_dir"
     test "$captured_status" -eq 0
+    fault_checkpoint middle
     review_ids=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$preview")
     test "$(printf '%s\n' "$review_ids" | awk 'NF { count++ } END { print count + 0 }')" -eq 1
     review_id=$review_ids
@@ -303,6 +374,7 @@ step_review() {
     capture_status "$reviewed" "$shell_binary" run --review "$review_id" --json \
         --config "$config" --state-dir "$state_dir"
     test "$captured_status" -eq 0
+    fault_checkpoint middle
     test ! -d "$project_root/sample/target"
     python3 - "$reviewed" "$review_id" <<'PY'
 import json
@@ -337,15 +409,33 @@ PY
 }
 
 step_no_scan() {
-    cargo build --manifest-path "$project_root/sample/Cargo.toml"
+    no_scan_root=$work_root/no-scan
+    cargo new "$no_scan_root/project"
+    cargo build --manifest-path "$no_scan_root/project/Cargo.toml"
     sleep 1
+    write_config "$no_scan_root"
+    seeded=$work_root/no-scan-seeded.out
+    "$shell_binary" run --dry-run --all \
+        --config "$config" --state-dir "$state_dir" > "$seeded"
+    grep -F -- "Cleanable: $no_scan_root/project" "$seeded" >/dev/null
+    seeded_bytes=$(sed -n 's/^Candidate bytes: \([0-9][0-9]*\)$/\1/p' "$seeded")
+    test -n "$seeded_bytes" && test "$seeded_bytes" -gt 0
+    fault_checkpoint middle
+
+    # Do not touch the project or target between discovery and cache-only use:
+    # the persisted identities must remain unchanged.
     output=$work_root/no-scan.out
     capture_status "$output" "$shell_binary" run --dry-run --no-scan --all \
         --config "$config" --state-dir "$state_dir"
     test "$captured_status" -eq 0
-    grep -F -- "$project_root/sample" "$output" >/dev/null
-    grep -E '^Review ID: [0-9]+$' "$output" >/dev/null
-    test -d "$project_root/sample/target"
+    grep -F -- "Cleanable: $no_scan_root/project" "$output" >/dev/null
+    candidate_bytes=$(sed -n 's/^Candidate bytes: \([0-9][0-9]*\)$/\1/p' "$output")
+    test -n "$candidate_bytes" && test "$candidate_bytes" -gt 0
+    review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$output")
+    test -n "$review"
+    "$shell_binary" run --review "$review" \
+        --config "$config" --state-dir "$state_dir"
+    test ! -d "$no_scan_root/project/target"
 }
 
 step_narrowed_scope() {
@@ -370,11 +460,30 @@ step_narrowed_scope() {
         "$work_root/narrow-broad-preview.out" >/dev/null
 
     write_config "$scope"
+    fault_checkpoint middle
     output=$work_root/narrow-preview.out
+    capture_status "$output" "$shell_binary" run --dry-run --no-scan --all \
+        --config "$config" --state-dir "$state_dir"
+    test "$captured_status" -eq 2
+    grep -F -- \
+        "No review ID was created because no valid matching discovery generation exists." \
+        "$output" >/dev/null
+    if grep -E '^Review ID: [0-9]+$' "$output" >/dev/null; then
+        echo "narrowed cache-only policy unexpectedly created cleanup authority" >&2
+        return 1
+    fi
+    printf 'skipped:out_of_scope cached target=%s (policy generation rejected)\n' \
+        "$outside/sentinel-project"
+    narrowed_scan=$work_root/narrow-authorized-preview.out
     "$shell_binary" run --dry-run --all \
-        --config "$config" --state-dir "$state_dir" > "$output"
-    review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$output")
+        --config "$config" --state-dir "$state_dir" > "$narrowed_scan"
+    review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$narrowed_scan")
     test -n "$review"
+    grep -F -- "Cleanable: $scope/project" "$narrowed_scan" >/dev/null
+    if grep -F -- "$outside/sentinel-project" "$narrowed_scan" >/dev/null; then
+        echo "normal narrowed scan reauthorized the outside cached target" >&2
+        return 1
+    fi
     "$shell_binary" run --review "$review" \
         --config "$config" --state-dir "$state_dir"
     test ! -d "$scope/project/target"
@@ -383,32 +492,45 @@ step_narrowed_scope() {
 
 step_cargo_failure() {
     failure_root=$work_root/cargo-failure
-    cargo new "$failure_root/project"
-    cargo build --manifest-path "$failure_root/project/Cargo.toml"
-    sleep 1
-    write_config "$failure_root"
-    preview=$work_root/cargo-failure-preview.out
-    "$shell_binary" run --dry-run --all \
-        --config "$config" --state-dir "$state_dir" > "$preview"
-    review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$preview")
-    test -n "$review"
+    failure_home=$failure_root/home
+    fail_bin=$failure_home/.cargo/bin
+    clean_marker=$failure_root/clean-shim-hit
+    delegate_marker=$failure_root/non-clean-delegated
     real_cargo=$(command -v cargo)
-    fail_bin=$work_root/failing-cargo-bin
     mkdir -p "$fail_bin"
     cat > "$fail_bin/cargo" <<EOF
 #!/bin/sh
 if test "\${1-}" = clean; then
+    : > "$clean_marker"
     echo "intentional acceptance Cargo failure" >&2
     exit 42
 fi
+: > "$delegate_marker"
 exec "$real_cargo" "\$@"
 EOF
     chmod +x "$fail_bin/cargo"
+    env HOME="$failure_home" PATH="$fail_bin:$original_path" \
+        cargo new "$failure_root/project"
+    env HOME="$failure_home" PATH="$fail_bin:$original_path" \
+        cargo build --manifest-path "$failure_root/project/Cargo.toml"
+    test -f "$delegate_marker"
+    sleep 1
+    write_config "$failure_root"
+    preview=$work_root/cargo-failure-preview.out
+    env HOME="$failure_home" PATH="$fail_bin:$original_path" \
+        "$shell_binary" run --dry-run --all \
+        --config "$config" --state-dir "$state_dir" > "$preview"
+    review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$preview")
+    test -n "$review"
+    fault_checkpoint middle
     output=$work_root/cargo-failure-run.out
-    capture_status "$output" env PATH="$fail_bin:$original_path" \
+    capture_status "$output" env HOME="$failure_home" \
+        PATH="$fail_bin:$original_path" \
         "$shell_binary" run --review "$review" \
         --config "$config" --state-dir "$state_dir"
     test "$captured_status" -eq 1
+    test -f "$clean_marker"
+    test -f "$delegate_marker"
     test -d "$failure_root/project/target"
     errors=$work_root/cargo-errors.json
     "$shell_binary" logs --errors-only --json --state-dir "$state_dir" > "$errors"
@@ -424,6 +546,7 @@ step_incomplete_scan() {
     capture_status "$output" "$shell_binary" run --dry-run --all \
         --config "$config" --state-dir "$state_dir"
     chmod 700 "$incomplete_root/denied"
+    fault_checkpoint middle
     cat "$output"
     test "$captured_status" -eq 2
     grep -E '^Review ID: [0-9]+$' "$output" >/dev/null
@@ -437,6 +560,7 @@ step_complete_scan() {
     output=$work_root/complete.out
     capture_status "$output" "$shell_binary" scan \
         --config "$config" --state-dir "$state_dir"
+    fault_checkpoint middle
     test "$captured_status" -eq 0
 }
 
@@ -449,6 +573,7 @@ step_strict_config() {
     unset CAR_GO_CLEAN_ACCEPTANCE_UNDEFINED 2>/dev/null || :
     capture_status "$work_root/typo.out" "$shell_binary" config --config "$typo"
     test "$captured_status" -eq 1
+    fault_checkpoint middle
     grep -E 'unknown field|unknown key' "$work_root/typo.out" >/dev/null
     capture_status "$work_root/undefined.out" "$shell_binary" config --config "$undefined"
     test "$captured_status" -eq 1
@@ -462,6 +587,7 @@ step_migration_roundtrip() {
         "$work_root/complete" > "$legacy"
     capture_status "$work_root/legacy.out" "$shell_binary" config --config "$legacy"
     test "$captured_status" -eq 0
+    fault_checkpoint middle
     grep -F -- 'deprecated' "$work_root/legacy.out" >/dev/null
     "$shell_binary" config migrate --config "$legacy" > "$work_root/migrate.out"
     grep -F -- 'override_excludes' "$legacy" >/dev/null
@@ -480,6 +606,7 @@ step_service_pre_reboot() {
     printf 'retain-state\n' > "$state_dir/retention-marker"
     assert_service_state "$shell_binary" no no no
     "$shell_binary" service install
+    fault_checkpoint middle
     assert_service_state "$shell_binary" yes yes yes
     "$shell_binary" service stop
     assert_service_state "$shell_binary" yes no no
@@ -490,6 +617,7 @@ step_service_post_reboot() {
     test -f "$session_marker"
     assert_service_state "$shell_binary" yes no no
     "$shell_binary" service start
+    fault_checkpoint middle
     assert_service_state "$shell_binary" yes yes yes
     "$shell_binary" service uninstall
     assert_service_state "$shell_binary" no no no
@@ -506,6 +634,14 @@ native_stop_old_service() {
             systemctl --user stop car-go-clean.service
             ;;
     esac
+}
+
+native_enable_old_service_fixture() {
+    if test "$platform" = Darwin; then
+        label=gui/$(id -u)/com.dcchuck.car-go-clean
+        echo "Fixture setup: launchctl enable $label"
+        launchctl enable "$label"
+    fi
 }
 
 step_upgrade_matrix() {
@@ -538,9 +674,11 @@ step_upgrade_matrix() {
             "$shell_binary" service uninstall >/dev/null 2>&1 || :
             case "$old_state" in
                 active)
+                    native_enable_old_service_fixture
                     "$case_dir/bin/car-go-clean" service install
                     ;;
                 stopped)
+                    native_enable_old_service_fixture
                     "$case_dir/bin/car-go-clean" service install
                     native_stop_old_service
                     ;;
@@ -582,6 +720,7 @@ EOF
                 > "$case_dir/preview.out" 2>&1
             review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$case_dir/preview.out")
             test -n "$review"
+            fault_checkpoint middle
             PATH="$case_dir/curl-bin:$case_dir/bin:$upgrade_path" \
                 "$upgrade" --version "$version" --method shell \
                 --execute-review "$review" > "$case_dir/execute.out" 2>&1
@@ -602,6 +741,7 @@ EOF
 
 step_macos_library_privacy() {
     if test "$platform" != Darwin; then
+        fault_checkpoint middle
         echo "Linux guest: macOS Library/TCC assertion is not applicable."
         return 0
     fi
@@ -619,6 +759,7 @@ step_macos_library_privacy() {
         XDG_STATE_HOME="$privacy_state" "$shell_binary" run --dry-run --all \
         --state-dir "$privacy_state"
     chmod 700 "$denied"
+    fault_checkpoint middle
     test "$captured_status" -eq 2
     grep -E 'Permission denied|Operation not permitted' "$output" >/dev/null
     test -f "$library_project/target/SENTINEL"
@@ -627,6 +768,8 @@ step_macos_library_privacy() {
         return 1
     fi
 }
+
+verify_artifact_set
 
 if test "$phase" = pre-reboot; then
     rm -rf "$work_root"

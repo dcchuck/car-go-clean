@@ -54,13 +54,21 @@ fi
 test "${CAR_GO_CLEAN_TART_DELETE_ALL-}" = YES ||
     die "refusing deletion; set CAR_GO_CLEAN_TART_DELETE_ALL=YES after reviewing the concrete inventory above"
 
-tart_home=${CAR_GO_CLEAN_TART_HOME:-"$HOME/.tart"}
+# CAR_GO_CLEAN_TART_HOME exists only for isolated harness tests. Normal
+# operation follows Tart's supported TART_HOME, then Tart's default.
+tart_home=${CAR_GO_CLEAN_TART_HOME:-${TART_HOME:-"$HOME/.tart"}}
+df_target=$tart_home
+while test ! -e "$df_target"; do
+    parent=$(dirname "$df_target")
+    test "$parent" != "$df_target" || break
+    df_target=$parent
+done
 if test -e "$tart_home"; then
     before_bytes=$(du -sk "$tart_home" | awk '{ print $1 * 1024 }')
 else
     before_bytes=0
 fi
-before_available_kib=$(df -Pk "$(dirname "$inventory")" | awk 'NR == 2 { print $4 }')
+before_available_kib=$(df -Pk "$df_target" | awk 'NR == 2 { print $4 }')
 
 while IFS='	' read -r name state source_reference source_digest; do
     test -n "$name" || continue
@@ -99,7 +107,7 @@ if test -e "$tart_home"; then
 else
     after_bytes=0
 fi
-after_available_kib=$(df -Pk "$(dirname "$inventory")" | awk 'NR == 2 { print $4 }')
+after_available_kib=$(df -Pk "$df_target" | awk 'NR == 2 { print $4 }')
 case "$before_bytes:$after_bytes" in
     *[!0-9:]*) reclaimed_bytes=unknown ;;
     *)

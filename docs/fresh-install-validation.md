@@ -181,10 +181,14 @@ policy and discovery generation and never bypasses any cleanup gate.
 ## Fresh Tart release acceptance
 
 The executable release harness turns the checks above into a two-guest,
-pre-tag acceptance run. It is intentionally strict: it has no default VM
-images, does not accept tags, and does not download release artifacts. Supply
-one Apple Silicon macOS image and one Apple Silicon Linux image as complete
-immutable GHCR references:
+pre-tag acceptance run. It accepts neither tags nor an open artifact
+directory. Start from the exact clean checkout and the downloaded aggregate
+artifact produced by that commit's successful `rehearse-release` workflow.
+The aggregate directory must contain `aggregate-status.txt`,
+`aggregate-inventory.json`, and the workflow's `jobs/` evidence.
+
+Supply Apple Silicon macOS and Linux base images as complete immutable GHCR
+references:
 
 ```sh
 export CAR_GO_CLEAN_TART_MACOS_IMAGE='ghcr.io/cirruslabs/macos-sequoia-base@sha256:<64-lowercase-hex>'
@@ -196,44 +200,94 @@ export CAR_GO_CLEAN_ACCEPTANCE_SHA="$(git rev-parse HEAD)"
 Replace each digest placeholder with the resolved digest for the image being
 accepted. A movable `:latest` or other tag is rejected even when Tart could
 resolve it. `CAR_GO_CLEAN_ACCEPTANCE_SHA` must be the exact 40-character Git
-commit whose artifacts are under test.
+commit whose artifacts are under test. The harness runs
+`scripts/validate-release-inputs.sh` before pulling a VM, so HEAD must equal
+that commit, the checkout must be clean and contained by `origin/main`, and
+the version/tag preconditions must still hold.
 
-Prepare one artifact directory copied from the exact-SHA rehearsal. It must
-contain `SHA256SUMS` with safe relative paths and hashes for every supplied
-file. For each guest architecture the acceptance steps require:
+The bases do not need Rust preinstalled. macOS must provide Python 3,
+Homebrew at `/opt/homebrew/bin/brew`, and a working user launchd domain.
+Linux must provide Python 3, `cc`, and a working user systemd manager. The
+harness installs the exact Rust/Cargo 1.95.0 minimal profile inside each
+disposable clone and uses an explicit non-login PATH. It does not run
+`apt-get` or `brew install`; a missing base prerequisite fails before guest
+acceptance.
+
+Prepare one closed artifact directory. Excluding `SHA256SUMS`, it must contain
+exactly these 17 regular, non-symlink files at the top level:
 
 ```text
+acceptance.sh
 car-go-clean-installer.sh
 car-go-clean-upgrade.sh
 car-go-clean-shell-assets.sha256
 car-go-clean.rb
-car-go-clean-<target>.tar.xz
-car-go-clean-<target>.tar.xz.sha256
-car-go-clean-v0.2.0-<target>
-car-go-clean-v0.3.0-<target>
+car-go-clean-aarch64-apple-darwin.tar.xz
+car-go-clean-aarch64-apple-darwin.tar.xz.sha256
+car-go-clean-aarch64-unknown-linux-musl.tar.xz
+car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256
+car-go-clean-v0.2.0-aarch64-apple-darwin
+car-go-clean-v0.3.0-aarch64-apple-darwin
+car-go-clean-v0.2.0-aarch64-unknown-linux-musl
+car-go-clean-v0.3.0-aarch64-unknown-linux-musl
+rustup-init-aarch64-apple-darwin
+rustup-init-aarch64-apple-darwin.sha256
+rustup-init-aarch64-unknown-linux-gnu
+rustup-init-aarch64-unknown-linux-gnu.sha256
 ```
 
-Here `<target>` is `aarch64-apple-darwin` or
-`aarch64-unknown-linux-musl`. The two old-version files are executable,
-faithfully built fixtures from the exact v0.2.0 and v0.3.0 tags; include their
-hashes in `SHA256SUMS`. The formula is the exact locally rendered v0.4.0
-formula. In the guest copy, the harness replaces exactly the current target's
-v0.4.0 URL with the copied archive's `file://` URL and inserts an explicit
-`version "0.4.0"`. macOS installs and tests that formula; Linux checks its Ruby
-syntax while the shell installer is exercised on both guests.
+Fetch each rustup binary and its publisher proof without rewriting the proof:
+
+```sh
+for target in aarch64-apple-darwin aarch64-unknown-linux-gnu
+do
+  url="https://static.rust-lang.org/rustup/dist/$target/rustup-init"
+  curl --proto '=https' --tlsv1.2 -fsSLo \
+    "/absolute/path/to/rehearsal-artifacts/rustup-init-$target" "$url"
+  curl --proto '=https' --tlsv1.2 -fsSLo \
+    "/absolute/path/to/rehearsal-artifacts/rustup-init-$target.sha256" \
+    "$url.sha256"
+done
+```
+
+Each publisher proof still names `rustup-init`; the harness compares that
+digest with the corresponding renamed binary, then also requires both files
+in the outer `SHA256SUMS`. That outer manifest must name every one of the 17
+files exactly once and no others. Subdirectories, symlinks, nested names,
+unlisted files, missing entries, and hash mismatches are rejected before a VM
+pull.
+
+`acceptance.sh`, the installer, and the upgrade helper must be byte-identical
+to the exact checkout. The shell-asset proof must agree with the outer
+manifest. The formula must be the deterministic render of the exact checkout
+template using the four archive hashes in the exact-SHA build/smoke evidence.
+The two local ARM archive hashes must also equal their aggregate hashes. Every
+required validate, build, smoke, hosted-runner, and tap outcome must be the
+expected success (with only the documented Apple
+`linux_dependencies=skipped` exception).
+
+The four old-version fixtures are provenance-sensitive inputs, not convenient
+stand-ins. Extract the exact target binaries from the published v0.2.0 and
+v0.3.0 release archives, or reproducibly build the corresponding exact tags.
+Record each tag/commit, published archive URL, published archive checksum, and
+the extracted binary's outer-manifest hash in the Task 8 readiness evidence.
+Never substitute the current v0.4 binary, a wrapper, or a fake implementation:
+the matrix exists to exercise the real old service and upgrade behavior.
 
 Run from the repository checkout:
 
 ```sh
 scripts/release/tart-rehearsal.sh \
   /absolute/path/to/rehearsal-artifacts \
+  /absolute/path/to/aggregate-rehearsal-evidence \
   /absolute/path/to/release-evidence/tart
 ```
 
-The orchestrator verifies `SHA256SUMS` on the host and again inside each
-guest, explicitly pulls each immutable image, creates a fresh unique clone,
-and copies only the supplied artifacts plus `acceptance.sh`. The documented
-Tart images use the `admin` user and password; override
+The output evidence path must not already exist. The orchestrator verifies the
+closed input set on the host and again inside each guest, explicitly pulls
+each immutable image, creates a fresh unique clone, and copies only the
+manifest-bound directory. The documented Tart images use the `admin` user and
+password; override
 `CAR_GO_CLEAN_TART_SSH_USER` or `CAR_GO_CLEAN_TART_SSH_PASSWORD` only for an
 equivalent private image.
 
@@ -245,13 +299,19 @@ incomplete exit `2`, complete exit `0`, strict config failures, migration and
 round trip, service lifecycle and retention, all v0.2/v0.3 ×
 active/stopped/absent upgrades, and macOS Library/privacy behavior. Service
 stop is completed in the pre-reboot phase. The host then issues an actual
-guest reboot and the post-reboot phase proves the service stayed disabled
-before start and uninstall.
+guest reboot. It copies the complete pre-reboot transcript and milestones
+before issuing that reboot, records the Linux boot ID or macOS boot time on
+both sides, and requires the identity to change before post-reboot acceptance.
+The post-reboot phase proves the service stayed disabled before start and
+uninstall. Pre- and post-reboot transcripts are separate files.
 
 No acceptance failure deletes a VM. Sanitized transcripts and host-side
-launch/SSH/hash logs are copied to the evidence directory before the
-orchestrator returns. The evidence `source-map.tsv` binds each fresh clone to
-the exact image reference and digest.
+launch, SSH, hash, normalized tool-version, and boot-identity evidence are
+copied before the orchestrator returns. Rustup's raw bootstrap chatter is not
+preserved on success; a failure diagnostic replaces the guest home with
+`$HOME`. The evidence `source-map.tsv` binds each fresh clone to the exact
+image reference and digest, and `verified-input-bindings.tsv` binds SHA,
+version, aggregate readiness, every artifact hash, and the rustup source URLs.
 
 ## Tart inventory and irreversible cleanup
 
@@ -272,7 +332,9 @@ name<TAB>state<TAB>source_reference<TAB>source_digest
 VMs not created by this rehearsal are printed as `UNKNOWN_SOURCE` and
 `UNKNOWN_DIGEST`. Treat those rows as unrecoverable unless you separately know
 their provenance. Comment rows record Tart storage bytes and host `df`
-capacity.
+capacity. Both measurements follow Tart's supported `TART_HOME` when it is
+set, otherwise `$HOME/.tart`. `CAR_GO_CLEAN_TART_HOME` is reserved for the
+isolated test harness and takes precedence only when explicitly supplied.
 
 Cleanup prints that exact concrete inventory before doing anything and is
 inert without the literal confirmation:

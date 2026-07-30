@@ -103,13 +103,21 @@ for item in sorted(items, key=lambda value: value.get("Name", "")):
     print(name, state, reference, digest, sep="\t")
 PY
 
-tart_home=${CAR_GO_CLEAN_TART_HOME:-"$HOME/.tart"}
+# CAR_GO_CLEAN_TART_HOME exists only for isolated harness tests. Normal
+# operation follows Tart's supported TART_HOME, then Tart's default.
+tart_home=${CAR_GO_CLEAN_TART_HOME:-${TART_HOME:-"$HOME/.tart"}}
 if test -e "$tart_home"; then
     tart_storage_bytes=$(du -sk "$tart_home" | awk '{ print $1 * 1024 }')
 else
     tart_storage_bytes=0
 fi
-host_df=$(df -Pk "$inventory_parent" | awk 'NR == 2 {
+df_target=$tart_home
+while test ! -e "$df_target"; do
+    parent=$(dirname "$df_target")
+    test "$parent" != "$df_target" || break
+    df_target=$parent
+done
+host_df=$(df -Pk "$df_target" | awk 'NR == 2 {
     printf "%s,total_kib=%s,used_kib=%s,available_kib=%s,capacity=%s,mounted=%s",
         $1, $2, $3, $4, $5, $6
 }')
