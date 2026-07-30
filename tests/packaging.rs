@@ -129,6 +129,159 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[cfg(unix)]
+fn fake_systemctl_body() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+printf 'systemctl %s\n' "$*" >> "${SERVICE_CALL_LOG:-/dev/null}"
+case "$*" in
+  "--user show-environment")
+    printf 'HOME=%s\n' "$HOME"
+    ;;
+  "--user is-enabled car-go-clean.service")
+    if test -e "$SERVICE_STATE_DIR/enabled"
+    then
+      printf 'enabled\n'
+    else
+      printf 'disabled\n'
+      exit 1
+    fi
+    ;;
+  "--user is-active car-go-clean.service")
+    if test -e "$SERVICE_STATE_DIR/active"
+    then
+      printf 'active\n'
+    else
+      printf 'inactive\n'
+      exit 3
+    fi
+    ;;
+  "--user daemon-reload") ;;
+  "--user enable --now car-go-clean.service")
+    : > "$SERVICE_STATE_DIR/enabled"
+    : > "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user disable --now car-go-clean.service")
+    rm -f "$SERVICE_STATE_DIR/enabled" "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user restart car-go-clean.service")
+    : > "$SERVICE_STATE_DIR/active"
+    ;;
+  "--user stop car-go-clean.service")
+    rm -f "$SERVICE_STATE_DIR/active"
+    ;;
+  *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#
+}
+
+#[cfg(unix)]
+fn fake_launchctl_body() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+printf 'launchctl %s\n' "$*" >> "${SERVICE_CALL_LOG:-/dev/null}"
+case "$1" in
+  print-disabled)
+    if test -e "$SERVICE_STATE_DIR/disabled"
+    then
+      printf 'disabled services = {\n  "com.dcchuck.car-go-clean" => true\n}\n'
+    else
+      printf 'disabled services = {\n}\n'
+    fi
+    ;;
+  print)
+    test -e "$SERVICE_STATE_DIR/active" || {
+      printf 'Could not find specified service\n' >&2
+      exit 113
+    }
+    ;;
+  enable) rm -f "$SERVICE_STATE_DIR/disabled" ;;
+  disable) : > "$SERVICE_STATE_DIR/disabled" ;;
+  bootstrap|kickstart) : > "$SERVICE_STATE_DIR/active" ;;
+  bootout) rm -f "$SERVICE_STATE_DIR/active" ;;
+  *) printf 'unexpected launchctl command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#
+}
+
+fn shell_blocks_in_numbered_section(markdown: &str, section: u8, next_section: u8) -> String {
+    let section_prefix = format!("## {section}.");
+    let next_prefix = format!("## {next_section}.");
+    let mut in_section = false;
+    let mut in_shell_block = false;
+    let mut found_section = false;
+    let mut found_next_section = false;
+    let mut block_count = 0;
+    let mut script = String::new();
+
+    for line in markdown.lines() {
+        if !in_section && line.starts_with(&section_prefix) {
+            in_section = true;
+            found_section = true;
+            continue;
+        }
+        if in_section && !in_shell_block && line.starts_with(&next_prefix) {
+            found_next_section = true;
+            break;
+        }
+        if !in_section {
+            continue;
+        }
+        if in_shell_block {
+            if line.trim() == "```" {
+                in_shell_block = false;
+                block_count += 1;
+                script.push('\n');
+            } else {
+                script.push_str(line);
+                script.push('\n');
+            }
+        } else if line.trim() == "```sh" {
+            in_shell_block = true;
+        }
+    }
+
+    assert!(found_section, "missing numbered section {section}");
+    assert!(
+        found_next_section,
+        "missing numbered section {next_section} after section {section}"
+    );
+    assert!(
+        !in_shell_block,
+        "unterminated sh fence in section {section}"
+    );
+    assert!(block_count > 0, "section {section} has no sh fences");
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_systemctl_supports_the_linux_install_preflight() {
+    let work = tempdir().unwrap();
+    let state = work.path().join("service-state");
+    let systemctl = work.path().join("systemctl");
+    fs::create_dir_all(&state).unwrap();
+    write_executable(&systemctl, fake_systemctl_body());
+
+    let output = Command::new(&systemctl)
+        .args(["--user", "show-environment"])
+        .env("HOME", "/home/walkthrough")
+        .env("SERVICE_STATE_DIR", &state)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Linux service install preflight failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("HOME=/home/walkthrough"),
+        "Linux service install preflight did not return the manager environment"
+    );
+}
+
 fn terminal_json(stdout: &[u8], command: &str) -> serde_json::Value {
     let report: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(stdout).lines().last().unwrap()).unwrap();
@@ -178,7 +331,7 @@ fn documented_subcommands_are_real_cli_entry_points() {
 
 #[cfg(unix)]
 #[test]
-fn documented_commands_execute() {
+fn documented_commands_hardcoded_semantics() {
     let _owner_tour = include_str!("../docs/v0.4-owner-tour.md");
     let work = tempdir().unwrap();
     let home = work.path().join("home");
@@ -212,75 +365,9 @@ fn documented_commands_execute() {
         ),
     );
     let (service_manager, service_manager_body) = if cfg!(target_os = "macos") {
-        (
-            "launchctl",
-            r#"#!/bin/sh
-set -eu
-case "$1" in
-  print-disabled)
-    if test -e "$SERVICE_STATE_DIR/disabled"
-    then
-      printf 'disabled services = {\n  "com.dcchuck.car-go-clean" => true\n}\n'
-    else
-      printf 'disabled services = {\n}\n'
-    fi
-    ;;
-  print)
-    test -e "$SERVICE_STATE_DIR/active" || {
-      printf 'Could not find specified service\n' >&2
-      exit 113
-    }
-    ;;
-  enable) rm -f "$SERVICE_STATE_DIR/disabled" ;;
-  disable) : > "$SERVICE_STATE_DIR/disabled" ;;
-  bootstrap|kickstart) : > "$SERVICE_STATE_DIR/active" ;;
-  bootout) rm -f "$SERVICE_STATE_DIR/active" ;;
-  *) printf 'unexpected launchctl command: %s\n' "$*" >&2; exit 64 ;;
-esac
-"#,
-        )
+        ("launchctl", fake_launchctl_body())
     } else {
-        (
-            "systemctl",
-            r#"#!/bin/sh
-set -eu
-case "$*" in
-  "--user is-enabled car-go-clean.service")
-    if test -e "$SERVICE_STATE_DIR/enabled"
-    then
-      printf 'enabled\n'
-    else
-      printf 'disabled\n'
-      exit 1
-    fi
-    ;;
-  "--user is-active car-go-clean.service")
-    if test -e "$SERVICE_STATE_DIR/active"
-    then
-      printf 'active\n'
-    else
-      printf 'inactive\n'
-      exit 3
-    fi
-    ;;
-  "--user daemon-reload") ;;
-  "--user enable --now car-go-clean.service")
-    : > "$SERVICE_STATE_DIR/enabled"
-    : > "$SERVICE_STATE_DIR/active"
-    ;;
-  "--user disable --now car-go-clean.service")
-    rm -f "$SERVICE_STATE_DIR/enabled" "$SERVICE_STATE_DIR/active"
-    ;;
-  "--user restart car-go-clean.service")
-    : > "$SERVICE_STATE_DIR/active"
-    ;;
-  "--user stop car-go-clean.service")
-    rm -f "$SERVICE_STATE_DIR/active"
-    ;;
-  *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 64 ;;
-esac
-"#,
-        )
+        ("systemctl", fake_systemctl_body())
     };
     write_executable(&bin.join(service_manager), service_manager_body);
     let mut path = bin.into_os_string();
@@ -614,6 +701,265 @@ esac
         .unwrap();
     assert_eq!(invalid_all.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&invalid_all.stderr).contains("--dry-run"));
+}
+
+#[cfg(unix)]
+#[test]
+fn documented_commands_execute() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempdir().unwrap();
+    let home = work.path().join("home");
+    let temp = work.path().join("tmp");
+    let bin = work.path().join("bin");
+    let cargo_bin = home.join(".cargo/bin");
+    let service_state = work.path().join("service-state");
+    let cargo_calls = work.path().join("cargo-calls");
+    let service_calls = work.path().join("service-calls");
+    for directory in [&home, &temp, &bin, &cargo_bin, &service_state] {
+        fs::create_dir_all(directory).unwrap();
+    }
+
+    write_executable(
+        &cargo_bin.join("cargo"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\t%s\n' "$0" "$*" >> "$CARGO_CALL_LOG"
+case "$1" in
+  --version) printf 'cargo 1.95.0\n' ;;
+  new)
+    shift
+    if test "${1:-}" = --quiet
+    then
+      shift
+    fi
+    test "$#" -eq 1
+    project=$1
+    mkdir -p "$project/src"
+    printf '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n' \
+      > "$project/Cargo.toml"
+    printf 'fn main() {}\n' > "$project/src/main.rs"
+    ;;
+  build)
+    shift
+    test "$#" -eq 2
+    test "$1" = --manifest-path
+    manifest=$2
+    project=${manifest%/Cargo.toml}
+    test -f "$project/Cargo.toml"
+    mkdir -p "$project/target"
+    dd if=/dev/zero of="$project/target/artifact" bs=4096 count=1 2>/dev/null
+    ;;
+  clean)
+    shift
+    test "$#" -eq 2
+    test "$1" = --target-dir
+    rm -rf "$2"
+    ;;
+  *) printf 'unexpected cargo command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+    );
+    let (service_manager, service_manager_body) = if cfg!(target_os = "macos") {
+        ("launchctl", fake_launchctl_body())
+    } else {
+        ("systemctl", fake_systemctl_body())
+    };
+    write_executable(&bin.join(service_manager), service_manager_body);
+    symlink(
+        Path::new(env!("CARGO_BIN_EXE_car-go-clean")),
+        bin.join("car-go-clean"),
+    )
+    .unwrap();
+
+    let script =
+        shell_blocks_in_numbered_section(include_str!("../docs/v0.4-owner-tour.md"), 13, 14);
+    let script_path = work.path().join("guided-lab.sh");
+    fs::write(&script_path, script).unwrap();
+    let path = std::env::join_paths([
+        cargo_bin.as_path(),
+        bin.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
+    let output = Command::new("/bin/sh")
+        .args(["-eu"])
+        .arg(&script_path)
+        .env("HOME", &home)
+        .env("TMPDIR", &temp)
+        .env("CARGO_HOME", home.join(".cargo"))
+        .env("RUSTUP_HOME", home.join(".rustup"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", &path)
+        .env("CARGO_CALL_LOG", &cargo_calls)
+        .env("SERVICE_CALL_LOG", &service_calls)
+        .env("SERVICE_STATE_DIR", &service_state)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Section 13 shell failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lab_roots = fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("car-go-clean-tour."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lab_roots.len(),
+        1,
+        "guided lab did not create exactly one isolated root"
+    );
+    let project = lab_roots[0].join("sample");
+    let target = project.join("target");
+    assert!(
+        target.is_dir(),
+        "cached-only dry run did not preserve the final rebuilt target"
+    );
+    assert!(
+        lab_roots[0].join("state/state.db").is_file(),
+        "guided lab did not persist isolated state"
+    );
+    let canonical_project = fs::canonicalize(&project).unwrap();
+    let canonical_target = fs::canonicalize(&target).unwrap();
+
+    let cargo_binary = cargo_bin.join("cargo");
+    let cargo_calls = fs::read_to_string(&cargo_calls).unwrap();
+    let cargo_invocations = cargo_calls
+        .lines()
+        .map(|line| line.split_once('\t').expect("malformed Cargo call log"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cargo_invocations.len(),
+        6,
+        "guided lab executed an unexpected Cargo command count"
+    );
+    assert!(
+        cargo_invocations
+            .iter()
+            .all(|(program, _)| Path::new(program) == cargo_binary),
+        "a documented command escaped the isolated HOME Cargo binary: {cargo_calls}"
+    );
+    assert_eq!(
+        cargo_invocations
+            .iter()
+            .filter(|(_, args)| args.starts_with("new "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        cargo_invocations
+            .iter()
+            .filter(|(_, args)| args.starts_with("build "))
+            .count(),
+        3
+    );
+    let clean_command = format!("clean --target-dir {}", canonical_target.display());
+    assert_eq!(
+        cargo_invocations
+            .iter()
+            .filter(|(_, args)| *args == clean_command)
+            .count(),
+        2,
+        "reviewed and dynamic paths did not each clean exactly once"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.lines().any(|line| line == env!("CARGO_PKG_VERSION")),
+        "guided lab did not execute the real binary's version command"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("Review ID: ")),
+        "documented preview did not produce a review ID"
+    );
+    let json = stdout
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let target_events = json
+        .iter()
+        .filter(|value| value["event"] == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(target_events.len(), 1);
+    assert_eq!(
+        target_events[0]["data"]["project"].as_str(),
+        Some(canonical_project.to_str().unwrap())
+    );
+    let reports = json
+        .iter()
+        .filter(|value| value["command"].is_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report["command"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["run", "status", "stats", "logs", "scan", "projects", "run"]
+    );
+    assert_eq!(reports[0]["format_version"], 1);
+    assert_eq!(reports[0]["outcome"]["code"], 0);
+    assert!(reports[0]["review_id"].as_i64().is_some_and(|id| id > 0));
+    assert_eq!(reports[0]["data"]["cleaned"], 1);
+    assert_eq!(reports[0]["data"]["bytes_recovered"], 4_096);
+    assert_eq!(reports[2]["data"]["total_bytes"], 4_096);
+    assert_eq!(reports[2]["data"]["failed_clean_attempts"], 0);
+    assert_eq!(reports[3]["data"]["errors"].as_array().unwrap().len(), 0);
+    assert_eq!(reports[6]["outcome"]["code"], 0);
+    assert_eq!(reports[6]["data"]["summary"]["cleanable_projects"], 1);
+
+    let installed = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("  Installed: "))
+        .collect::<Vec<_>>();
+    let enabled = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("  Enabled: "))
+        .collect::<Vec<_>>();
+    let running = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("  Running: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        installed,
+        ["no", "yes", "yes", "yes", "yes", "yes", "no", "no"]
+    );
+    assert_eq!(
+        enabled,
+        ["no", "yes", "yes", "no", "yes", "yes", "no", "no"]
+    );
+    assert_eq!(
+        running,
+        ["no", "yes", "yes", "no", "yes", "yes", "no", "no"]
+    );
+    let definition = if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist")
+    } else {
+        home.join(".config/systemd/user/car-go-clean.service")
+    };
+    assert!(
+        !definition.exists(),
+        "service uninstall left the isolated definition behind"
+    );
+    let service_calls = fs::read_to_string(service_calls).unwrap();
+    if cfg!(target_os = "linux") {
+        assert!(
+            service_calls.contains("systemctl --user show-environment"),
+            "Linux guided service install skipped its user-manager preflight"
+        );
+    }
 }
 
 #[test]
