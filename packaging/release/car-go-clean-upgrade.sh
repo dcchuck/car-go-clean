@@ -154,14 +154,21 @@ path_has_no_symlink_components() {
 
 portable_file_metadata() {
     metadata_path=$1
-    metadata=$(stat -f '%u:%Lp:%d:%i:%z:%m' -- "$metadata_path" 2>/dev/null || :)
-    case "$metadata" in
-        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*)
-            printf '%s\n' "$metadata"
-            return 0
+    case "$platform" in
+        Darwin)
+            metadata=$(
+                stat -f '%u:%Lp:%d:%i:%z:%m' -- "$metadata_path" 2>/dev/null
+            ) || return 1
+            ;;
+        Linux)
+            metadata=$(
+                stat -c '%u:%a:%d:%i:%s:%Y' -- "$metadata_path" 2>/dev/null
+            ) || return 1
+            ;;
+        *)
+            return 1
             ;;
     esac
-    metadata=$(stat -c '%u:%a:%d:%i:%s:%Y' -- "$metadata_path" 2>/dev/null || :)
     case "$metadata" in
         [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*)
             printf '%s\n' "$metadata"

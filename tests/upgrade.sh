@@ -28,7 +28,7 @@ EOF
 cat > "$fake_bin/id" <<'EOF'
 #!/bin/sh
 test "$1" = "-u"
-printf '%s\n' 501
+exec /usr/bin/id -u
 EOF
 
 cat > "$car_go_clean_fixture" <<'EOF'
@@ -678,13 +678,15 @@ set -eu
 
 metadata_for() {
     metadata_path=$1
-    metadata=$(/usr/bin/stat -f '%u:%Lp:%d:%i:%z:%m' "$metadata_path" 2>/dev/null || :)
-    case "$metadata" in
-        [0-9]*:[0-7]*:[0-9]*:[0-9]*:[0-9]*:[0-9]*) ;;
-        *)
-            metadata=$(/usr/bin/stat -c '%u:%a:%d:%i:%s:%Y' "$metadata_path")
-            ;;
-    esac
+    if metadata=$(
+        /usr/bin/stat -c '%u:%a:%d:%i:%s:%Y' -- "$metadata_path" 2>/dev/null
+    ); then
+        :
+    else
+        metadata=$(
+            /usr/bin/stat -f '%u:%Lp:%d:%i:%z:%m' -- "$metadata_path"
+        )
+    fi
     if [ -n "${STAT_OWNER_OVERRIDE_PATH-}" ] &&
         [ "$metadata_path" = "$STAT_OWNER_OVERRIDE_PATH" ]; then
         metadata=${STAT_OWNER_OVERRIDE-999}:${metadata#*:}
@@ -694,11 +696,11 @@ metadata_for() {
 
 mode_for() {
     mode_path=$1
-    mode=$(/usr/bin/stat -f '%Lp' "$mode_path" 2>/dev/null || :)
-    case "$mode" in
-        [0-7][0-7][0-7]) ;;
-        *) mode=$(/usr/bin/stat -c '%a' "$mode_path") ;;
-    esac
+    if mode=$(/usr/bin/stat -c '%a' -- "$mode_path" 2>/dev/null); then
+        :
+    else
+        mode=$(/usr/bin/stat -f '%Lp' -- "$mode_path")
+    fi
     printf '%s\n' "$mode"
 }
 
@@ -706,7 +708,11 @@ for argument do
     stat_path=$argument
 done
 
-if [ "${GNU_STAT_FIXTURE-0}" = 1 ]; then
+if [ "${GNU_STAT_F_FALSE_POSITIVE-0}" = 1 ] &&
+    [ "${1-}" = -f ] &&
+    [ "${2-}" = '%u:%Lp:%d:%i:%z:%m' ]; then
+    printf '%s\n' '777:770:1:2:3:4'
+elif [ "${GNU_STAT_FIXTURE-0}" = 1 ]; then
     case "$1" in
         -f)
             printf 'GNU filesystem status output\n'
@@ -918,6 +924,7 @@ EOF
     SHELL_RESOLVE_FAIL_AFTER_SUCCESS=0
     WRONG_NEW_VERSION=0
     GNU_STAT_FIXTURE=0
+    GNU_STAT_F_FALSE_POSITIVE=0
     STAT_OWNER_OVERRIDE_PATH=
     STAT_OWNER_OVERRIDE=
     RESTORE_FAIL=0
@@ -966,7 +973,7 @@ EOF
     export SHASUM_FIXTURE
     export SHELL_REPLACE_FAIL SHELL_PARTIAL_REPLACE_FAIL
     export SHELL_RESOLVE_FAIL_AFTER_SUCCESS WRONG_NEW_VERSION
-    export GNU_STAT_FIXTURE
+    export GNU_STAT_FIXTURE GNU_STAT_F_FALSE_POSITIVE
     export STAT_OWNER_OVERRIDE_PATH STAT_OWNER_OVERRIDE
 }
 
@@ -1325,6 +1332,19 @@ assert_output_has "group/world-writable"
 test "$(cat "$service_state")" = running
 test -e "$service_enabled"
 assert_calls_lack "launchctl bootout"
+
+# GNU stat -f can emit numeric-looking filesystem metadata for a BSD format.
+# Linux must select GNU file metadata directly instead of accepting that tuple.
+new_case state-gnu-stat-f-false-positive Linux 0.3.0 running shell
+chmod 0770 "$state_dir"
+GNU_STAT_F_FALSE_POSITIVE=1
+export GNU_STAT_F_FALSE_POSITIVE
+run_upgrade --version 0.4.0 --method shell
+test "$run_status" -ne 0
+assert_output_has "group/world-writable"
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+assert_calls_lack "systemctl --user disable --now car-go-clean.service"
 
 new_case state-wrong-owner Linux 0.3.0 running shell
 STAT_OWNER_OVERRIDE_PATH=$state_dir
