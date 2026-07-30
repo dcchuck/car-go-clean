@@ -1301,10 +1301,11 @@ fn release_publication_requires_both_human_approval_environments_in_order() {
             workflow_steps(&release, "publish-prerelease"),
             "Publish approved prerelease"
         )),
-        Some(
-            "gh release edit \"$TAG\" --repo \"$GITHUB_REPOSITORY\" \
-             --draft=false --prerelease --latest=false"
-        )
+        Some("scripts/transition-release.sh publish-prerelease \"$TAG\" \"$GITHUB_SHA\" \"$RELEASE_ID\"")
+    );
+    assert_eq!(
+        prerelease["steps"][2]["env"]["RELEASE_ID"].as_str(),
+        Some("${{ needs.custom-release-verify.outputs.release_id }}")
     );
 
     let hosted = &jobs["hosted-release-smoke"];
@@ -1329,7 +1330,7 @@ fn release_publication_requires_both_human_approval_environments_in_order() {
     let stable = &jobs["promote-stable"];
     assert_eq!(
         yaml_strings(&stable["needs"]),
-        BTreeSet::from(["hosted-release-smoke", "plan"])
+        BTreeSet::from(["hosted-release-smoke", "plan", "publish-prerelease"])
     );
     assert_eq!(stable["environment"].as_str(), Some("v040-stable"));
     assert_eq!(stable["permissions"]["contents"].as_str(), Some("write"));
@@ -1339,9 +1340,12 @@ fn release_publication_requires_both_human_approval_environments_in_order() {
             "Promote approved stable release"
         )),
         Some(
-            "gh release edit \"$TAG\" --repo \"$GITHUB_REPOSITORY\" \
-             --prerelease=false --latest"
+            "scripts/transition-release.sh promote-stable \"$TAG\" \"$GITHUB_SHA\" \"$RELEASE_ID\""
         )
+    );
+    assert_eq!(
+        stable["steps"][1]["env"]["RELEASE_ID"].as_str(),
+        Some("${{ needs.publish-prerelease.outputs.release_id }}")
     );
 
     let formula = &jobs["custom-publish-homebrew-formula"];
@@ -1355,7 +1359,8 @@ fn release_publication_requires_both_human_approval_environments_in_order() {
     );
 
     let source = repo_file(".github/workflows/release.yml");
-    assert_eq!(source.matches("gh release edit ").count(), 2);
+    assert!(!source.contains("gh release edit "));
+    assert_eq!(source.matches("scripts/transition-release.sh ").count(), 2);
     assert!(!yaml_strings(&jobs["custom-release-verify"]["needs"])
         .contains("custom-publish-homebrew-formula"));
 }
@@ -1416,14 +1421,16 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
         "https://github.com/dcchuck/car-go-clean/releases/download/$TAG/$asset",
         "curl --proto '=https'",
         "scripts/verify-release-assets.sh",
+        "scripts/verify-shell-release-assets.sh",
         "gh attestation verify",
         "sh ./car-go-clean-installer.sh",
         "test \"$version_output\" = \"$VERSION\"",
         "health --skip-cargo",
         "Library/LaunchAgents/com.dcchuck.car-go-clean.plist",
         ".config/systemd/user/car-go-clean.service",
-        "scripts/render-homebrew-formula.sh",
-        "brew install --formula",
+        "scripts/render-local-homebrew-formula.sh",
+        "brew tap --custom-remote",
+        "brew install car-go-clean/release-smoke/car-go-clean",
         "brew test car-go-clean",
     ] {
         assert!(
@@ -1441,6 +1448,7 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
     }
     assert!(!run.contains("gh release download"));
     assert!(!run.contains("--download-base-url"));
+    assert!(!run.contains("file://$ASSET_DIR"));
     assert!(!repo_file(".github/workflows/hosted-release-smoke.yml").contains("homebrew-tap"));
 }
 
@@ -1448,8 +1456,18 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
 fn authenticated_draft_verification_requires_all_fifteen_assets() {
     let verify = workflow(".github/workflows/release-verify.yml");
     assert_eq!(verify["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        verify["on"]["workflow_call"]["outputs"]["release_id"]["value"].as_str(),
+        Some("${{ jobs.inventory.outputs.release_id }}")
+    );
+    assert_eq!(
+        verify["jobs"]["inventory"]["outputs"]["release_id"].as_str(),
+        Some("${{ steps.inventory.outputs.release_id }}")
+    );
     let inventory = workflow_steps(&verify, "inventory");
-    let run = run_command(named_step(inventory, "Verify commit-bound draft inventory")).unwrap();
+    let inventory_step = named_step(inventory, "Verify commit-bound draft inventory");
+    assert_eq!(inventory_step["id"].as_str(), Some("inventory"));
+    let run = run_command(inventory_step).unwrap();
     for fragment in [
         "EXPECTED_ASSET_COUNT=15",
         "car-go-clean-aarch64-apple-darwin.tar.xz",
@@ -1461,7 +1479,9 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
         "car-go-clean-shell-assets.sha256",
         ".isDraft",
         ".isPrerelease",
-        "targetCommitish",
+        ".isLatest",
+        "tagCommit",
+        "target_commitish",
     ] {
         assert!(
             run.contains(fragment),
@@ -1472,9 +1492,40 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
     let source = repo_file(".github/workflows/release-verify.yml");
     assert!(source.contains("gh release download"));
     assert!(source.contains("gh attestation verify"));
-    assert!(source.contains("scripts/render-homebrew-formula.sh"));
+    assert!(source.contains("scripts/verify-shell-release-assets.sh"));
+    assert!(source.contains("scripts/render-local-homebrew-formula.sh"));
+    let smoke_run = run_command(named_step(
+        workflow_steps(&verify, "smoke"),
+        "Verify authenticated draft install paths",
+    ))
+    .unwrap();
+    assert!(
+        smoke_run
+            .find("scripts/verify-shell-release-assets.sh")
+            .unwrap()
+            < smoke_run.find("gh attestation verify").unwrap()
+    );
+    assert!(smoke_run.contains("brew tap --custom-remote"));
+    assert!(smoke_run.contains("brew install car-go-clean/release-smoke/car-go-clean"));
     assert!(!source.contains("homebrew-tap"));
     assert!(!source.contains("formula/car-go-clean-$TAG"));
+}
+
+#[test]
+fn release_documentation_names_safe_targeted_retry_modes() {
+    let docs = repo_file("docs/releasing.md");
+    for fragment in [
+        "gh run rerun RUN_ID --failed",
+        "gh run rerun RUN_ID --job FORMULA_JOB_ID",
+        "A full workflow rerun is not a publication retry",
+        "already stable",
+        "never demoted",
+    ] {
+        assert!(
+            docs.contains(fragment),
+            "release retry docs omit `{fragment}`"
+        );
+    }
 }
 
 #[test]
@@ -1496,8 +1547,8 @@ fn release_workflow_is_tag_only_and_uses_dist() {
     assert!(workflow.contains("\n  custom-publish-homebrew-formula:\n"));
     assert!(workflow.contains("\n  custom-release-verify:\n"));
     assert!(workflow.contains("needs.custom-release-verify.result == 'success'"));
-    assert!(workflow.contains("gh release edit"));
-    assert!(workflow.contains("--draft=false"));
+    assert!(workflow.contains("scripts/transition-release.sh"));
+    assert!(!workflow.contains("gh release edit"));
 
     let host = workflow
         .split("\n  host:\n")
@@ -1866,10 +1917,10 @@ fn ci_and_release_verification_cover_installable_artifacts() {
     assert!(release.contains("publish-homebrew-formula"));
     assert!(release.contains("Enforce annotated vX.Y.Z release tag"));
     assert!(verify.contains("health --skip-cargo"));
-    assert!(verify.contains("brew install --formula"));
+    assert!(verify.contains("brew install car-go-clean/release-smoke/car-go-clean"));
     assert!(verify.contains("brew test car-go-clean"));
     assert!(verify.contains("gh release download"));
-    assert!(verify.contains("scripts/render-homebrew-formula.sh"));
+    assert!(verify.contains("scripts/render-local-homebrew-formula.sh"));
     assert!(!verify.contains("homebrew-tap"));
     assert!(!verify.contains("formula/car-go-clean-$TAG"));
 

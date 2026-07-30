@@ -93,6 +93,33 @@ it never pushes the tap's default branch. A public-smoke failure leaves the
 release as a non-latest prerelease and does not invoke the tap publisher. The
 workflow does not publish to crates.io or enable any daemon.
 
+## Retry a publication gate
+
+Use targeted retries so the workflow resumes from the release state that has
+already been approved. If hosted public smoke fails while the release is a
+non-latest prerelease, retry only the failed jobs:
+
+```sh
+gh run rerun RUN_ID --failed
+```
+
+If stable promotion succeeded but formula publication failed, find the
+reusable formula job ID and retry that job:
+
+```sh
+gh run rerun RUN_ID --job FORMULA_JOB_ID
+```
+
+The transition guard re-reads the numeric release ID, tag commit, resolved
+target, exact 15-asset inventory, and publication state immediately before
+each mutation. A targeted prerelease retry that finds the release already
+stable is a no-op, so a stable release is never demoted. A stable-transition
+retry is also a no-op when that release is already stable but no longer
+latest after a newer release; it does not make the older release latest again.
+
+A full workflow rerun is not a publication retry: its authenticated verifier
+requires the exact draft state and stops once the release has been published.
+
 ## Complete the Homebrew release
 
 After stable/latest promotion creates or updates the manual tap pull request,

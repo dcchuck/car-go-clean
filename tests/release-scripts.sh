@@ -6,9 +6,12 @@ validator="$repo_root/scripts/validate-release-inputs.sh"
 dist_installer="$repo_root/scripts/install-cargo-dist.sh"
 asset_verifier="$repo_root/scripts/verify-release-assets.sh"
 formula_renderer="$repo_root/scripts/render-homebrew-formula.sh"
+local_formula_renderer="$repo_root/scripts/render-local-homebrew-formula.sh"
+shell_asset_verifier="$repo_root/scripts/verify-shell-release-assets.sh"
 tap_rehearsal="$repo_root/scripts/rehearse-tap-capability.sh"
 draft_upserter="$repo_root/scripts/upsert-draft-release.sh"
 environment_configurator="$repo_root/scripts/configure-release-environments.sh"
+release_transition="$repo_root/scripts/transition-release.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
@@ -53,9 +56,12 @@ for script in \
     "$dist_installer" \
     "$asset_verifier" \
     "$formula_renderer" \
+    "$local_formula_renderer" \
+    "$shell_asset_verifier" \
     "$tap_rehearsal" \
     "$draft_upserter" \
-    "$environment_configurator"
+    "$environment_configurator" \
+    "$release_transition"
 do
     sh -n "$script"
 done
@@ -294,6 +300,85 @@ do
 done
 expect_failure "malformed formula tag" "$formula_renderer" 0.4.0 "$artifacts" "$work/bad.rb"
 
+shell_assets="$work/shell-assets"
+mkdir -p "$shell_assets"
+printf '%s\n' '#!/bin/sh' 'printf "installer fixture\n"' \
+    > "$shell_assets/car-go-clean-installer.sh"
+printf '%s\n' '#!/bin/sh' 'printf "upgrade fixture\n"' \
+    > "$shell_assets/car-go-clean-upgrade.sh"
+installer_hash=$(hash_file "$shell_assets/car-go-clean-installer.sh")
+upgrade_hash=$(hash_file "$shell_assets/car-go-clean-upgrade.sh")
+write_good_shell_manifest() {
+    printf '%s  %s\n' \
+        "$installer_hash" \
+        car-go-clean-installer.sh \
+        "$upgrade_hash" \
+        car-go-clean-upgrade.sh \
+        > "$shell_assets/car-go-clean-shell-assets.sha256"
+}
+write_good_shell_manifest
+shell_inventory=$("$shell_asset_verifier" "$shell_assets")
+test "$(printf '%s\n' "$shell_inventory" | awk 'NF { count++ } END { print count + 0 }')" -eq 2
+printf '%s\n' 'corrupted installer' >> "$shell_assets/car-go-clean-installer.sh"
+expect_failure "shell manifest wrong installer hash" \
+    "$shell_asset_verifier" "$shell_assets"
+printf '%s\n' '#!/bin/sh' 'printf "installer fixture\n"' \
+    > "$shell_assets/car-go-clean-installer.sh"
+write_good_shell_manifest
+printf '%s  %s\n' \
+    "$installer_hash" \
+    car-go-clean-installer.sh \
+    "$installer_hash" \
+    car-go-clean-installer.sh \
+    > "$shell_assets/car-go-clean-shell-assets.sha256"
+expect_failure "shell manifest duplicate entry" \
+    "$shell_asset_verifier" "$shell_assets"
+printf '%s  %s\n' "$installer_hash" car-go-clean-installer.sh \
+    > "$shell_assets/car-go-clean-shell-assets.sha256"
+expect_failure "shell manifest missing entry" \
+    "$shell_asset_verifier" "$shell_assets"
+printf '%s  %s\n' \
+    "$installer_hash" \
+    car-go-clean-installer.sh \
+    "$upgrade_hash" \
+    unexpected-upgrade.sh \
+    > "$shell_assets/car-go-clean-shell-assets.sha256"
+expect_failure "shell manifest unexpected filename" \
+    "$shell_asset_verifier" "$shell_assets"
+printf '%s  %s\n' \
+    NOT-A-SHA256 \
+    car-go-clean-installer.sh \
+    "$upgrade_hash" \
+    car-go-clean-upgrade.sh \
+    > "$shell_assets/car-go-clean-shell-assets.sha256"
+expect_failure "shell manifest malformed hash" \
+    "$shell_asset_verifier" "$shell_assets"
+write_good_shell_manifest
+printf '%s\n' extra-line >> "$shell_assets/car-go-clean-shell-assets.sha256"
+expect_failure "shell manifest extra line" \
+    "$shell_asset_verifier" "$shell_assets"
+write_good_shell_manifest
+
+local_formula="$work/car-go-clean-local.rb"
+"$local_formula_renderer" v0.4.0 "$artifacts" "$local_formula"
+test "$(grep -Fxc '  version "0.4.0"' "$local_formula")" -eq 1
+test "$(grep -F -c \
+    'https://github.com/dcchuck/car-go-clean/releases/download/v0.4.0/' \
+    "$local_formula")" -eq 4
+draft_local_formula="$work/car-go-clean-draft-local.rb"
+"$local_formula_renderer" \
+    v0.4.0 \
+    "$artifacts" \
+    "$draft_local_formula" \
+    "file://$artifacts"
+test "$(grep -Fxc '  version "0.4.0"' "$draft_local_formula")" -eq 1
+test "$(grep -F -c "file://$artifacts/car-go-clean-" "$draft_local_formula")" -eq 4
+test "$(grep -F -c \
+    'https://github.com/dcchuck/car-go-clean/releases/download/' \
+    "$draft_local_formula")" -eq 0
+ruby -c "$local_formula" >/dev/null
+ruby -c "$draft_local_formula" >/dev/null
+
 environment_fake_bin="$work/environment-fake-bin"
 mkdir -p "$environment_fake_bin"
 cat > "$environment_fake_bin/gh" <<'EOF'
@@ -456,6 +541,295 @@ do
             FAKE_ENV_READBACK="$invalid_readback" \
             "$environment_configurator" dcchuck/car-go-clean
 done
+
+transition_fake_bin="$work/transition-fake-bin"
+mkdir -p "$transition_fake_bin"
+cat > "$transition_fake_bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >> "$FAKE_TRANSITION_LOG"
+test "$1" = api
+shift
+
+method=GET
+endpoint=
+input=
+while test "$#" -gt 0
+do
+    case "$1" in
+        --method) method=$2; shift 2 ;;
+        --input) input=$2; shift 2 ;;
+        --jq|-f|-F) shift 2 ;;
+        --silent) shift ;;
+        -*) echo "unexpected fake transition gh option: $1" >&2; exit 2 ;;
+        *) test -z "$endpoint"; endpoint=$1; shift ;;
+    esac
+done
+
+state=$FAKE_TRANSITION_STATE/release.json
+case "$method:$endpoint" in
+    GET:graphql)
+        count=0
+        if test -f "$FAKE_TRANSITION_STATE/discovery-count"
+        then
+            count=$(cat "$FAKE_TRANSITION_STATE/discovery-count")
+        fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$FAKE_TRANSITION_STATE/discovery-count"
+        if test "${FAKE_STABILIZE_ON_DISCOVERY:-0}" -eq "$count"
+        then
+            tmp=$state.tmp
+            jq '.draft = false |
+                .prerelease = false |
+                .is_latest = true' "$state" > "$tmp"
+            mv "$tmp" "$state"
+        fi
+        release_id=$(jq -r '.id' "$state")
+        if test "${FAKE_REPLACE_ID_ON_DISCOVERY:-0}" -eq "$count"
+        then
+            release_id=$((release_id + 1))
+        fi
+        tag_commit=${FAKE_TAG_COMMIT:-$EXPECTED_TRANSITION_SHA}
+        jq -n \
+            --argjson release_id "$release_id" \
+            --argjson draft "$(jq '.draft' "$state")" \
+            --argjson prerelease "$(jq '.prerelease' "$state")" \
+            --argjson latest "$(jq '.is_latest' "$state")" \
+            --arg tag "$(jq -r '.tag_name' "$state")" \
+            --arg tag_commit "$tag_commit" \
+            '{
+              data: {
+                repository: {
+                  release: {
+                    databaseId: $release_id,
+                    isDraft: $draft,
+                    isPrerelease: $prerelease,
+                    isLatest: $latest,
+                    tagName: $tag,
+                    tagCommit: {oid: $tag_commit}
+                  }
+                }
+              }
+            }'
+        ;;
+    GET:repos/dcchuck/car-go-clean/releases/*)
+        release_id=${endpoint##*/}
+        test "$(jq -r '.id' "$state")" = "$release_id" || {
+            echo 'gh: Not Found (HTTP 404)' >&2
+            exit 1
+        }
+        jq 'del(.is_latest)' "$state"
+        ;;
+    GET:repos/dcchuck/car-go-clean/commits/*)
+        printf '%s\n' "${endpoint##*/}"
+        ;;
+    PATCH:repos/dcchuck/car-go-clean/releases/*)
+        release_id=${endpoint##*/}
+        test "$(jq -r '.id' "$state")" = "$release_id"
+        test -f "$input"
+        tmp=$state.tmp
+        case "$(jq -r '.make_latest' "$input")" in
+            false)
+                jq -e '
+                  .draft == false and
+                  .prerelease == true and
+                  .make_latest == "false"
+                ' "$input" >/dev/null
+                jq '.draft = false |
+                    .prerelease = true |
+                    .is_latest = false' "$state" > "$tmp"
+                ;;
+            true)
+                jq -e '
+                  .draft == false and
+                  .prerelease == false and
+                  .make_latest == "true"
+                ' "$input" >/dev/null
+                jq '.draft = false |
+                    .prerelease = false |
+                    .is_latest = true' "$state" > "$tmp"
+                ;;
+            *) echo "unexpected make_latest transition" >&2; exit 2 ;;
+        esac
+        mv "$tmp" "$state"
+        ;;
+    *) echo "unexpected fake transition gh call: $method $endpoint" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$transition_fake_bin/gh"
+
+transition_sha=0123456789abcdef0123456789abcdef01234567
+transition_assets='
+car-go-clean-aarch64-apple-darwin.tar.xz
+car-go-clean-aarch64-apple-darwin.tar.xz.sha256
+car-go-clean-aarch64-unknown-linux-musl.tar.xz
+car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256
+car-go-clean-installer.sh
+car-go-clean-shell-assets.sha256
+car-go-clean-upgrade.sh
+car-go-clean-x86_64-apple-darwin.tar.xz
+car-go-clean-x86_64-apple-darwin.tar.xz.sha256
+car-go-clean-x86_64-unknown-linux-musl.tar.xz
+car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256
+car-go-clean.rb
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
+'
+transition_assets_json=$(
+    printf '%s\n' "$transition_assets" |
+        sed '/^$/d' |
+        jq -Rsc 'split("\n") |
+          map(select(length > 0)) |
+          map({name: .})'
+)
+
+make_transition_state() {
+    transition_state_dir=$1
+    transition_draft=$2
+    transition_prerelease=$3
+    transition_latest=$4
+    mkdir -p "$transition_state_dir"
+    jq -n \
+        --argjson assets "$transition_assets_json" \
+        --arg sha "$transition_sha" \
+        --argjson draft "$transition_draft" \
+        --argjson prerelease "$transition_prerelease" \
+        --argjson latest "$transition_latest" \
+        '{
+          id: 73,
+          tag_name: "v0.4.0",
+          target_commitish: $sha,
+          draft: $draft,
+          prerelease: $prerelease,
+          is_latest: $latest,
+          assets: $assets
+        }' > "$transition_state_dir/release.json"
+    : > "$transition_state_dir/gh.log"
+}
+
+run_release_transition() {
+    transition_state_dir=$1
+    transition_mode=$2
+    shift 2
+    env \
+        PATH="$transition_fake_bin:$PATH" \
+        GITHUB_REPOSITORY=dcchuck/car-go-clean \
+        FAKE_TRANSITION_STATE="$transition_state_dir" \
+        FAKE_TRANSITION_LOG="$transition_state_dir/gh.log" \
+        EXPECTED_TRANSITION_SHA="$transition_sha" \
+        "$@" \
+        "$release_transition" \
+        "$transition_mode" \
+        v0.4.0 \
+        "$transition_sha" \
+        73
+}
+
+transition_sequence="$work/transition-sequence"
+make_transition_state "$transition_sequence" true false false
+run_release_transition "$transition_sequence" publish-prerelease
+jq -e '.draft == false and .prerelease == true and .is_latest == false' \
+    "$transition_sequence/release.json" >/dev/null
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_sequence/gh.log")" -eq 1
+run_release_transition "$transition_sequence" publish-prerelease
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_sequence/gh.log")" -eq 1
+run_release_transition "$transition_sequence" promote-stable
+jq -e '.draft == false and .prerelease == false and .is_latest == true' \
+    "$transition_sequence/release.json" >/dev/null
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_sequence/gh.log")" -eq 2
+run_release_transition "$transition_sequence" promote-stable
+run_release_transition "$transition_sequence" publish-prerelease
+jq -e '.draft == false and .prerelease == false and .is_latest == true' \
+    "$transition_sequence/release.json" >/dev/null
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_sequence/gh.log")" -eq 2
+
+transition_old_stable="$work/transition-old-stable"
+make_transition_state "$transition_old_stable" false false false
+run_release_transition "$transition_old_stable" publish-prerelease
+run_release_transition "$transition_old_stable" promote-stable
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_old_stable/gh.log")" -eq 0
+jq -e '.draft == false and .prerelease == false and .is_latest == false' \
+    "$transition_old_stable/release.json" >/dev/null
+
+transition_revalidated="$work/transition-revalidated"
+make_transition_state "$transition_revalidated" true false false
+run_release_transition \
+    "$transition_revalidated" \
+    publish-prerelease \
+    FAKE_STABILIZE_ON_DISCOVERY=2
+jq -e '.draft == false and .prerelease == false and .is_latest == true' \
+    "$transition_revalidated/release.json" >/dev/null
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_revalidated/gh.log")" -eq 0
+
+transition_replaced="$work/transition-replaced"
+make_transition_state "$transition_replaced" true false false
+expect_failure "release ID replaced before transition" \
+    run_release_transition \
+        "$transition_replaced" \
+        publish-prerelease \
+        FAKE_REPLACE_ID_ON_DISCOVERY=2
+jq -e '.draft == true and .prerelease == false and .is_latest == false' \
+    "$transition_replaced/release.json" >/dev/null
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_replaced/gh.log")" -eq 0
+
+transition_target="$work/transition-target"
+make_transition_state "$transition_target" true false false
+jq '.target_commitish = "ffffffffffffffffffffffffffffffffffffffff"' \
+    "$transition_target/release.json" \
+    > "$transition_target/release.json.tmp"
+mv "$transition_target/release.json.tmp" "$transition_target/release.json"
+expect_failure "release target commit drift" \
+    run_release_transition "$transition_target" publish-prerelease
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_target/gh.log")" -eq 0
+
+transition_inventory="$work/transition-inventory"
+make_transition_state "$transition_inventory" true false false
+jq '.assets = .assets[:-1]' \
+    "$transition_inventory/release.json" \
+    > "$transition_inventory/release.json.tmp"
+mv "$transition_inventory/release.json.tmp" "$transition_inventory/release.json"
+expect_failure "release inventory drift" \
+    run_release_transition "$transition_inventory" publish-prerelease
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_inventory/gh.log")" -eq 0
+
+transition_tag="$work/transition-tag"
+make_transition_state "$transition_tag" true false false
+expect_failure "release tag commit drift" \
+    run_release_transition \
+        "$transition_tag" \
+        publish-prerelease \
+        FAKE_TAG_COMMIT=ffffffffffffffffffffffffffffffffffffffff
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_tag/gh.log")" -eq 0
+
+transition_invalid_state="$work/transition-invalid-state"
+make_transition_state "$transition_invalid_state" false true true
+expect_failure "prerelease marked latest" \
+    run_release_transition "$transition_invalid_state" publish-prerelease
+test "$(grep -F -c \
+    'api --method PATCH repos/dcchuck/car-go-clean/releases/73 --input' \
+    "$transition_invalid_state/gh.log")" -eq 0
 
 make_tap_origin() {
     fixture_root=$1

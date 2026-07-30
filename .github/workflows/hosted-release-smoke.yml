@@ -62,7 +62,7 @@ jobs:
           mkdir -p \
             "$ASSET_DIR" \
             "$ISOLATED_ROOT/extracted" \
-            "$ISOLATED_ROOT/formula" \
+            "$ISOLATED_ROOT/formula-tap/Formula" \
             "$ISOLATED_ROOT/home" \
             "$ISOLATED_ROOT/installed/bin" \
             "$ISOLATED_ROOT/projects" \
@@ -95,39 +95,8 @@ jobs:
 
           scripts/verify-release-assets.sh "$TAG" "$ASSET_DIR" \
             > "$RUNNER_TEMP/public-release-inventory.tsv"
-          awk '
-            NF {
-              if (NF != 2 || length($1) != 64 ||
-                  $1 !~ /^[0-9a-f]+$/ ||
-                  ($2 != "car-go-clean-installer.sh" &&
-                   $2 != "car-go-clean-upgrade.sh")) {
-                exit 1
-              }
-              print $2
-              count++
-            }
-            END {
-              if (count != 2) {
-                exit 1
-              }
-            }
-          ' "$ASSET_DIR/car-go-clean-shell-assets.sha256" |
-            LC_ALL=C sort > "$RUNNER_TEMP/shell-asset-names"
-          printf '%s\n' \
-            car-go-clean-installer.sh \
-            car-go-clean-upgrade.sh \
-            > "$RUNNER_TEMP/expected-shell-asset-names"
-          cmp "$RUNNER_TEMP/expected-shell-asset-names" \
-            "$RUNNER_TEMP/shell-asset-names"
-          (
-            cd "$ASSET_DIR"
-            if command -v shasum >/dev/null 2>&1
-            then
-              shasum -a 256 -c car-go-clean-shell-assets.sha256
-            else
-              sha256sum -c car-go-clean-shell-assets.sha256
-            fi
-          )
+          scripts/verify-shell-release-assets.sh "$ASSET_DIR" \
+            > "$RUNNER_TEMP/public-shell-inventory.tsv"
 
           archive="car-go-clean-$TARGET.tar.xz"
           for attested_asset in \
@@ -167,24 +136,32 @@ jobs:
           test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$HOME/.config/systemd/user/car-go-clean.service"
 
-          scripts/render-homebrew-formula.sh \
+          scripts/render-local-homebrew-formula.sh \
             "$TAG" \
             "$ASSET_DIR" \
-            "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
           if test "$(uname -s)" = Darwin
           then
             export HOMEBREW_NO_AUTO_UPDATE=1
             export HOMEBREW_NO_INSTALL_CLEANUP=1
+            FORMULA_TAP=car-go-clean/release-smoke
+            git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
+            git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release smoke"
+            git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+            git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
+            git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local release formula"
             cleanup() {
               brew uninstall --force car-go-clean >/dev/null 2>&1 || true
+              brew untap "$FORMULA_TAP" >/dev/null 2>&1 || true
             }
             trap cleanup EXIT HUP INT TERM
-            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
+            brew install car-go-clean/release-smoke/car-go-clean
             brew test car-go-clean
             brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
             test "$("$brew_binary" version)" = "$VERSION"
           else
-            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            ruby -c "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
           fi
           test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"

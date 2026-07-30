@@ -6,6 +6,10 @@ on:
       plan:
         required: true
         type: string
+    outputs:
+      release_id:
+        description: Numeric ID of the authenticated commit-bound draft
+        value: ${{ jobs.inventory.outputs.release_id }}
 
 permissions:
   # GitHub requires contents:write for workflow tokens to read draft releases.
@@ -17,23 +21,64 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      release_id: ${{ steps.inventory.outputs.release_id }}
     steps:
-      - name: Verify commit-bound draft inventory
+      - id: inventory
+        name: Verify commit-bound draft inventory
         env:
           GH_TOKEN: ${{ github.token }}
           PLAN: ${{ inputs.plan }}
         run: |
           set -eu
           TAG="$(jq -er '.announcement_tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PLAN")"
-          RELEASE_JSON="$(
-            gh release view "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json tagName,isDraft,isPrerelease,targetCommitish,assets
+          # Dollar-prefixed names in this query are GraphQL variables.
+          # shellcheck disable=SC2016
+          QUERY='
+            query VerifiedDraft($owner: String!, $name: String!, $tagName: String!) {
+              repository(owner: $owner, name: $name) {
+                release(tagName: $tagName) {
+                  databaseId
+                  isDraft
+                  isPrerelease
+                  isLatest
+                  tagName
+                  tagCommit {
+                    oid
+                  }
+                }
+              }
+            }'
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          NAME="${GITHUB_REPOSITORY#*/}"
+          DISCOVERY="$(
+            gh api graphql \
+              -f query="$QUERY" \
+              -F owner="$OWNER" \
+              -F name="$NAME" \
+              -F tagName="$TAG"
           )"
-          test "$(jq -er '.tagName' <<< "$RELEASE_JSON")" = "$TAG"
-          test "$(jq -er '.isDraft' <<< "$RELEASE_JSON")" = true
-          test "$(jq -er '.isPrerelease' <<< "$RELEASE_JSON")" = false
-          TARGET="$(jq -er '.targetCommitish' <<< "$RELEASE_JSON")"
+          jq -e '
+            .errors == null and
+            (.data.repository.release | type == "object") and
+            (.data.repository.release.databaseId | type == "number") and
+            .data.repository.release.isDraft == true and
+            .data.repository.release.isPrerelease == false and
+            .data.repository.release.isLatest == false and
+            (.data.repository.release.tagName | type == "string") and
+            (.data.repository.release.tagCommit.oid | type == "string")
+          ' <<< "$DISCOVERY" >/dev/null
+          RELEASE_ID="$(jq -r '.data.repository.release.databaseId' <<< "$DISCOVERY")"
+          test "$(jq -r '.data.repository.release.tagName' <<< "$DISCOVERY")" = "$TAG"
+          test "$(jq -r '.data.repository.release.tagCommit.oid' <<< "$DISCOVERY")" = "$GITHUB_SHA"
+          RELEASE_JSON="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          )"
+          test "$(jq -er '.id' <<< "$RELEASE_JSON")" = "$RELEASE_ID"
+          test "$(jq -er '.tag_name' <<< "$RELEASE_JSON")" = "$TAG"
+          test "$(jq -er '.draft' <<< "$RELEASE_JSON")" = true
+          test "$(jq -er '.prerelease' <<< "$RELEASE_JSON")" = false
+          TARGET="$(jq -er '.target_commitish' <<< "$RELEASE_JSON")"
           RESOLVED_TARGET="$(
             gh api "repos/$GITHUB_REPOSITORY/commits/$TARGET" --jq '.sha'
           )"
@@ -65,6 +110,7 @@ jobs:
             -eq "$EXPECTED_ASSET_COUNT"
           cmp "$RUNNER_TEMP/expected-release-assets.sorted" \
             "$RUNNER_TEMP/actual-release-assets"
+          printf 'release_id=%s\n' "$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
   smoke:
     name: Authenticated draft smoke (${{ matrix.target }})
@@ -126,6 +172,8 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_UNAME"
           scripts/verify-release-assets.sh "$TAG" "$ASSET_DIR" \
             > "$RUNNER_TEMP/draft-release-inventory.tsv"
+          scripts/verify-shell-release-assets.sh "$ASSET_DIR" \
+            > "$RUNNER_TEMP/draft-shell-inventory.tsv"
 
           archive="car-go-clean-$TARGET.tar.xz"
           for attested_asset in \
@@ -141,7 +189,7 @@ jobs:
           rm -rf "$ISOLATED_ROOT"
           mkdir -p \
             "$ISOLATED_ROOT/extracted" \
-            "$ISOLATED_ROOT/formula" \
+            "$ISOLATED_ROOT/formula-tap/Formula" \
             "$ISOLATED_ROOT/home" \
             "$ISOLATED_ROOT/installed/bin" \
             "$ISOLATED_ROOT/projects" \
@@ -175,28 +223,33 @@ jobs:
           test ! -e "$HOME/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$HOME/.config/systemd/user/car-go-clean.service"
 
-          scripts/render-homebrew-formula.sh \
+          scripts/render-local-homebrew-formula.sh \
             "$TAG" \
             "$ASSET_DIR" \
-            "$ISOLATED_ROOT/formula/car-go-clean.public.rb"
-          sed \
-            "s#https://github.com/dcchuck/car-go-clean/releases/download/$TAG#file://$ASSET_DIR#g" \
-            "$ISOLATED_ROOT/formula/car-go-clean.public.rb" \
-            > "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb" \
+            "file://$ASSET_DIR"
           if test "$(uname -s)" = Darwin
           then
             export HOMEBREW_NO_AUTO_UPDATE=1
             export HOMEBREW_NO_INSTALL_CLEANUP=1
+            FORMULA_TAP=car-go-clean/release-smoke
+            git -C "$ISOLATED_ROOT/formula-tap" init -q -b main
+            git -C "$ISOLATED_ROOT/formula-tap" config user.name "Release smoke"
+            git -C "$ISOLATED_ROOT/formula-tap" config user.email actions@users.noreply.github.com
+            git -C "$ISOLATED_ROOT/formula-tap" add Formula/car-go-clean.rb
+            git -C "$ISOLATED_ROOT/formula-tap" commit -qm "local release formula"
             cleanup() {
               brew uninstall --force car-go-clean >/dev/null 2>&1 || true
+              brew untap "$FORMULA_TAP" >/dev/null 2>&1 || true
             }
             trap cleanup EXIT HUP INT TERM
-            brew install --formula "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            brew tap --custom-remote "$FORMULA_TAP" "$ISOLATED_ROOT/formula-tap"
+            brew install car-go-clean/release-smoke/car-go-clean
             brew test car-go-clean
             brew_binary="$(brew --prefix car-go-clean)/bin/car-go-clean"
             test "$("$brew_binary" version)" = "$VERSION"
           else
-            ruby -c "$ISOLATED_ROOT/formula/car-go-clean.rb"
+            ruby -c "$ISOLATED_ROOT/formula-tap/Formula/car-go-clean.rb"
           fi
           test ! -e "$ISOLATED_ROOT/home/Library/LaunchAgents/com.dcchuck.car-go-clean.plist"
           test ! -e "$ISOLATED_ROOT/home/.config/systemd/user/car-go-clean.service"
