@@ -1275,6 +1275,38 @@ impl Store {
         Ok(self.current_generation(policy_hash)?.is_some())
     }
 
+    pub fn current_generation_coverage_incomplete(&self, policy_hash: &str) -> Result<bool> {
+        let incomplete = self.conn.query_row(
+            "
+            SELECT CASE
+                WHEN current_generation.id IS NULL THEN 1
+                ELSE EXISTS(
+                    SELECT 1
+                    FROM discovery_origins
+                    WHERE generation_id = current_generation.id
+                      AND completed = 0
+                )
+            END
+            FROM (SELECT 1) AS singleton
+            LEFT JOIN (
+                SELECT id
+                FROM discovery_generations
+                WHERE authority_valid = 1
+                  AND id = (
+                      SELECT id
+                      FROM discovery_generations
+                      WHERE policy_hash = ?1
+                      ORDER BY id DESC
+                      LIMIT 1
+                  )
+            ) AS current_generation
+            ",
+            [policy_hash],
+            |row| row.get(0),
+        )?;
+        Ok(incomplete)
+    }
+
     pub fn discovery_origins(&self, generation_id: i64) -> Result<Vec<DiscoveryOriginRecord>> {
         let mut statement = self.conn.prepare(
             "

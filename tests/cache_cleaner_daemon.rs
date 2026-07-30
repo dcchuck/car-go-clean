@@ -14,7 +14,10 @@ use car_go_clean::activity::{
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::config;
-use car_go_clean::daemon::{clamp_next_scan_at, Clock, Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::daemon::{
+    clamp_next_scan_at, Clock, Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions,
+    ShutdownFlag,
+};
 use car_go_clean::identity::{
     BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
 };
@@ -1285,6 +1288,33 @@ struct EmptyEnvironment;
 impl Environment for EmptyEnvironment {
     fn var_os(&self, _name: &str) -> Option<std::ffi::OsString> {
         None
+    }
+}
+
+#[derive(Clone)]
+struct FileCycleFactory {
+    config_path: PathBuf,
+}
+
+impl DaemonCycleFactory for FileCycleFactory {
+    fn snapshot(&self) -> anyhow::Result<DaemonCycleSnapshot> {
+        let cfg = config::load(&self.config_path)?;
+        cfg.validate()?;
+        let policy = ScopePolicy::build(&cfg, &self.config_path, &EmptyEnvironment)?;
+        let scanner = Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: cfg.project_dirs.clone(),
+            excludes: cfg.effective_excludes(),
+        })
+        .with_authority(policy, Arc::new(SystemIdentityProvider));
+        Ok(DaemonCycleSnapshot::new(
+            scanner,
+            DaemonOptions {
+                clean_interval: cfg.clean_interval,
+                scan_interval: cfg.scan_interval,
+                target_quiet_period: cfg.target_quiet_period,
+            },
+        ))
     }
 }
 
@@ -5583,4 +5613,356 @@ fn upgraded_nonempty_cache_prunes_exclusions_when_clean_is_due_before_scan() {
     assert!(!ordinary_project.join("target").exists());
     assert_eq!(store.all_projects().unwrap().len(), 3);
     assert_eq!(store.last_run().unwrap().projects_cleaned, 1);
+}
+
+#[test]
+fn daemon_reloads_scope_for_each_cycle_and_never_uses_obsolete_authority() {
+    let work = tempfile::tempdir().unwrap();
+    let old_scope = work.path().join("old-scope");
+    let new_scope = work.path().join("new-scope");
+    let project = old_scope.join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    fs::create_dir_all(&new_scope).unwrap();
+    let config_path = work.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(&old_scope).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let initial = FileCycleFactory {
+        config_path: config_path.clone(),
+    }
+    .snapshot()
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        initial.scanner().clone(),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        initial.options(),
+    )
+    .with_cycle_factory(Arc::new(FileCycleFactory {
+        config_path: config_path.clone(),
+    }));
+
+    daemon.scan_cycle().unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(&new_scope).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let second_cycle = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(second_cycle.coverage_incomplete);
+    assert_eq!(second_cycle.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_reloads_absolute_exclusion_aliases_for_each_cycle() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let initially_excluded = work.path().join("initially-excluded");
+    let newly_excluded = root.join("newly-excluded");
+    let project = newly_excluded.join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    fs::create_dir_all(&initially_excluded).unwrap();
+    let exclusion_alias = work.path().join("excluded-alias");
+    symlink(&initially_excluded, &exclusion_alias).unwrap();
+    let config_path = work.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = [{}]\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(&root).unwrap(),
+            serde_json::to_string(&exclusion_alias.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let initial = FileCycleFactory {
+        config_path: config_path.clone(),
+    }
+    .snapshot()
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        initial.scanner().clone(),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        initial.options(),
+    )
+    .with_cycle_factory(Arc::new(FileCycleFactory {
+        config_path: config_path.clone(),
+    }));
+
+    daemon.scan_cycle().unwrap();
+    fs::remove_file(&exclusion_alias).unwrap();
+    symlink(&newly_excluded, &exclusion_alias).unwrap();
+
+    let second_cycle = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(second_cycle.coverage_incomplete);
+    assert_eq!(second_cycle.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
+}
+
+#[test]
+fn persisted_incomplete_origin_outlives_transient_scan_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let scan_root = root.path().join("scan-root");
+    fs::create_dir_all(&scan_root).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let clock = Arc::new(HookClock::new(now));
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![scan_root.clone()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            scan_interval: Duration::from_secs(60),
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(clock.clone());
+
+    fs::remove_dir_all(&scan_root).unwrap();
+    let scan = daemon.scan_cycle().unwrap();
+    assert!(scan.origins.iter().any(|origin| !origin.completed));
+    clock.set_now(now + Duration::from_secs(10 * 60));
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert!(result.coverage_incomplete);
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_boot_ancestor_symlink_retarget_is_never_reauthorized() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let scope = root.path().join("scope");
+    let ancestor = scope.join("ancestor");
+    let project = ancestor.join("project");
+    let outside = root.path().join("outside");
+    let outside_project = outside.join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    write_file(&outside_project.join("Cargo.toml"), b"[package]\n");
+    write_file(&outside_project.join("target/outside.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(&scope).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: vec![],
+            excludes: vec![],
+        })
+        .with_authority(policy, identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    fs::rename(&ancestor, scope.join("ancestor-boot-a")).unwrap();
+    symlink(&outside, &ancestor).unwrap();
+    identity.switch_boot();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(outside_project.join("target/outside.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_symlink_mutation_after_review_is_rejected_before_cargo() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let scope = root.path().join("scope");
+    let ancestor = scope.join("ancestor");
+    let project = ancestor.join("project");
+    let outside = root.path().join("outside");
+    let outside_project = outside.join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+    write_file(&outside_project.join("Cargo.toml"), b"[package]\n");
+    write_file(&outside_project.join("target/outside.bin"), &[0; 2048]);
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(&scope).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: vec![],
+            excludes: vec![],
+        })
+        .with_authority(policy, identity),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
+    daemon.scan_cycle().unwrap();
+
+    let ancestor_for_mutation = ancestor.clone();
+    let scope_for_mutation = scope.clone();
+    let outside_for_mutation = outside.clone();
+    let inspector = MutatingProcessInspector::on_second_call(move || {
+        fs::rename(
+            &ancestor_for_mutation,
+            scope_for_mutation.join("ancestor-reviewed"),
+        )
+        .unwrap();
+        symlink(&outside_for_mutation, &ancestor_for_mutation).unwrap();
+    });
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(outside_project.join("target/outside.bin").exists());
 }

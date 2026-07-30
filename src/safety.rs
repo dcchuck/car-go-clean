@@ -59,6 +59,7 @@ pub struct SafetyOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectReview {
     pub path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
     pub class: ProjectClass,
     pub target_path: PathBuf,
     pub target_bytes: u64,
@@ -413,6 +414,10 @@ pub fn bind_review_to_observation(
         review.decision = CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable);
         return ObservationIdentityStatus::Rejected;
     };
+    if review.canonical_path.as_deref() != Some(review.path.as_path()) {
+        review.decision = CleanDecision::Skipped(SkipReason::ProjectIdentityChanged);
+        return ObservationIdentityStatus::Rejected;
+    }
 
     let project_comparison = compare_persisted(
         observed_boot,
@@ -492,6 +497,11 @@ pub fn revalidate_before_clean(
             SkipReason::ProjectIdentityUnavailable,
         ));
     };
+    if refreshed.canonical_path != review.canonical_path
+        || refreshed.canonical_path.as_deref() != Some(review.path.as_path())
+    {
+        return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));
+    }
     if refreshed_identity.project != reviewed_identity.project {
         return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));
     }
@@ -539,6 +549,31 @@ pub fn revalidate_before_clean(
     if let Some(reason) = policy_block_reason(policy, review, opts) {
         return Ok(CleanDecision::Skipped(reason));
     }
+    let final_canonical_project = match fs::canonicalize(&review.path) {
+        Ok(path) => path,
+        Err(_) => {
+            return Ok(CleanDecision::Skipped(
+                SkipReason::ProjectIdentityUnavailable,
+            ));
+        }
+    };
+    if final_canonical_project != review.path {
+        return Ok(CleanDecision::Skipped(SkipReason::ProjectIdentityChanged));
+    }
+    let final_canonical_target = match fs::canonicalize(&review.target_path) {
+        Ok(path) => path,
+        Err(_) => {
+            return Ok(CleanDecision::Skipped(
+                SkipReason::TargetIdentityUnavailable,
+            ));
+        }
+    };
+    if !policy.contains_project(&final_canonical_project) {
+        return Ok(CleanDecision::Skipped(SkipReason::OutOfScope));
+    }
+    if policy.is_excluded(&final_canonical_project) || policy.is_excluded(&final_canonical_target) {
+        return Ok(CleanDecision::Skipped(SkipReason::Excluded));
+    }
 
     Ok(CleanDecision::Cleanable)
 }
@@ -548,14 +583,25 @@ fn policy_block_reason(
     review: &ProjectReview,
     opts: &SafetyOptions,
 ) -> Option<SkipReason> {
-    if !policy.contains_project(&review.path) {
+    let Some(canonical_project) = review.canonical_path.as_deref() else {
+        return Some(SkipReason::ProjectIdentityUnavailable);
+    };
+    if canonical_project != review.path {
+        return Some(SkipReason::ProjectIdentityChanged);
+    }
+    let canonical_target = fs::canonicalize(&review.target_path).ok();
+    if !policy.contains_project(canonical_project) {
         return Some(SkipReason::OutOfScope);
     }
-    if policy.is_excluded(&review.path) || policy.is_excluded(&review.target_path) {
+    if policy.is_excluded(canonical_project)
+        || canonical_target
+            .as_deref()
+            .is_some_and(|target| policy.is_excluded(target))
+    {
         return Some(SkipReason::Excluded);
     }
     if !opts.include_managed_cache {
-        return policy_protected_class(policy, &review.path).map(|class| match class {
+        return policy_protected_class(policy, canonical_project).map(|class| match class {
             ProjectClass::ManagedCache => SkipReason::ManagedCache,
             ProjectClass::ContainerStorage => SkipReason::ContainerStorage,
             ProjectClass::Workspace => unreachable!("protected roots are not workspaces"),
@@ -631,8 +677,15 @@ fn review(
     reviewed_identity: Option<ReviewedIdentity>,
     decision: CleanDecision,
 ) -> ProjectReview {
+    let canonical_path = fs::canonicalize(project).ok();
+    let decision = if canonical_path.is_none() && decision == CleanDecision::Cleanable {
+        CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable)
+    } else {
+        decision
+    };
     ProjectReview {
         path: project.to_path_buf(),
+        canonical_path,
         class,
         target_path,
         target_bytes,

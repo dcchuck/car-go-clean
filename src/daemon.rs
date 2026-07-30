@@ -96,6 +96,30 @@ impl Default for DaemonOptions {
     }
 }
 
+#[derive(Clone)]
+pub struct DaemonCycleSnapshot {
+    scanner: Scanner,
+    options: DaemonOptions,
+}
+
+impl DaemonCycleSnapshot {
+    pub fn new(scanner: Scanner, options: DaemonOptions) -> Self {
+        Self { scanner, options }
+    }
+
+    pub fn scanner(&self) -> &Scanner {
+        &self.scanner
+    }
+
+    pub fn options(&self) -> DaemonOptions {
+        self.options
+    }
+}
+
+pub trait DaemonCycleFactory: Send + Sync {
+    fn snapshot(&self) -> Result<DaemonCycleSnapshot>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunCycleResult {
     pub run_id: i64,
@@ -122,6 +146,7 @@ pub struct Daemon<'a, R: CommandRunner> {
     opts: DaemonOptions,
     logger: Option<Logger>,
     clock: Arc<dyn Clock>,
+    cycle_factory: Option<Arc<dyn DaemonCycleFactory>>,
 }
 
 impl<'a, R: CommandRunner> Daemon<'a, R> {
@@ -140,6 +165,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             opts,
             logger: None,
             clock: Arc::new(SystemClock),
+            cycle_factory: None,
         }
     }
 
@@ -153,14 +179,36 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self
     }
 
+    pub fn with_cycle_factory(mut self, factory: Arc<dyn DaemonCycleFactory>) -> Self {
+        self.cycle_factory = Some(factory);
+        self
+    }
+
+    fn cycle_snapshot(&self) -> Result<DaemonCycleSnapshot> {
+        match &self.cycle_factory {
+            Some(factory) => factory.snapshot(),
+            None => Ok(DaemonCycleSnapshot::new(self.scanner.clone(), self.opts)),
+        }
+    }
+
     pub fn reconcile_cached_state(&self) -> Result<Vec<PathBuf>> {
+        let snapshot = self.cycle_snapshot()?;
+        self.reconcile_cached_state_with(snapshot.scanner())
+    }
+
+    fn reconcile_cached_state_with(&self, scanner: &Scanner) -> Result<Vec<PathBuf>> {
         self.cache
-            .reconcile_for_review(|path| self.scanner.is_excluded(path))
+            .reconcile_for_review(|path| scanner.is_excluded(path))
     }
 
     pub fn scan_cycle(&self) -> Result<ScanCycleResult> {
+        let snapshot = self.cycle_snapshot()?;
+        self.scan_cycle_with_snapshot(&snapshot)
+    }
+
+    fn scan_cycle_with_snapshot(&self, snapshot: &DaemonCycleSnapshot) -> Result<ScanCycleResult> {
         let now = self.clock.now();
-        let report = self.scanner.scan_with_errors()?;
+        let report = snapshot.scanner.scan_with_errors()?;
         let error_count = report.errors.len();
         for error in &report.errors {
             self.store.record_error(&ErrorRecord {
@@ -175,7 +223,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 message: error.message.clone(),
             })?;
         }
-        self.reconcile_cached_state()?;
+        self.reconcile_cached_state_with(&snapshot.scanner)?;
         for discovery in &report.worktree_discoveries {
             match discovery {
                 WorktreeDiscovery::Success {
@@ -227,13 +275,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_cycle(&self) -> Result<()> {
+        let snapshot = self.cycle_snapshot()?;
         let opts = SafetyOptions {
-            target_quiet_period: self.opts.target_quiet_period,
+            target_quiet_period: snapshot.options.target_quiet_period,
             include_managed_cache: false,
             include_active: false,
             force: false,
         };
-        self.run_cycle_with_safety(opts, &crate::activity::SysinfoProcessInspector)?;
+        self.run_cycle_with_snapshot(&snapshot, opts, &crate::activity::SysinfoProcessInspector)?;
         Ok(())
     }
 
@@ -242,25 +291,40 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         safety: SafetyOptions,
         inspector: &impl ProcessInspector,
     ) -> Result<RunCycleResult> {
-        self.reconcile_cached_state()?;
+        let snapshot = self.cycle_snapshot()?;
+        self.run_cycle_with_snapshot(&snapshot, safety, inspector)
+    }
+
+    fn run_cycle_with_snapshot(
+        &self,
+        snapshot: &DaemonCycleSnapshot,
+        safety: SafetyOptions,
+        inspector: &impl ProcessInspector,
+    ) -> Result<RunCycleResult> {
+        self.reconcile_cached_state_with(&snapshot.scanner)?;
         let started = self.clock.now();
         let run_id = self.store.start_run(started)?;
-        let (observations, generation) = self.authorized_observations()?;
+        let (observations, generation) = self.authorized_observations(&snapshot.scanner)?;
         let generation_missing = generation.is_none();
         let project_paths: Vec<PathBuf> = observations
             .iter()
             .map(|observation| observation.project_path.clone())
             .collect();
         let scan_error_since = started
-            .checked_sub(self.opts.scan_interval)
+            .checked_sub(snapshot.options.scan_interval)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
         let scan_coverage_incomplete = self
             .store
             .scan_coverage_incomplete_since(scan_error_since)?;
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
-        let coverage_incomplete =
-            generation_missing || scan_coverage_incomplete || !discovery_blocks.is_empty();
+        let durable_generation_incomplete = self
+            .store
+            .current_generation_coverage_incomplete(snapshot.scanner.policy_hash())?;
+        let coverage_incomplete = generation_missing
+            || durable_generation_incomplete
+            || scan_coverage_incomplete
+            || !discovery_blocks.is_empty();
         let mut activity_sampler = ActivitySampler::new(inspector);
         let activity =
             activity_signals(activity_sampler.active_projects_at(&project_paths, started)?);
@@ -280,11 +344,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 &activity,
                 started,
                 &safety,
-                self.scanner.identity_provider(),
+                snapshot.scanner.identity_provider(),
             )?;
 
             if review.decision == CleanDecision::Cleanable {
-                match self.scanner.policy() {
+                match snapshot.scanner.policy() {
                     Some(policy) if !policy.contains_project(&path) => {
                         review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
                     }
@@ -319,11 +383,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 // change after this returns, so this narrows but cannot eliminate
                 // the residual TOCTOU window.
                 let revalidation_now = self.clock.now();
-                review.decision = match self.scanner.policy() {
+                review.decision = match snapshot.scanner.policy() {
                     Some(policy) => revalidate_before_clean(
                         &review,
                         policy,
-                        self.scanner.identity_provider(),
+                        snapshot.scanner.identity_provider(),
                         &activity_signals(
                             activity_sampler
                                 .active_projects_at(&project_paths, revalidation_now)?,
@@ -453,11 +517,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
 
     fn authorized_observations(
         &self,
+        scanner: &Scanner,
     ) -> Result<(Vec<ProjectObservation>, Option<DiscoveryGeneration>)> {
-        if self.scanner.policy().is_none() {
+        if scanner.policy().is_none() {
             return Ok((Vec::new(), None));
         }
-        let Some(generation) = self.store.current_generation(self.scanner.policy_hash())? else {
+        let Some(generation) = self.store.current_generation(scanner.policy_hash())? else {
             return Ok((Vec::new(), None));
         };
         let observations = self.store.authorized_observations(generation.id)?;
@@ -492,19 +557,20 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_until_shutdown(&self, shutdown: &ShutdownFlag) -> Result<()> {
-        let mut schedule = self.scheduler_status_or_initialize()?;
-        self.schedule_missing_generation_scan(&mut schedule)?;
-        if self.scanner.policy().is_some()
+        let mut scheduler_snapshot = self.cycle_snapshot()?;
+        let mut schedule = self.scheduler_status_or_initialize(&scheduler_snapshot)?;
+        self.schedule_missing_generation_scan(&mut schedule, &scheduler_snapshot)?;
+        if scheduler_snapshot.scanner.policy().is_some()
             && !self
                 .store
-                .has_matching_generation(self.scanner.policy_hash())?
+                .has_matching_generation(scheduler_snapshot.scanner.policy_hash())?
             && self.clock.now() >= schedule.next_scan_at
         {
             if let Err(err) = self.scan_cycle() {
-                self.defer_after_scan_failure(&mut schedule, &err)?;
+                self.defer_after_scan_failure(&mut schedule, &err, &scheduler_snapshot)?;
             } else {
                 self.store.clear_scan_retry_at()?;
-                schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
+                schedule.next_scan_at = self.clock.now() + scheduler_snapshot.options.scan_interval;
                 self.store.record_scheduler_status(
                     self.clock.now(),
                     schedule.next_clean_at,
@@ -513,7 +579,8 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             }
         }
         while !shutdown.is_requested() {
-            self.schedule_missing_generation_scan(&mut schedule)?;
+            scheduler_snapshot = self.cycle_snapshot()?;
+            self.schedule_missing_generation_scan(&mut schedule, &scheduler_snapshot)?;
             let next_due = if schedule.next_clean_at <= schedule.next_scan_at {
                 schedule.next_clean_at
             } else {
@@ -526,15 +593,16 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             let now = self.clock.now();
             if now >= schedule.next_scan_at {
                 if let Err(err) = self.scan_cycle() {
-                    self.defer_after_scan_failure(&mut schedule, &err)?;
+                    self.defer_after_scan_failure(&mut schedule, &err, &scheduler_snapshot)?;
                     continue;
                 }
                 self.store.clear_scan_retry_at()?;
-                schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
+                schedule.next_scan_at = self.clock.now() + scheduler_snapshot.options.scan_interval;
             }
             if now >= schedule.next_clean_at {
                 self.run_cycle()?;
-                schedule.next_clean_at = self.clock.now() + self.opts.clean_interval;
+                schedule.next_clean_at =
+                    self.clock.now() + scheduler_snapshot.options.clean_interval;
             }
             self.store.record_scheduler_status(
                 self.clock.now(),
@@ -545,11 +613,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         Ok(())
     }
 
-    fn schedule_missing_generation_scan(&self, schedule: &mut SchedulerStatus) -> Result<()> {
-        if self.scanner.policy().is_none()
+    fn schedule_missing_generation_scan(
+        &self,
+        schedule: &mut SchedulerStatus,
+        snapshot: &DaemonCycleSnapshot,
+    ) -> Result<()> {
+        if snapshot.scanner.policy().is_none()
             || self
                 .store
-                .has_matching_generation(self.scanner.policy_hash())?
+                .has_matching_generation(snapshot.scanner.policy_hash())?
         {
             return Ok(());
         }
@@ -598,13 +670,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         &self,
         schedule: &mut SchedulerStatus,
         err: &anyhow::Error,
+        snapshot: &DaemonCycleSnapshot,
     ) -> Result<()> {
-        let retry_delay = self.opts.scan_interval.max(Duration::from_secs(1));
+        let retry_delay = snapshot.options.scan_interval.max(Duration::from_secs(1));
         let now = self.clock.now();
         let mut retry_at = now + retry_delay;
         if !self
             .store
-            .has_matching_generation(self.scanner.policy_hash())?
+            .has_matching_generation(snapshot.scanner.policy_hash())?
         {
             if let Some(forced_at) = self.store.last_forced_scan_at()? {
                 retry_at = retry_at.max(
@@ -625,12 +698,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         Ok(())
     }
 
-    fn scheduler_status_or_initialize(&self) -> Result<SchedulerStatus> {
+    fn scheduler_status_or_initialize(
+        &self,
+        snapshot: &DaemonCycleSnapshot,
+    ) -> Result<SchedulerStatus> {
         if let Some(mut status) = self.store.scheduler_status()? {
             let next_scan_at = clamp_next_scan_at(
                 status.next_scan_at,
                 self.clock.now(),
-                self.opts.scan_interval,
+                snapshot.options.scan_interval,
             );
             if next_scan_at != status.next_scan_at {
                 status.next_scan_at = next_scan_at;
@@ -649,12 +725,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             .last_run()
             .ok()
             .and_then(|run| run.finished_at)
-            .map(|finished_at| finished_at + self.opts.clean_interval)
-            .unwrap_or(now + self.opts.clean_interval);
+            .map(|finished_at| finished_at + snapshot.options.clean_interval)
+            .unwrap_or(now + snapshot.options.clean_interval);
         let status = SchedulerStatus {
             updated_at: now,
             next_clean_at,
-            next_scan_at: now + self.opts.scan_interval,
+            next_scan_at: now + snapshot.options.scan_interval,
         };
         self.store.record_scheduler_status(
             status.updated_at,

@@ -752,6 +752,71 @@ fn run_no_scan_uses_only_cached_state() {
     assert!(store.all_projects().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn persisted_incomplete_origin_keeps_all_review_paths_incomplete_after_diagnostics_age_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home) = seed_incomplete_diagnostic_state(&work);
+    let database = state.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "
+            DELETE FROM worktree_discovery_failures;
+            UPDATE errors SET ts = 1;
+            ",
+        )
+        .unwrap();
+
+    let bin_dir = work.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let cargo_marker = work.path().join("cargo-ran");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", cargo_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--no-scan", "--force", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .code(2);
+    assert!(!cargo_marker.exists());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["projects", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .assert()
+        .code(2);
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["status", "--refresh", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .assert()
+        .code(2);
+}
+
 #[test]
 fn dry_run_no_scan_rejects_target_replaced_after_matching_generation() {
     let work = tempfile::tempdir().unwrap();

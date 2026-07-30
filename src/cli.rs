@@ -2,7 +2,7 @@ use crate::activity::ProcessInspector;
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{default_path, load, paths, prepare_migration, Config, ConfigWarning, PathSet};
-use crate::daemon::{Daemon, DaemonOptions};
+use crate::daemon::{Daemon, DaemonCycleFactory, DaemonCycleSnapshot, DaemonOptions};
 use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
 use crate::logging::Logger;
@@ -998,6 +998,8 @@ fn project_reviews(
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let scan_errors = store.scan_error_paths_since(scan_error_since)?;
     let scan_coverage_incomplete = store.scan_coverage_incomplete_since(scan_error_since)?;
+    let durable_generation_incomplete =
+        store.current_generation_coverage_incomplete(policy.hash())?;
     let discovery_blocks = store.blocked_worktree_discovery_paths()?;
     let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
 
@@ -1042,6 +1044,7 @@ fn project_reviews(
     Ok(ReviewBatch {
         reviews,
         coverage_incomplete: generation.is_none()
+            || durable_generation_incomplete
             || scan_coverage_incomplete
             || !discovery_blocks.is_empty(),
     })
@@ -1247,8 +1250,30 @@ fn daemon(config_path: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()
     logger.info("daemon starting");
     let cargo = resolve_cargo_bin(&default_cargo_candidates())?;
     let store = open_store_at(&path_set)?;
-    let daemon = daemon_for_clean(&store, &cfg, cargo, &policy).with_logger(logger);
+    let daemon = daemon_for_clean(&store, &cfg, cargo, &policy)
+        .with_logger(logger)
+        .with_cycle_factory(Arc::new(ConfigCycleFactory { config_source }));
     daemon.run_forever()
+}
+
+struct ConfigCycleFactory {
+    config_source: PathBuf,
+}
+
+impl DaemonCycleFactory for ConfigCycleFactory {
+    fn snapshot(&self) -> Result<DaemonCycleSnapshot> {
+        let cfg = load(&self.config_source)?;
+        cfg.validate()?;
+        let policy = build_policy(&cfg, &self.config_source)?;
+        Ok(DaemonCycleSnapshot::new(
+            scanner_for(&cfg, &policy),
+            DaemonOptions {
+                clean_interval: cfg.clean_interval,
+                scan_interval: cfg.scan_interval,
+                target_quiet_period: cfg.target_quiet_period,
+            },
+        ))
+    }
 }
 
 fn stats(state_dir: Option<PathBuf>, since: Option<String>, top: usize, json: bool) -> Result<()> {

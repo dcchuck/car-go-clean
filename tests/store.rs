@@ -2179,6 +2179,89 @@ fn discovery_generation_forced_scan_timestamp_round_trips() {
 }
 
 #[test]
+fn current_generation_coverage_remains_incomplete_until_a_complete_generation_replaces_it() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    store
+        .reconcile_generation(
+            observed_at,
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: Some("boot-a".to_string()),
+                origins: vec![OriginReconciliation {
+                    kind: DiscoveryOriginKind::ScanRoot,
+                    configured_path: PathBuf::from("/workspace"),
+                    canonical_path: Some(PathBuf::from("/workspace")),
+                    completed: false,
+                    error: Some("traversal failed".to_string()),
+                    observations: vec![],
+                }],
+            },
+        )
+        .unwrap();
+
+    assert!(store
+        .current_generation_coverage_incomplete("policy-a")
+        .unwrap());
+
+    store
+        .reconcile_generation(
+            observed_at + Duration::from_secs(10),
+            &GenerationReconciliation {
+                policy_hash: "policy-a".to_string(),
+                boot_session_id: Some("boot-a".to_string()),
+                origins: vec![completed_origin("/workspace", vec![])],
+            },
+        )
+        .unwrap();
+
+    assert!(!store
+        .current_generation_coverage_incomplete("policy-a")
+        .unwrap());
+    assert!(store
+        .current_generation_coverage_incomplete("missing-policy")
+        .unwrap());
+}
+
+#[test]
+fn invalid_latest_generation_does_not_fall_back_to_older_complete_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let store = test_store(&database);
+    let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    for offset in [0, 10] {
+        store
+            .reconcile_generation(
+                observed_at + Duration::from_secs(offset),
+                &GenerationReconciliation {
+                    policy_hash: "policy-a".to_string(),
+                    boot_session_id: Some("boot-a".to_string()),
+                    origins: vec![completed_origin("/workspace", vec![])],
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "
+            UPDATE discovery_generations
+            SET authority_valid = 0
+            WHERE id = (SELECT MAX(id) FROM discovery_generations)
+            ",
+            [],
+        )
+        .unwrap();
+    let store = Store::open(&database).unwrap();
+
+    assert_eq!(store.current_generation("policy-a").unwrap(), None);
+    assert!(store
+        .current_generation_coverage_incomplete("policy-a")
+        .unwrap());
+}
+
+#[test]
 fn scheduler_scan_retry_deadline_round_trips_and_clears() {
     let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
