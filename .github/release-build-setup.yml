@@ -12,6 +12,8 @@
   run: cargo fmt --all -- --check
 - name: Check Clippy
   run: cargo clippy --all-targets --locked -- -D warnings
+- name: Install verified dist
+  run: scripts/install-cargo-dist.sh
 - name: Run locked tests
   run: cargo test --locked
 - name: Check shell installer

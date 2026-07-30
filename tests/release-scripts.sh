@@ -1452,57 +1452,196 @@ log="$state/gh.log"
 
 if test "$1" = api
 then
-    case "$2" in
+    shift
+    method=GET
+    endpoint=
+    input=
+    while test "$#" -gt 0
+    do
+        case "$1" in
+            --method) method=$2; shift 2 ;;
+            --input) input=$2; shift 2 ;;
+            --jq|-f|-F|--field|--raw-field) shift 2 ;;
+            graphql)
+                endpoint=graphql
+                shift
+                ;;
+            *)
+                if test -z "$endpoint"
+                then
+                    endpoint=$1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    case "$endpoint" in
+        graphql)
+            if test -n "${FAKE_DISCOVERY_AUTH_FAILURE:-}"
+            then
+                echo 'gh: authentication failed (HTTP 401)' >&2
+                exit 1
+            fi
+            if test -n "${FAKE_DISCOVERY_QUERY_FAILURE:-}"
+            then
+                printf '%s\n' '{"errors":[{"message":"query failed"}]}'
+                exit 0
+            fi
+            if test -n "${FAKE_DISCOVERY_MISSING_RELEASE:-}"
+            then
+                printf '%s\n' '{"data":{"repository":{}}}'
+                exit 0
+            fi
+            if test ! -f "$state/release.json"
+            then
+                printf '%s\n' '{"data":{"repository":{"release":null}}}'
+            else
+                jq '{
+                    data: {
+                        repository: {
+                            release: {
+                                databaseId: .databaseId,
+                                isDraft: .isDraft
+                            }
+                        }
+                    }
+                }' "$state/release.json"
+            fi
+            ;;
         repos/dcchuck/car-go-clean)
             printf '%s\n' dcchuck/car-go-clean
-            exit 0
             ;;
         repos/dcchuck/car-go-clean/git/ref/tags/v0.4.0)
-            printf '%s\t%s\n' tag aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-            exit 0
+            count=0
+            if test -f "$state/tag-ref-count"
+            then
+                count=$(cat "$state/tag-ref-count")
+            fi
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$state/tag-ref-count"
+            if test "${FAKE_DELETE_TAG_ON_REF_CALL:-0}" -eq "$count"
+            then
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            fi
+            if test "${FAKE_REPLACE_TAG_ON_REF_CALL:-0}" -eq "$count"
+            then
+                printf '%s\t%s\n' tag bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            else
+                printf '%s\t%s\n' tag aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            fi
             ;;
         repos/dcchuck/car-go-clean/git/tags/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
             printf '%s\t%s\n' \
                 commit \
                 0123456789abcdef0123456789abcdef01234567
-            exit 0
+            ;;
+        repos/dcchuck/car-go-clean/git/tags/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+            printf '%s\t%s\n' \
+                commit \
+                0123456789abcdef0123456789abcdef01234567
             ;;
         repos/dcchuck/car-go-clean/releases/tags/v0.4.0)
-            if test -n "${FAKE_VIEW_OUTAGE:-}"
-            then
-                echo 'gh: authentication failed (HTTP 401)' >&2
-                exit 1
-            fi
-            if test ! -f "$state/release.json"
+            # GitHub's REST-by-tag endpoint is published-only. A draft must be
+            # found through GraphQL and fetched by numeric database ID.
+            if test ! -f "$state/release.json" ||
+               test "$(jq -r '.isDraft' "$state/release.json")" = true
             then
                 echo 'gh: Not Found (HTTP 404)' >&2
                 exit 1
             fi
-            jq '{
-                tagName: .tagName,
-                isDraft: .isDraft,
-                targetCommitish: .targetCommitish,
-                assets: .assets
-            }' "$state/release.json"
-            exit 0
+            cat "$state/release.json"
+            ;;
+        repos/dcchuck/car-go-clean/releases/assets/*)
+            test "$method" = DELETE
+            asset_id=${endpoint##*/}
+            if test -n "${FAKE_REPLACE_ASSET_BEFORE_DELETE:-}" &&
+               test ! -f "$state/asset-replaced"
+            then
+                tmp="$state/release.json.tmp"
+                jq \
+                    --argjson old_id "$asset_id" \
+                    '.assets |= map(
+                        if .id == $old_id then .id = 999 else . end
+                    )' \
+                    "$state/release.json" > "$tmp"
+                mv "$tmp" "$state/release.json"
+                : > "$state/asset-replaced"
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            fi
+            test "$(
+                jq --argjson id "$asset_id" \
+                    '[.assets[] | select(.id == $id)] | length' \
+                    "$state/release.json"
+            )" -eq 1 || {
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            }
+            tmp="$state/release.json.tmp"
+            jq --argjson id "$asset_id" \
+                '.assets |= map(select(.id != $id))' \
+                "$state/release.json" > "$tmp"
+            mv "$tmp" "$state/release.json"
+            ;;
+        repos/dcchuck/car-go-clean/releases/*)
+            release_id=${endpoint##*/}
+            test -f "$state/release.json" || {
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            }
+            test "$(jq -r '.databaseId' "$state/release.json")" = "$release_id" || {
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            }
+            case "$method" in
+                GET)
+                    cat "$state/release.json"
+                    ;;
+                PATCH)
+                    test -f "$input"
+                    tmp="$state/release.json.tmp"
+                    jq \
+                        --slurpfile patch "$input" \
+                        '.tagName = $patch[0].tag_name |
+                         .targetCommitish = $patch[0].target_commitish |
+                         .name = $patch[0].name |
+                         .body = $patch[0].body |
+                         .isDraft = $patch[0].draft' \
+                        "$state/release.json" > "$tmp"
+                    mv "$tmp" "$state/release.json"
+                    if test -n "${FAKE_REPLACE_RELEASE_AFTER_PATCH:-}"
+                    then
+                        tmp="$state/release.json.tmp"
+                        jq '.databaseId = 74' "$state/release.json" > "$tmp"
+                        mv "$tmp" "$state/release.json"
+                    fi
+                    cat "$state/release.json"
+                    ;;
+                *)
+                    echo "unexpected release API method: $method" >&2
+                    exit 2
+                    ;;
+            esac
             ;;
         repos/dcchuck/car-go-clean/commits/*)
-            target=${2##*/}
+            target=${endpoint##*/}
             printf '%s\n' "${FAKE_RESOLVED_SHA:-$target}"
-            exit 0
             ;;
         *)
-            echo "unexpected gh api path: $2" >&2
+            echo "unexpected gh api path: $endpoint" >&2
             exit 2
             ;;
     esac
+    exit 0
 fi
 
 test "$1" = release
 command=$2
 case "$command" in
     view)
-        echo 'release lookup must use the REST endpoint' >&2
+        echo 'release lookup must use GraphQL and numeric release IDs' >&2
         exit 2
         ;;
     create)
@@ -1512,6 +1651,7 @@ case "$command" in
         title=
         notes_file=
         draft=false
+        verify_tag=false
         while test "$#" -gt 0
         do
             case "$1" in
@@ -1520,74 +1660,42 @@ case "$command" in
                 --notes-file) notes_file=$2; shift 2 ;;
                 --repo) shift 2 ;;
                 --draft) draft=true; shift ;;
+                --verify-tag) verify_tag=true; shift ;;
                 *) echo "unexpected release create argument: $1" >&2; exit 2 ;;
             esac
         done
         test "$draft" = true
+        test "$verify_tag" = true
         test -f "$notes_file"
+        test ! -f "$state/release.json"
+        if test -n "${FAKE_DELETE_TAG_BEFORE_CREATE:-}"
+        then
+            echo 'tag v0.4.0 not found' >&2
+            exit 1
+        fi
         jq -n \
             --arg tag "$tag" \
             --arg target "$target" \
             --arg title "$title" \
+            --rawfile body "$notes_file" \
             '{
+                databaseId: 73,
                 tagName: $tag,
                 isDraft: true,
                 isPrerelease: false,
                 targetCommitish: $target,
                 name: $title,
+                body: $body,
                 assets: []
             }' > "$state/release.json"
         ;;
     edit)
-        test -f "$state/release.json"
-        tag=$3
-        shift 3
-        target=
-        title=
-        notes_file=
-        draft=false
-        while test "$#" -gt 0
-        do
-            case "$1" in
-                --target) target=$2; shift 2 ;;
-                --title) title=$2; shift 2 ;;
-                --notes-file) notes_file=$2; shift 2 ;;
-                --repo) shift 2 ;;
-                --draft) draft=true; shift ;;
-                *) echo "unexpected release edit argument: $1" >&2; exit 2 ;;
-            esac
-        done
-        test "$draft" = true
-        test -f "$notes_file"
-        tmp="$state/release.json.tmp"
-        jq \
-            --arg tag "$tag" \
-            --arg target "$target" \
-            --arg title "$title" \
-            '.tagName = $tag |
-             .targetCommitish = $target |
-             .name = $title' \
-            "$state/release.json" > "$tmp"
-        mv "$tmp" "$state/release.json"
+        echo 'release edits must use the verified numeric release ID' >&2
+        exit 2
         ;;
     delete-asset)
-        test -f "$state/release.json"
-        tag=$3
-        name=$4
-        shift 4
-        while test "$#" -gt 0
-        do
-            case "$1" in
-                --repo) shift 2 ;;
-                --yes) shift ;;
-                *) echo "unexpected release delete-asset argument: $1" >&2; exit 2 ;;
-            esac
-        done
-        test "$(jq -r '.tagName' "$state/release.json")" = "$tag"
-        tmp="$state/release.json.tmp"
-        jq --arg name "$name" '.assets |= map(select(.name != $name))' \
-            "$state/release.json" > "$tmp"
-        mv "$tmp" "$state/release.json"
+        echo 'asset deletion must use the verified numeric asset ID' >&2
+        exit 2
         ;;
     upload)
         test -f "$state/release.json"
@@ -1648,6 +1756,61 @@ do
         "$archive" \
         > "$draft_assets/$archive.sha256"
 done
+printf '%s\n' 'class CarGoClean < Formula' > "$draft_assets/car-go-clean.rb"
+printf '%s\n' 'aggregate checksums' > "$draft_assets/sha256.sum"
+printf '%s\n' 'source archive fixture' > "$draft_assets/source.tar.gz"
+printf '%s  %s\n' \
+    "$(hash_file "$draft_assets/source.tar.gz")" \
+    source.tar.gz \
+    > "$draft_assets/source.tar.gz.sha256"
+
+draft_expected_assets='
+car-go-clean-aarch64-apple-darwin.tar.xz
+car-go-clean-aarch64-apple-darwin.tar.xz.sha256
+car-go-clean-aarch64-unknown-linux-musl.tar.xz
+car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256
+car-go-clean-x86_64-apple-darwin.tar.xz
+car-go-clean-x86_64-apple-darwin.tar.xz.sha256
+car-go-clean-x86_64-unknown-linux-musl.tar.xz
+car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256
+car-go-clean.rb
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
+'
+draft_expected_json=$(
+    printf '%s\n' "$draft_expected_assets" |
+        sed '/^$/d' |
+        jq -Rsc 'split("\n") | map(select(length > 0))'
+)
+draft_plan_manifest="$work/draft-plan-dist-manifest.json"
+jq -n \
+    --arg tag v0.4.0 \
+    --argjson names "$draft_expected_json" \
+    '{
+        dist_version: "0.32.0",
+        announcement_tag: $tag,
+        artifacts: ($names | map({key: ., value: {name: .}}) | from_entries),
+        upload_files: []
+    }' > "$draft_plan_manifest"
+draft_global_manifest="$work/draft-global-dist-manifest.json"
+jq -n \
+    '[
+        "car-go-clean.rb",
+        "sha256.sum",
+        "source.tar.gz",
+        "source.tar.gz.sha256"
+    ]' > "$work/draft-global-assets.json"
+jq -n \
+    --arg tag v0.4.0 \
+    --slurpfile global_names "$work/draft-global-assets.json" \
+    '{
+        dist_version: "0.32.0",
+        announcement_tag: $tag,
+        artifacts: ($global_names[0] |
+            map({key: ., value: {name: .}}) | from_entries),
+        upload_files: ($global_names[0] | map("/target/distrib/" + .))
+    }' > "$draft_global_manifest"
 
 run_draft_upsert() {
     draft_state=$1
@@ -1656,6 +1819,8 @@ run_draft_upsert() {
         PATH="$draft_fake_bin:$PATH" \
         FAKE_GH_STATE="$draft_state" \
         GITHUB_REPOSITORY=dcchuck/car-go-clean \
+        CARGO_DIST_PLAN_MANIFEST="$draft_plan_manifest" \
+        CARGO_DIST_GLOBAL_MANIFEST="$draft_global_manifest" \
         "$@" \
         "$draft_upserter" \
         v0.4.0 \
@@ -1671,14 +1836,11 @@ assert_draft_inventory() {
     test "$(jq -r '.isDraft' "$state/release.json")" = true
     test "$(jq -r '.targetCommitish' "$state/release.json")" = "$draft_sha"
     test "$(jq -r '.name' "$state/release.json")" = 'car-go-clean v0.4.0'
-    test "$(jq '[.assets[].name] | unique | length' "$state/release.json")" -eq 8
-    test "$(jq '[.assets[].name] | length' "$state/release.json")" -eq 8
-    for archive in $archives
+    test "$(jq '[.assets[].name] | unique | length' "$state/release.json")" -eq 12
+    test "$(jq '[.assets[].name] | length' "$state/release.json")" -eq 12
+    for asset in $draft_expected_assets
     do
-        test "$(jq --arg name "$archive" \
-            '[.assets[] | select(.name == $name)] | length' \
-            "$state/release.json")" -eq 1
-        test "$(jq --arg name "$archive.sha256" \
+        test "$(jq --arg name "$asset" \
             '[.assets[] | select(.name == $name)] | length' \
             "$state/release.json")" -eq 1
     done
@@ -1693,29 +1855,77 @@ then
     exit 1
 fi
 assert_draft_inventory "$draft_absent"
-test "$(grep -c "$(printf 'CALL\\trelease\\tcreate\\tv0.4.0')" \
+test "$(grep -c "$(printf 'CALL\trelease\tcreate\tv0.4.0')" \
     "$draft_absent/gh.log")" -eq 1
-test "$(grep -c "$(printf 'CALL\\tapi\\trepos/dcchuck/car-go-clean\\t--jq\\t.full_name')" \
+grep -Fq "$(printf '\t--verify-tag')" "$draft_absent/gh.log"
+test "$(grep -c "$(printf 'CALL\tapi\trepos/dcchuck/car-go-clean\t--jq\t.full_name')" \
     "$draft_absent/gh.log")" -eq 1
-test "$(grep -c "$(printf 'CALL\\tapi\\trepos/dcchuck/car-go-clean/git/ref/tags/v0.4.0')" \
-    "$draft_absent/gh.log")" -eq 1
+grep -Fq "$(printf 'CALL\tapi\tgraphql')" "$draft_absent/gh.log"
+grep -Fq "$(printf 'CALL\tapi\trepos/dcchuck/car-go-clean/releases/73')" \
+    "$draft_absent/gh.log"
+if grep -Fq 'releases/tags/v0.4.0' "$draft_absent/gh.log"
+then
+    echo "draft discovery incorrectly used the published-only REST endpoint" >&2
+    exit 1
+fi
 
 draft_outage="$work/draft-outage"
 mkdir -p "$draft_outage"
 expect_failure "release lookup authentication outage" \
-    run_draft_upsert "$draft_outage" FAKE_VIEW_OUTAGE=1
+    run_draft_upsert "$draft_outage" FAKE_DISCOVERY_AUTH_FAILURE=1
 test ! -e "$draft_outage/release.json"
-if grep -Fq "$(printf 'CALL\\trelease\\tcreate')" "$draft_outage/gh.log"
+if grep -Fq "$(printf 'CALL\trelease\tcreate')" "$draft_outage/gh.log"
 then
     echo "draft upsert treated a non-404 lookup failure as absence" >&2
     exit 1
 fi
+draft_query_failure="$work/draft-query-failure"
+mkdir -p "$draft_query_failure"
+expect_failure "release GraphQL query failure" \
+    run_draft_upsert "$draft_query_failure" FAKE_DISCOVERY_QUERY_FAILURE=1
+test ! -e "$draft_query_failure/release.json"
+draft_schema_failure="$work/draft-schema-failure"
+mkdir -p "$draft_schema_failure"
+expect_failure "release GraphQL response without explicit release null" \
+    run_draft_upsert "$draft_schema_failure" FAKE_DISCOVERY_MISSING_RELEASE=1
+test ! -e "$draft_schema_failure/release.json"
+
+for bad_manifest in plan global
+do
+    bad_state="$work/draft-bad-$bad_manifest"
+    mkdir -p "$bad_state"
+    bad_file="$bad_state/$bad_manifest.json"
+    case "$bad_manifest" in
+        plan)
+            jq 'del(.artifacts["source.tar.gz"])' \
+                "$draft_plan_manifest" > "$bad_file"
+            bad_env="CARGO_DIST_PLAN_MANIFEST=$bad_file"
+            ;;
+        global)
+            jq '.upload_files += ["/target/distrib/unexpected.zip"]' \
+                "$draft_global_manifest" > "$bad_file"
+            bad_env="CARGO_DIST_GLOBAL_MANIFEST=$bad_file"
+            ;;
+    esac
+    expect_failure "invalid $bad_manifest cargo-dist inventory" \
+        run_draft_upsert "$bad_state" "$bad_env"
+    test ! -s "$bad_state/gh.log"
+done
+
+printf '%s\n' unexpected > "$draft_assets/unexpected.zip"
+draft_extra="$work/draft-extra-direct-artifact"
+mkdir -p "$draft_extra"
+expect_failure "unexpected direct release artifact" \
+    run_draft_upsert "$draft_extra"
+test ! -s "$draft_extra/gh.log"
+rm "$draft_assets/unexpected.zip"
 
 draft_matching="$work/draft-matching"
 mkdir -p "$draft_matching"
 jq -n \
     --arg sha "$draft_sha" \
     '{
+        databaseId: 73,
         tagName: "v0.4.0",
         isDraft: true,
         isPrerelease: false,
@@ -1730,12 +1940,12 @@ run_draft_upsert "$draft_matching"
 test "$(jq '[.assets[] | select(.name == "keep-me.txt")] | length' \
     "$draft_matching/release.json")" -eq 1
 test "$(jq '[.assets[].name] | unique | length' \
-    "$draft_matching/release.json")" -eq 9
+    "$draft_matching/release.json")" -eq 13
 test "$(jq '[.assets[].name] | length' \
-    "$draft_matching/release.json")" -eq 9
-test "$(grep -c "$(printf 'CALL\\trelease\\tdelete-asset\\tv0.4.0\\tcar-go-clean-aarch64-apple-darwin.tar.xz')" \
+    "$draft_matching/release.json")" -eq 13
+test "$(grep -c "$(printf 'CALL\tapi\t--method\tDELETE\trepos/dcchuck/car-go-clean/releases/assets/10')" \
     "$draft_matching/gh.log")" -eq 1
-if grep -Fq "$(printf 'delete-asset\\tv0.4.0\\tkeep-me.txt')" \
+if grep -Fq 'releases/assets/9' \
     "$draft_matching/gh.log"
 then
     echo "draft upsert deleted an unexpected release asset" >&2
@@ -1746,6 +1956,7 @@ draft_resolved_target="$work/draft-resolved-target"
 mkdir -p "$draft_resolved_target"
 jq -n \
     '{
+        databaseId: 73,
         tagName: "v0.4.0",
         isDraft: true,
         isPrerelease: false,
@@ -1755,7 +1966,7 @@ jq -n \
     }' > "$draft_resolved_target/release.json"
 run_draft_upsert "$draft_resolved_target" FAKE_RESOLVED_SHA="$draft_sha"
 assert_draft_inventory "$draft_resolved_target"
-test "$(grep -c "$(printf 'CALL\\tapi\\trepos/dcchuck/car-go-clean/commits/main')" \
+test "$(grep -c "$(printf 'CALL\tapi\trepos/dcchuck/car-go-clean/commits/main')" \
     "$draft_resolved_target/gh.log")" -eq 1
 
 for rejected_state in published mismatched
@@ -1772,6 +1983,7 @@ do
         --argjson draft "$is_draft" \
         --arg target "$target" \
         '{
+            databaseId: 73,
             tagName: "v0.4.0",
             isDraft: $draft,
             isPrerelease: false,
@@ -1780,7 +1992,7 @@ do
             assets: []
         }' > "$rejected/release.json"
     expect_failure "$rejected_state release" run_draft_upsert "$rejected"
-    if grep -Eq "$(printf 'CALL\\trelease\\t(edit|delete-asset|upload|create)')" \
+    if grep -Eq "$(printf 'CALL\trelease\t(upload|create)|CALL\tapi\t--method\t(PATCH|DELETE)')" \
         "$rejected/gh.log"
     then
         echo "$rejected_state release was mutated" >&2
@@ -1796,3 +2008,61 @@ test "$(jq '.assets | length' "$draft_partial/release.json")" -eq 3
 rm "$draft_partial/upload-count"
 run_draft_upsert "$draft_partial"
 assert_draft_inventory "$draft_partial"
+
+draft_deleted_before_create="$work/draft-deleted-before-create"
+mkdir -p "$draft_deleted_before_create"
+expect_failure "tag deleted before verified release creation" \
+    run_draft_upsert "$draft_deleted_before_create" FAKE_DELETE_TAG_BEFORE_CREATE=1
+test ! -e "$draft_deleted_before_create/release.json"
+if grep -Fq "$(printf 'CALL\trelease\tupload')" \
+    "$draft_deleted_before_create/gh.log"
+then
+    echo "assets uploaded after tag deletion" >&2
+    exit 1
+fi
+
+for tag_race in deleted-after-edit replaced-after-edit replaced-at-final-boundary
+do
+    race="$work/draft-$tag_race"
+    mkdir -p "$race"
+    cp "$draft_matching/release.json" "$race/release.json"
+    case "$tag_race" in
+        deleted-after-edit) race_env=FAKE_DELETE_TAG_ON_REF_CALL=2 ;;
+        replaced-after-edit) race_env=FAKE_REPLACE_TAG_ON_REF_CALL=2 ;;
+        replaced-at-final-boundary) race_env=FAKE_REPLACE_TAG_ON_REF_CALL=3 ;;
+    esac
+    expect_failure "$tag_race" \
+        run_draft_upsert "$race" "$race_env"
+    if grep -Eq "$(printf 'CALL\trelease\tupload|CALL\tapi\t--method\tDELETE')" \
+        "$race/gh.log"
+    then
+        echo "assets mutated after a tag replacement race" >&2
+        exit 1
+    fi
+done
+
+draft_release_replaced="$work/draft-release-replaced"
+mkdir -p "$draft_release_replaced"
+cp "$draft_matching/release.json" "$draft_release_replaced/release.json"
+expect_failure "release replaced after metadata patch" \
+    run_draft_upsert "$draft_release_replaced" FAKE_REPLACE_RELEASE_AFTER_PATCH=1
+if grep -Eq "$(printf 'CALL\trelease\tupload|CALL\tapi\t--method\tDELETE')" \
+    "$draft_release_replaced/gh.log"
+then
+    echo "assets mutated after release identity changed" >&2
+    exit 1
+fi
+
+draft_asset_replaced="$work/draft-asset-replaced"
+mkdir -p "$draft_asset_replaced"
+cp "$draft_matching/release.json" "$draft_asset_replaced/release.json"
+expect_failure "asset replaced before ID-addressed deletion" \
+    run_draft_upsert "$draft_asset_replaced" FAKE_REPLACE_ASSET_BEFORE_DELETE=1
+test "$(jq '[.assets[] | select(.id == 999)] | length' \
+    "$draft_asset_replaced/release.json")" -eq 1
+if grep -Fq "$(printf 'CALL\trelease\tupload')" \
+    "$draft_asset_replaced/gh.log"
+then
+    echo "assets uploaded after ID-addressed deletion lost its race" >&2
+    exit 1
+fi

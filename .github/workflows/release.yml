@@ -157,14 +157,14 @@ jobs:
         run: "cargo fmt --all -- --check"
       - name: "Check Clippy"
         run: "cargo clippy --all-targets --locked -- -D warnings"
+      - name: Install verified dist
+        run: scripts/install-cargo-dist.sh
       - name: "Run locked tests"
         run: "cargo test --locked"
       - name: "Check shell installer"
         run: "make test-installer"
       - name: "Check upgrade helper"
         run: "make test-upgrade"
-      - name: Install verified dist
-        run: scripts/install-cargo-dist.sh
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -288,7 +288,10 @@ jobs:
           merge-multiple: true
       - name: Cleanup
         run: |
-          # Remove the granular manifests
+          # Preserve the authoritative plan and global build manifest for the
+          # strict draft preflight, then leave only upload assets in artifacts/.
+          cp artifacts/plan-dist-manifest.json "$RUNNER_TEMP/plan-dist-manifest.json"
+          cp artifacts/global-dist-manifest.json "$RUNNER_TEMP/global-dist-manifest.json"
           rm -f artifacts/*-dist-manifest.json
       - name: Compose reviewed release notes
         env:
@@ -302,6 +305,8 @@ jobs:
       - name: Upsert commit-bound draft release
         env:
           ANNOUNCEMENT_TITLE: "${{ fromJson(needs.plan.outputs.val).announcement_title }}"
+          CARGO_DIST_GLOBAL_MANIFEST: ${{ runner.temp }}/global-dist-manifest.json
+          CARGO_DIST_PLAN_MANIFEST: ${{ runner.temp }}/plan-dist-manifest.json
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
           scripts/upsert-draft-release.sh \

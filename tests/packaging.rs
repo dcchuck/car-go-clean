@@ -1309,6 +1309,46 @@ fn release_workflow_is_tag_only_and_uses_dist() {
 }
 
 #[test]
+fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
+    let output = Command::new("dist")
+        .args(["plan", "--tag=v0.4.0", "--output-format=json"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo-dist must be installed for release contract tests");
+    assert!(
+        output.status.success(),
+        "cargo-dist plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dist_version"], "0.32.0");
+    assert_eq!(plan["announcement_tag"], "v0.4.0");
+    let actual = plan["artifacts"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual,
+        BTreeSet::from([
+            "car-go-clean-aarch64-apple-darwin.tar.xz",
+            "car-go-clean-aarch64-apple-darwin.tar.xz.sha256",
+            "car-go-clean-aarch64-unknown-linux-musl.tar.xz",
+            "car-go-clean-aarch64-unknown-linux-musl.tar.xz.sha256",
+            "car-go-clean-x86_64-apple-darwin.tar.xz",
+            "car-go-clean-x86_64-apple-darwin.tar.xz.sha256",
+            "car-go-clean-x86_64-unknown-linux-musl.tar.xz",
+            "car-go-clean-x86_64-unknown-linux-musl.tar.xz.sha256",
+            "car-go-clean.rb",
+            "sha256.sum",
+            "source.tar.gz",
+            "source.tar.gz.sha256",
+        ])
+    );
+}
+
+#[test]
 fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(root.join("docs/releases/v0.4.0.md").is_file());
@@ -1316,6 +1356,14 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
 
     let release = workflow(".github/workflows/release.yml");
     let steps = workflow_steps(&release, "host");
+    let cleanup = named_step(steps, "Cleanup");
+    let cleanup_run = run_command(cleanup).unwrap();
+    assert!(cleanup_run
+        .contains("cp artifacts/plan-dist-manifest.json \"$RUNNER_TEMP/plan-dist-manifest.json\""));
+    assert!(cleanup_run.contains(
+        "cp artifacts/global-dist-manifest.json \"$RUNNER_TEMP/global-dist-manifest.json\""
+    ));
+    assert!(cleanup_run.contains("rm -f artifacts/*-dist-manifest.json"));
     let compose = steps
         .iter()
         .enumerate()
@@ -1342,6 +1390,14 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
     assert!(compose.0 < upsert.0);
     assert!(compose.1["env"]["ANNOUNCEMENT_BODY"].as_str().is_some());
     assert!(upsert.1["env"]["ANNOUNCEMENT_BODY"].is_badvalue());
+    assert_eq!(
+        upsert.1["env"]["CARGO_DIST_PLAN_MANIFEST"].as_str(),
+        Some("${{ runner.temp }}/plan-dist-manifest.json")
+    );
+    assert_eq!(
+        upsert.1["env"]["CARGO_DIST_GLOBAL_MANIFEST"].as_str(),
+        Some("${{ runner.temp }}/global-dist-manifest.json")
+    );
     assert!(run_command(upsert.1)
         .unwrap()
         .split_whitespace()
@@ -1383,6 +1439,9 @@ fn ci_runs_release_note_validation_after_installer_validation() {
     let release_setup =
         YamlLoader::load_from_str(&repo_file(".github/release-build-setup.yml")).unwrap();
     let release_steps = release_setup[0].as_vec().unwrap();
+    let setup_dist = step_running(release_steps, "scripts/install-cargo-dist.sh");
+    let setup_tests = step_running(release_steps, "cargo test --locked");
+    assert!(setup_dist.0 < setup_tests.0);
     step_running(release_steps, "make test-upgrade");
 
     let release = workflow(".github/workflows/release.yml");
@@ -1422,6 +1481,19 @@ fn release_publication_workflows_pin_actions_and_use_verified_dist() {
     assert_eq!(
         run_command(named_step(plan_steps, "Install verified dist")),
         Some("scripts/install-cargo-dist.sh")
+    );
+    let local_steps = workflow_steps(&release, "build-local-artifacts");
+    let install_dist = local_steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Install verified dist"))
+        .expect("local release build does not install verified cargo-dist");
+    let locked_tests = local_steps
+        .iter()
+        .position(|step| run_command(step) == Some("cargo test --locked"))
+        .expect("local release build does not run locked tests");
+    assert!(
+        install_dist < locked_tests,
+        "cargo-dist must be installed before packaging tests execute"
     );
     assert!(!repo_file(".github/workflows/release.yml").contains("cargo-dist-installer.sh | sh"));
 }
