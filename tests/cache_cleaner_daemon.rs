@@ -1482,6 +1482,76 @@ fn cleaner_measures_bytes_and_skips_missing_target() {
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
 }
 
+#[test]
+fn cleaner_reports_only_after_preflight_and_immediately_before_runner() {
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let runner = SequencedRunner {
+        events: events.clone(),
+        exit_code: 0,
+    };
+    let cleaner = Cleaner::new("cargo", runner, Duration::from_secs(60));
+    let report_events = events.clone();
+
+    let skipped = cleaner
+        .clean_with_attempt_reporter(project.path(), move |_project, target| {
+            report_events
+                .lock()
+                .unwrap()
+                .push(format!("target:{}", target.display()));
+        })
+        .unwrap();
+
+    assert!(skipped.skipped);
+    assert!(events.lock().unwrap().is_empty());
+
+    write_file(&project.path().join("target/blob.bin"), &[0; 4096]);
+    let report_events = events.clone();
+    let result = cleaner
+        .clean_with_attempt_reporter(project.path(), move |_project, target| {
+            report_events
+                .lock()
+                .unwrap()
+                .push(format!("target:{}", target.display()));
+        })
+        .unwrap();
+
+    assert!(!result.skipped);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("target:{}", project.path().join("target").display()),
+            format!("cargo:{}", project.path().display()),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cleaner_preflight_error_emits_no_target_event_and_runs_no_cargo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().unwrap();
+    write_file(&project.path().join("Cargo.toml"), b"[package]\n");
+    write_file(&project.path().join("target/blob.bin"), &[0; 4096]);
+    let target = project.path().join("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+    let runner = FakeRunner::default();
+    let cleaner = Cleaner::new("cargo", runner.clone(), Duration::from_secs(60));
+    let reported = Arc::new(AtomicUsize::new(0));
+    let reported_for_callback = reported.clone();
+
+    let result = cleaner.clean_with_attempt_reporter(project.path(), move |_, _| {
+        reported_for_callback.fetch_add(1, Ordering::SeqCst);
+    });
+
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(reported.load(Ordering::SeqCst), 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_skips_canonical_project_for_symlink_spelled_active_argument() {
@@ -6065,6 +6135,223 @@ fn exact_review_execution_never_appends_scanner_candidates() {
         runner.calls.lock().unwrap()[0].dir,
         included.canonicalize().unwrap()
     );
+}
+
+#[test]
+fn persisted_review_reauthorizes_exact_path_across_boot_with_fresh_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let project = project.canonicalize().unwrap();
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: vec![],
+            excludes: vec![],
+        })
+        .with_authority(policy.clone(), identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let generation = daemon.scan_cycle().unwrap();
+    let persisted = review_project_with_identity_provider(
+        &project,
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        },
+        identity.as_ref(),
+    )
+    .unwrap();
+    let plan = store
+        .create_review_plan(
+            SystemTime::now(),
+            policy.hash(),
+            generation.generation,
+            false,
+            persisted.target_bytes as i64,
+            &[persisted],
+        )
+        .unwrap();
+    let loaded = store
+        .load_review_plan(
+            plan.id,
+            SystemTime::now(),
+            policy.hash(),
+            generation.generation,
+        )
+        .unwrap();
+    assert_eq!(
+        loaded.targets[0]
+            .review
+            .reviewed_identity
+            .as_ref()
+            .unwrap()
+            .boot_session,
+        Some(BootSessionId("boot-a".to_string()))
+    );
+    identity.switch_boot();
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            loaded
+                .targets
+                .into_iter()
+                .map(|target| target.review)
+                .collect(),
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert!(!project.join("target").exists());
+}
+
+#[test]
+fn persisted_review_rejects_same_boot_identity_replacement_without_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let project = project.canonicalize().unwrap();
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "scan_dirs = [{}]\noverride_excludes = []\ntarget_quiet_period = \"1ms\"\n",
+            serde_json::to_string(root.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config_path).unwrap();
+    let policy = ScopePolicy::build(&cfg, &config_path, &EmptyEnvironment).unwrap();
+    let identity = Arc::new(SwitchableIdentityProvider {
+        boot_phase: AtomicUsize::new(0),
+        target_revision: AtomicUsize::new(0),
+        cross_device: AtomicUsize::new(0),
+    });
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner::default();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        Scanner::new(ScannerOptions {
+            roots: cfg.scan_dirs.clone(),
+            project_dirs: vec![],
+            excludes: vec![],
+        })
+        .with_authority(policy.clone(), identity.clone()),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    let generation = daemon.scan_cycle().unwrap();
+    let persisted = review_project_with_identity_provider(
+        &project,
+        &[],
+        &[],
+        &[],
+        SystemTime::now(),
+        &SafetyOptions {
+            target_quiet_period: Duration::ZERO,
+            include_managed_cache: false,
+            include_active: false,
+            force: false,
+        },
+        identity.as_ref(),
+    )
+    .unwrap();
+    let plan = store
+        .create_review_plan(
+            SystemTime::now(),
+            policy.hash(),
+            generation.generation,
+            false,
+            persisted.target_bytes as i64,
+            &[persisted],
+        )
+        .unwrap();
+    let loaded = store
+        .load_review_plan(
+            plan.id,
+            SystemTime::now(),
+            policy.hash(),
+            generation.generation,
+        )
+        .unwrap();
+    identity.replace_target_in_same_boot();
+
+    let result = daemon
+        .execute_reviews_with_safety(
+            loaded
+                .targets
+                .into_iter()
+                .map(|target| target.review)
+                .collect(),
+            false,
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
 }
 
 #[test]

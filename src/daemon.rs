@@ -1,6 +1,7 @@
 use crate::activity::{ActivitySampler, ActivitySignal, ProcessInspector};
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
+use crate::identity::{compare_persisted, IdentityComparison};
 use crate::logging::Logger;
 use crate::safety::{
     bind_review_to_observation, revalidate_before_clean, review_project_with_identity_provider,
@@ -160,6 +161,26 @@ struct PreparedReview {
 }
 
 type TargetReporter = dyn Fn(&ProjectReview) + Send + Sync;
+
+fn enforce_current_policy(scanner: &Scanner, review: &mut ProjectReview) {
+    if review.decision != CleanDecision::Cleanable {
+        return;
+    }
+    match scanner.policy() {
+        Some(policy) if !policy.contains_project(&review.path) => {
+            review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
+        }
+        Some(policy)
+            if policy.is_excluded(&review.path) || policy.is_excluded(&review.target_path) =>
+        {
+            review.decision = CleanDecision::Skipped(SkipReason::Excluded);
+        }
+        Some(_) => {}
+        None => {
+            review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
+        }
+    }
+}
 
 pub struct Daemon<'a, R: CommandRunner> {
     store: &'a Store,
@@ -374,22 +395,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 snapshot.scanner.identity_provider(),
             )?;
 
-            if review.decision == CleanDecision::Cleanable {
-                match snapshot.scanner.policy() {
-                    Some(policy) if !policy.contains_project(&path) => {
-                        review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
-                    }
-                    Some(policy)
-                        if policy.is_excluded(&path) || policy.is_excluded(&review.target_path) =>
-                    {
-                        review.decision = CleanDecision::Skipped(SkipReason::Excluded);
-                    }
-                    Some(_) => {}
-                    None => {
-                        review.decision = CleanDecision::Skipped(SkipReason::OutOfScope);
-                    }
-                }
-            }
+            enforce_current_policy(&snapshot.scanner, &mut review);
 
             let mut reverified_across_boot = false;
             if review.decision == CleanDecision::Cleanable {
@@ -430,15 +436,81 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         source: RunSource,
     ) -> Result<RunCycleResult> {
         let snapshot = self.cycle_snapshot()?;
-        let reviews = reviews
+        let persisted_reviews = reviews
             .into_iter()
             .filter(|review| review.decision == CleanDecision::Cleanable)
-            .map(|review| PreparedReview {
-                review,
-                reverified_across_boot: false,
-            })
-            .collect();
+            .collect::<Vec<_>>();
+        let project_paths = persisted_reviews
+            .iter()
+            .map(|review| review.path.clone())
+            .collect::<Vec<_>>();
+        let reviewed_at = self.clock.now();
+        let scan_error_since = reviewed_at
+            .checked_sub(snapshot.options.scan_interval)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let scan_errors = self.store.scan_error_paths_since(scan_error_since)?;
+        let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
         let mut activity_sampler = ActivitySampler::new(inspector);
+        let activity =
+            activity_signals(activity_sampler.active_projects_at(&project_paths, reviewed_at)?);
+        let reviews = persisted_reviews
+            .into_iter()
+            .map(|persisted| {
+                let mut fresh = review_project_with_identity_provider(
+                    &persisted.path,
+                    &scan_errors,
+                    &discovery_blocks,
+                    &activity,
+                    reviewed_at,
+                    &safety,
+                    snapshot.scanner.identity_provider(),
+                )?;
+                enforce_current_policy(&snapshot.scanner, &mut fresh);
+                if fresh.decision == CleanDecision::Cleanable
+                    && (fresh.path != persisted.path
+                        || fresh.target_path != persisted.target_path
+                        || fresh.canonical_path != persisted.canonical_path)
+                {
+                    fresh.decision = CleanDecision::Skipped(SkipReason::ProjectIdentityChanged);
+                }
+                if fresh.decision == CleanDecision::Cleanable {
+                    match (
+                        persisted.reviewed_identity.as_ref(),
+                        fresh.reviewed_identity.as_ref(),
+                    ) {
+                        (Some(persisted_identity), Some(fresh_identity)) => {
+                            if compare_persisted(
+                                persisted_identity.boot_session.as_ref(),
+                                fresh_identity.boot_session.as_ref(),
+                                &persisted_identity.project,
+                                &fresh_identity.project,
+                            ) == IdentityComparison::Replaced
+                            {
+                                fresh.decision =
+                                    CleanDecision::Skipped(SkipReason::ProjectIdentityChanged);
+                            } else if compare_persisted(
+                                persisted_identity.boot_session.as_ref(),
+                                fresh_identity.boot_session.as_ref(),
+                                &persisted_identity.target,
+                                &fresh_identity.target,
+                            ) == IdentityComparison::Replaced
+                            {
+                                fresh.decision =
+                                    CleanDecision::Skipped(SkipReason::TargetIdentityChanged);
+                            }
+                        }
+                        _ => {
+                            fresh.decision =
+                                CleanDecision::Skipped(SkipReason::ProjectIdentityUnavailable);
+                        }
+                    }
+                }
+                Ok(PreparedReview {
+                    review: fresh,
+                    reverified_across_boot: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.execute_prepared_reviews(
             &snapshot,
             reviews,
@@ -535,11 +607,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             if review.decision != CleanDecision::Cleanable {
                 continue;
             }
-            if let Some(reporter) = &self.target_reporter {
-                reporter(review);
-            }
 
-            match self.cleaner.clean(&path) {
+            match self.cleaner.clean_with_attempt_reporter(&path, |_, _| {
+                if let Some(reporter) = &self.target_reporter {
+                    reporter(review);
+                }
+            }) {
                 Ok(result) if result.skipped => {
                     cleaner_skipped += 1;
                 }
