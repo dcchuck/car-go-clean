@@ -5,6 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
+__CAR_GO_CLEAN_ENVIRONMENT__
 ExecStart=__CAR_GO_CLEAN_BIN__ daemon
 Restart=on-failure
 RestartSec=30s

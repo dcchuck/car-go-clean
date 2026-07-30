@@ -1,9 +1,10 @@
 use anyhow::Result;
+use car_go_clean::policy::Environment;
 use car_go_clean::service::{
-    resolve_service_binary, CommandOutput, CommandRunner, ServiceManager, ServicePlatform,
-    ServiceStatus,
+    resolve_service_binary, CommandOutput, CommandRunner, ServiceEnvironment, ServiceManager,
+    ServicePlatform, ServiceStatus,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,634 @@ fn strings(args: &[OsString]) -> Vec<String> {
         .collect()
 }
 
+struct TestEnvironment(BTreeMap<String, OsString>);
+
+impl Environment for TestEnvironment {
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        self.0.get(name).cloned()
+    }
+}
+
+fn environment(values: &[(&str, &str)]) -> TestEnvironment {
+    TestEnvironment(
+        values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), OsString::from(value)))
+            .collect(),
+    )
+}
+
+fn call_arguments(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner.calls.iter().map(|(_, args)| strings(args)).collect()
+}
+
+#[test]
+fn mac_install_clears_persistent_disable_before_bootstrap() {
+    let work = tempfile::tempdir().unwrap();
+    let mut manager = ServiceManager::new_with_environment(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::default(),
+        &environment(&[("HOME", "/Users/tester")]),
+    );
+
+    assert_eq!(
+        manager.install().unwrap(),
+        ServiceStatus {
+            installed: true,
+            enabled: true,
+            active: true,
+        }
+    );
+    assert_eq!(
+        call_arguments(&manager.into_runner()),
+        [
+            vec![
+                "enable".to_string(),
+                format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                    libc::geteuid()
+                }),
+            ],
+            vec![
+                "bootstrap".to_string(),
+                format!("gui/{}", unsafe { libc::geteuid() }),
+                work.path()
+                    .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist")
+                    .display()
+                    .to_string(),
+            ],
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                    libc::geteuid()
+                }),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn reinstall_transiently_stops_an_active_service_before_loading_new_environment() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "legacy definition").unwrap();
+    let mut mac = ServiceManager::new_with_environment(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+        &environment(&[("HOME", "/new/home")]),
+    );
+    mac.install().unwrap();
+    let mac_calls = call_arguments(&mac.into_runner());
+    assert_eq!(mac_calls[2][0], "bootout");
+    assert_eq!(mac_calls[3][0], "enable");
+    assert_eq!(mac_calls[4][0], "bootstrap");
+    assert_eq!(mac_calls[5][0], "kickstart");
+
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "legacy definition").unwrap();
+    let mut linux = ServiceManager::new_with_environment(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+            CommandOutput::new(true, "active\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+        &environment(&[("HOME", "/new/home")]),
+    );
+    linux.install().unwrap();
+    let linux_calls = call_arguments(&linux.into_runner());
+    assert_eq!(linux_calls[3], ["--user", "stop", "car-go-clean.service"]);
+    assert_eq!(linux_calls[5], ["--user", "daemon-reload"]);
+    assert_eq!(
+        linux_calls[6],
+        ["--user", "enable", "--now", "car-go-clean.service"]
+    );
+}
+
+#[test]
+fn mac_status_models_persistent_enablement_and_process_state_separately() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "legacy definition").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n  \"com.dcchuck.car-go-clean\" => true\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+        ]),
+    );
+
+    assert_eq!(
+        manager.status().unwrap(),
+        ServiceStatus {
+            installed: true,
+            enabled: false,
+            active: false,
+        }
+    );
+    assert_eq!(
+        call_arguments(&manager.into_runner()),
+        [
+            vec![
+                "print-disabled".to_string(),
+                format!("gui/{}", unsafe { libc::geteuid() }),
+            ],
+            vec![
+                "print".to_string(),
+                format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                    libc::geteuid()
+                }),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn mac_stop_disables_before_bootout_and_start_enables_before_bootstrap() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "legacy definition").unwrap();
+
+    let enabled = "disabled services = {\n}\n";
+    let mut stop = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, enabled.to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+    stop.stop().unwrap();
+    let stop_calls = call_arguments(&stop.into_runner());
+    assert_eq!(stop_calls[2][0], "disable");
+    assert_eq!(stop_calls[3][0], "bootout");
+
+    let mut start = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n  \"com.dcchuck.car-go-clean\" => true\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+    start.start().unwrap();
+    let start_calls = call_arguments(&start.into_runner());
+    assert_eq!(start_calls[2][0], "enable");
+    assert_eq!(start_calls[3][0], "bootstrap");
+    assert_eq!(start_calls[4][0], "kickstart");
+}
+
+#[test]
+fn linux_lifecycle_uses_persistent_enablement_commands_in_order() {
+    let work = tempfile::tempdir().unwrap();
+    let binary = work.path().join("bin/car-go-clean");
+    let mut install = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        binary.clone(),
+        FakeRunner::default(),
+    );
+    install.install().unwrap();
+    assert_eq!(
+        call_arguments(&install.into_runner()),
+        [
+            vec!["--user".to_string(), "show-environment".to_string()],
+            vec!["--user".to_string(), "daemon-reload".to_string()],
+            vec![
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                "car-go-clean.service".to_string(),
+            ],
+        ]
+    );
+
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    let status_outputs = || {
+        [
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+        ]
+    };
+    let mut start = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        binary.clone(),
+        FakeRunner::with_outputs(status_outputs()),
+    );
+    start.start().unwrap();
+    assert!(unit.exists());
+    let start_calls = call_arguments(&start.into_runner());
+    assert_eq!(
+        &start_calls[3..],
+        [
+            vec!["--user".to_string(), "daemon-reload".to_string()],
+            vec![
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                "car-go-clean.service".to_string(),
+            ],
+        ]
+    );
+
+    let mut stop = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        binary,
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+            CommandOutput::new(true, "active\n".to_string(), String::new()),
+        ]),
+    );
+    stop.stop().unwrap();
+    assert_eq!(
+        call_arguments(&stop.into_runner()).last().unwrap(),
+        &[
+            "--user".to_string(),
+            "disable".to_string(),
+            "--now".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn restart_requires_an_installed_and_enabled_definition() {
+    let work = tempfile::tempdir().unwrap();
+    let mut missing = test_manager(
+        ServicePlatform::MacOs,
+        work.path(),
+        work.path().join("bin/car-go-clean"),
+    );
+    assert!(missing
+        .restart()
+        .unwrap_err()
+        .to_string()
+        .contains("not installed"));
+
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "unit").unwrap();
+    let mut disabled = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(false, "disabled\n".to_string(), String::new()),
+            CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+        ]),
+    );
+    assert!(disabled
+        .restart()
+        .unwrap_err()
+        .to_string()
+        .contains("not enabled"));
+}
+
+#[test]
+fn restart_uses_only_the_platform_restart_command_after_state_validation() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "definition").unwrap();
+    let mut mac = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+    mac.restart().unwrap();
+    assert_eq!(
+        call_arguments(&mac.into_runner()).last().unwrap(),
+        &[
+            "kickstart".to_string(),
+            "-k".to_string(),
+            format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
+                libc::geteuid()
+            }),
+        ]
+    );
+
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "definition").unwrap();
+    let mut linux = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+            CommandOutput::new(true, "active\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+    linux.restart().unwrap();
+    assert_eq!(
+        call_arguments(&linux.into_runner()).last().unwrap(),
+        &[
+            "--user".to_string(),
+            "restart".to_string(),
+            "car-go-clean.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn manager_output_must_match_an_enumerated_state() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "unit").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "surprise\n".to_string(), String::new()),
+        ]),
+    );
+
+    assert!(manager
+        .status()
+        .unwrap_err()
+        .to_string()
+        .contains("malformed systemctl is-enabled output"));
+}
+
+#[test]
+fn manager_status_errors_preserve_the_underlying_failure() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "unit").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Failed to query unit: Permission denied".to_string(),
+            ),
+        ]),
+    );
+
+    assert!(manager
+        .status()
+        .unwrap_err()
+        .to_string()
+        .contains("Permission denied"));
+}
+
+#[test]
+fn captured_environment_is_whitelisted_and_round_trips_through_definitions() {
+    let work = tempfile::tempdir().unwrap();
+    let current = environment(&[
+        ("HOME", "/Users/a & b"),
+        ("CARGO_HOME", "/cargo/<shared>"),
+        ("RUSTUP_HOME", "/rustup"),
+        ("XDG_CACHE_HOME", "/cache"),
+        ("XDG_DATA_HOME", "/data/\"quoted\"/%done\\slash"),
+        ("GOMODCACHE", "/go/pkg/mod"),
+        ("BUN_INSTALL", "/bun"),
+        ("BUN_INSTALL_CACHE_DIR", "/bun-cache"),
+        ("COLIMA_HOME", "/colima"),
+        ("LIMA_HOME", "/lima"),
+        ("AWS_SECRET_ACCESS_KEY", "do-not-capture"),
+        ("PATH", "/also/not/captured"),
+    ]);
+    let captured = ServiceEnvironment::capture(&current);
+    assert_eq!(
+        captured.values.keys().cloned().collect::<Vec<_>>(),
+        [
+            "BUN_INSTALL",
+            "BUN_INSTALL_CACHE_DIR",
+            "CARGO_HOME",
+            "COLIMA_HOME",
+            "GOMODCACHE",
+            "HOME",
+            "LIMA_HOME",
+            "RUSTUP_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+        ]
+    );
+
+    let binary = work.path().join("bin/car-go-clean");
+    let mut mac = ServiceManager::new_with_environment(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        binary.clone(),
+        FakeRunner::default(),
+        &current,
+    );
+    mac.install().unwrap();
+    assert_eq!(mac.installed_environment().unwrap(), Some(captured.clone()));
+    assert_eq!(mac.environment_divergence(&current).unwrap(), Some(false));
+
+    let mut linux = ServiceManager::new_with_environment(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        binary,
+        FakeRunner::default(),
+        &current,
+    );
+    linux.install().unwrap();
+    assert_eq!(
+        linux.installed_environment().unwrap(),
+        Some(captured.clone())
+    );
+    assert_eq!(linux.environment_divergence(&current).unwrap(), Some(false));
+
+    let changed = environment(&[
+        ("HOME", "/Users/a & b"),
+        ("CARGO_HOME", "/other-cargo"),
+        ("RUSTUP_HOME", "/rustup"),
+        ("XDG_CACHE_HOME", "/cache"),
+        ("XDG_DATA_HOME", "/data/\"quoted\"/%done\\slash"),
+        ("GOMODCACHE", "/go/pkg/mod"),
+        ("BUN_INSTALL", "/bun"),
+        ("BUN_INSTALL_CACHE_DIR", "/bun-cache"),
+        ("COLIMA_HOME", "/colima"),
+        ("LIMA_HOME", "/lima"),
+    ]);
+    assert_eq!(linux.environment_divergence(&changed).unwrap(), Some(true));
+
+    let lexically_different_but_equivalent = environment(&[
+        ("HOME", "/Users/a & b/"),
+        ("CARGO_HOME", "/cargo/<shared>/"),
+        ("RUSTUP_HOME", "/rustup/"),
+        ("XDG_CACHE_HOME", "/cache/"),
+        ("XDG_DATA_HOME", "/data/\"quoted\"/%done\\slash/"),
+        ("GOMODCACHE", "/go/pkg/mod/"),
+        ("BUN_INSTALL", "/bun/"),
+        ("BUN_INSTALL_CACHE_DIR", "/bun-cache/"),
+        ("COLIMA_HOME", "/colima/"),
+        ("LIMA_HOME", "/lima/"),
+    ]);
+    assert_eq!(
+        linux
+            .environment_divergence(&lexically_different_but_equivalent)
+            .unwrap(),
+        Some(false)
+    );
+}
+
+#[test]
+fn install_rejects_environment_values_that_cannot_be_rendered_safely() {
+    let work = tempfile::tempdir().unwrap();
+    let mut manager = ServiceManager::new_with_environment(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::default(),
+        &environment(&[("HOME", "/home/tester\ninjected")]),
+    );
+
+    let error = manager.install().unwrap_err();
+    assert!(error.to_string().contains("cannot be rendered safely"));
+    assert!(!work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service")
+        .exists());
+    assert!(manager.into_runner().calls.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn install_rejects_non_utf8_environment_values() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let environment = TestEnvironment(BTreeMap::from([(
+        "HOME".to_string(),
+        OsString::from_vec(vec![b'/', b'h', 0xff]),
+    )]));
+    let mut manager = ServiceManager::new_with_environment(
+        ServicePlatform::Linux,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::default(),
+        &environment,
+    );
+
+    let error = manager.install().unwrap_err();
+    assert!(error.to_string().contains("not valid UTF-8"));
+    assert!(!work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service")
+        .exists());
+}
+
+#[test]
+fn legacy_definition_environment_is_unknown_not_equal() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Service]\nExecStart=/bin/true\n").unwrap();
+    let manager = test_manager(
+        ServicePlatform::Linux,
+        work.path(),
+        work.path().join("bin/car-go-clean"),
+    );
+
+    assert_eq!(manager.installed_environment().unwrap(), None);
+    assert_eq!(
+        manager
+            .environment_divergence(&environment(&[("HOME", "/home/tester")]))
+            .unwrap(),
+        None
+    );
+}
+
 #[test]
 fn mac_install_renders_an_escaped_absolute_binary_and_bootstraps_the_agent() {
     let work = tempfile::tempdir().unwrap();
@@ -86,11 +715,7 @@ fn mac_install_renders_an_escaped_absolute_binary_and_bootstraps_the_agent() {
     )
     .unwrap();
     assert!(plist.contains(&binary.display().to_string().replace('&', "&amp;")));
-    assert_eq!(runner.calls[0].1[0], "bootout");
-    assert_eq!(
-        runner.calls[0].1[1].to_string_lossy(),
-        format!("gui/{}", unsafe { libc::geteuid() })
-    );
+    assert_eq!(runner.calls[0].1[0], "enable");
     assert_eq!(
         runner.calls[2].1[2].to_string_lossy(),
         format!("gui/{}/com.dcchuck.car-go-clean", unsafe {
@@ -128,29 +753,6 @@ fn linux_install_writes_user_unit_and_enables_it_without_sudo() {
 }
 
 #[test]
-fn restart_uses_platform_specific_user_service_command() {
-    let work = tempfile::tempdir().unwrap();
-    let mut mac = test_manager(
-        ServicePlatform::MacOs,
-        work.path(),
-        work.path().join("bin/car-go-clean"),
-    );
-    mac.restart().unwrap();
-    assert_eq!(strings(&mac.into_runner().calls[0].1)[0], "kickstart");
-
-    let mut linux = test_manager(
-        ServicePlatform::Linux,
-        work.path(),
-        work.path().join("bin/car-go-clean"),
-    );
-    linux.restart().unwrap();
-    assert_eq!(
-        strings(&linux.into_runner().calls[1].1),
-        ["--user", "restart", "car-go-clean.service"]
-    );
-}
-
-#[test]
 fn uninstall_stops_and_removes_only_the_expected_service_file() {
     let work = tempfile::tempdir().unwrap();
     let expected = work
@@ -161,16 +763,32 @@ fn uninstall_stops_and_removes_only_the_expected_service_file() {
     fs::write(&expected, "unit").unwrap();
     fs::write(&other, "other").unwrap();
 
-    let mut manager = test_manager(
+    let config = work.path().join(".config/car-go-clean/config.toml");
+    let state = work.path().join(".local/state/car-go-clean/state.db");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&config, "scan_dirs=[]").unwrap();
+    fs::write(&state, "state").unwrap();
+
+    let mut manager = ServiceManager::new(
         ServicePlatform::Linux,
-        work.path(),
+        work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+            CommandOutput::new(true, "active\n".to_string(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
     );
     manager.uninstall().unwrap();
     let runner = manager.into_runner();
 
     assert!(!expected.exists());
     assert!(other.exists());
+    assert!(config.exists());
+    assert!(state.exists());
     assert!(runner.calls.iter().any(|(_, args)| {
         strings(args) == ["--user", "disable", "--now", "car-go-clean.service"]
     }));
@@ -189,6 +807,13 @@ fn linux_uninstall_keeps_the_unit_when_disable_fails_unexpectedly() {
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
         FakeRunner {
+            outputs: [
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+                CommandOutput::new(true, "active\n".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
             disable_output: Some(CommandOutput::new(
                 false,
                 String::new(),
@@ -216,6 +841,13 @@ fn linux_uninstall_allows_an_already_missing_systemd_unit() {
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
         FakeRunner {
+            outputs: [
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(false, "not-found\n".to_string(), String::new()),
+                CommandOutput::new(false, "unknown\n".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
             disable_output: Some(CommandOutput::new(
                 false,
                 String::new(),
@@ -243,6 +875,16 @@ fn mac_uninstall_keeps_the_plist_when_bootout_fails_unexpectedly() {
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
         FakeRunner {
+            outputs: [
+                CommandOutput::new(
+                    true,
+                    "disabled services = {\n}\n".to_string(),
+                    String::new(),
+                ),
+                CommandOutput::new(true, String::new(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
             bootout_output: Some(CommandOutput::new(
                 false,
                 String::new(),
@@ -258,29 +900,49 @@ fn mac_uninstall_keeps_the_plist_when_bootout_fails_unexpectedly() {
 }
 
 #[test]
-fn mac_uninstall_removes_the_plist_when_service_is_not_loaded() {
+fn mac_uninstall_disables_before_bootout_and_retains_config_and_state() {
     let work = tempfile::tempdir().unwrap();
     let plist = work
         .path()
         .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    let config = work.path().join(".config/car-go-clean/config.toml");
+    let state = work.path().join(".local/state/car-go-clean/state.db");
     fs::create_dir_all(plist.parent().unwrap()).unwrap();
-    fs::write(&plist, "plist").unwrap();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&plist, "definition").unwrap();
+    fs::write(&config, "scan_dirs=[]").unwrap();
+    fs::write(&state, "state").unwrap();
     let mut manager = ServiceManager::new(
         ServicePlatform::MacOs,
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
-        FakeRunner {
-            bootout_output: Some(CommandOutput::new(
-                false,
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n}\n".to_string(),
                 String::new(),
-                "Boot-out failed: 3: No such process".to_string(),
-            )),
-            ..FakeRunner::default()
-        },
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
     );
 
-    manager.uninstall().unwrap();
+    assert_eq!(
+        manager.uninstall().unwrap(),
+        ServiceStatus {
+            installed: false,
+            enabled: false,
+            active: false,
+        }
+    );
     assert!(!plist.exists());
+    assert!(config.exists());
+    assert!(state.exists());
+    let calls = call_arguments(&manager.into_runner());
+    assert_eq!(calls[2][0], "disable");
+    assert_eq!(calls[3][0], "bootout");
 }
 
 #[test]
@@ -292,14 +954,40 @@ fn status_is_not_installed_without_running_a_platform_command() {
         work.path().join("bin/car-go-clean"),
     );
 
-    let status = manager.status().unwrap();
-    assert!(!status.installed);
+    assert_eq!(
+        manager.status().unwrap(),
+        ServiceStatus {
+            installed: false,
+            enabled: false,
+            active: false,
+        }
+    );
     assert!(manager.into_runner().calls.is_empty());
+
+    let mut linux = test_manager(
+        ServicePlatform::Linux,
+        work.path(),
+        work.path().join("bin/car-go-clean"),
+    );
+    assert_eq!(
+        linux.status().unwrap(),
+        ServiceStatus {
+            installed: false,
+            enabled: false,
+            active: false,
+        }
+    );
+    assert!(linux.into_runner().calls.is_empty());
 }
 
 #[test]
 fn linux_reports_when_systemd_user_is_unavailable() {
     let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(unit, "unit").unwrap();
     let mut manager = ServiceManager::new(
         ServicePlatform::Linux,
         work.path().to_path_buf(),
@@ -315,115 +1003,6 @@ fn linux_reports_when_systemd_user_is_unavailable() {
         .unwrap_err()
         .to_string()
         .contains("systemd --user is unavailable"));
-}
-
-#[test]
-fn mac_stop_preserves_plist_and_start_bootstraps_it() {
-    let work = tempfile::tempdir().unwrap();
-    let plist = work
-        .path()
-        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
-    fs::create_dir_all(plist.parent().unwrap()).unwrap();
-    fs::write(&plist, "plist").unwrap();
-
-    let mut stop = ServiceManager::new(
-        ServicePlatform::MacOs,
-        work.path().to_path_buf(),
-        work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(true, String::new(), String::new()),
-        ]),
-    );
-    assert_eq!(
-        stop.stop().unwrap(),
-        ServiceStatus {
-            installed: true,
-            active: false,
-        }
-    );
-    let stop_runner = stop.into_runner();
-    assert_eq!(strings(&stop_runner.calls[0].1)[0], "print");
-    assert_eq!(strings(&stop_runner.calls[1].1)[0], "bootout");
-    assert!(plist.exists());
-
-    let mut start = ServiceManager::new(
-        ServicePlatform::MacOs,
-        work.path().to_path_buf(),
-        work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([
-            CommandOutput::new(
-                false,
-                String::new(),
-                "Could not find specified service".to_string(),
-            ),
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(true, String::new(), String::new()),
-        ]),
-    );
-    assert_eq!(
-        start.start().unwrap(),
-        ServiceStatus {
-            installed: true,
-            active: true,
-        }
-    );
-    let start_runner = start.into_runner();
-    assert_eq!(strings(&start_runner.calls[0].1)[0], "print");
-    assert_eq!(strings(&start_runner.calls[1].1)[0], "bootstrap");
-    assert_eq!(strings(&start_runner.calls[2].1)[0], "kickstart");
-}
-
-#[test]
-fn linux_stop_and_start_use_user_service_commands() {
-    let work = tempfile::tempdir().unwrap();
-    let unit = work
-        .path()
-        .join(".config/systemd/user/car-go-clean.service");
-    fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    fs::write(&unit, "unit").unwrap();
-
-    let mut stop = ServiceManager::new(
-        ServicePlatform::Linux,
-        work.path().to_path_buf(),
-        work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(true, String::new(), String::new()),
-        ]),
-    );
-    stop.stop().unwrap();
-    let stop_runner = stop.into_runner();
-    assert!(stop_runner
-        .calls
-        .iter()
-        .any(|(_, args)| { strings(args) == ["--user", "stop", "car-go-clean.service"] }));
-    assert!(!stop_runner
-        .calls
-        .iter()
-        .any(|(program, _)| program == Path::new("sudo")));
-
-    let mut start = ServiceManager::new(
-        ServicePlatform::Linux,
-        work.path().to_path_buf(),
-        work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([
-            CommandOutput::new(true, String::new(), String::new()),
-            CommandOutput::new(false, "inactive\n".to_string(), String::new()),
-            CommandOutput::new(true, String::new(), String::new()),
-        ]),
-    );
-    start.start().unwrap();
-    let start_runner = start.into_runner();
-    assert!(start_runner
-        .calls
-        .iter()
-        .any(|(_, args)| { strings(args) == ["--user", "start", "car-go-clean.service"] }));
-    assert!(!start_runner
-        .calls
-        .iter()
-        .any(|(program, _)| program == Path::new("sudo")));
 }
 
 #[test]
@@ -452,23 +1031,37 @@ fn start_and_stop_are_idempotent_for_current_state() {
         ServicePlatform::MacOs,
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([CommandOutput::new(true, String::new(), String::new())]),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
     );
     assert!(active.start().unwrap().active);
-    assert_eq!(active.into_runner().calls.len(), 1);
+    assert_eq!(active.into_runner().calls.len(), 2);
 
     let mut inactive = ServiceManager::new(
         ServicePlatform::MacOs,
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
-        FakeRunner::with_outputs([CommandOutput::new(
-            false,
-            String::new(),
-            "Could not find specified service".to_string(),
-        )]),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n  \"com.dcchuck.car-go-clean\" => true\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+        ]),
     );
     assert!(!inactive.stop().unwrap().active);
-    assert_eq!(inactive.into_runner().calls.len(), 1);
+    assert_eq!(inactive.into_runner().calls.len(), 2);
 }
 
 #[test]
@@ -484,14 +1077,16 @@ fn lifecycle_reports_unexpected_status_probe_failure() {
         work.path().to_path_buf(),
         work.path().join("bin/car-go-clean"),
         FakeRunner::with_outputs([CommandOutput::new(
-            false,
+            true,
+            "not a launchctl dictionary".to_string(),
             String::new(),
-            "Operation not permitted".to_string(),
         )]),
     );
 
     let error = manager.stop().unwrap_err();
-    assert!(error.to_string().contains("Operation not permitted"));
+    assert!(error
+        .to_string()
+        .contains("malformed launchctl print-disabled output"));
     assert!(plist.exists());
     assert_eq!(manager.into_runner().calls.len(), 1);
 }

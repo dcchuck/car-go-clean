@@ -10,6 +10,7 @@
     <string>__CAR_GO_CLEAN_BIN__</string>
     <string>daemon</string>
   </array>
+__CAR_GO_CLEAN_ENVIRONMENT__
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

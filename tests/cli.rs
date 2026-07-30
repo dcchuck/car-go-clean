@@ -116,6 +116,7 @@ fn seed_incomplete_diagnostic_state(work: &tempfile::TempDir) -> (PathBuf, PathB
     fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
     let state = work.path().join("state");
     let home = work.path().join("home");
+    fs::create_dir(&home).unwrap();
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
@@ -605,6 +606,21 @@ fn service_help_lists_only_explicit_lifecycle_actions() {
         .stdout(contains("stop"))
         .stdout(contains("restart"))
         .stdout(contains("uninstall"));
+}
+
+#[test]
+fn service_status_prints_definition_enablement_and_process_state_separately() {
+    let work = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["service", "status"])
+        .env("HOME", work.path())
+        .assert()
+        .success()
+        .stdout(contains("Installed: no"))
+        .stdout(contains("Enabled: no"))
+        .stdout(contains("Running: no"));
 }
 
 #[test]
@@ -1254,6 +1270,8 @@ fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
     let config = work.path().join("config.toml");
     fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
     let state = work.path().join("state");
+    let home = work.path().join("home");
+    fs::create_dir(&home).unwrap();
 
     for subcommand in ["health", "status"] {
         let mut json_command = Command::cargo_bin("car-go-clean").unwrap();
@@ -1262,7 +1280,8 @@ fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
             .args(["--json", "--config"])
             .arg(&config)
             .args(["--state-dir"])
-            .arg(&state);
+            .arg(&state)
+            .env("HOME", &home);
         if subcommand == "health" {
             json_command.arg("--skip-cargo");
         }
@@ -1280,7 +1299,8 @@ fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
             .args(["--config"])
             .arg(&config)
             .args(["--state-dir"])
-            .arg(&state);
+            .arg(&state)
+            .env("HOME", &home);
         if subcommand == "health" {
             text_command.arg("--skip-cargo");
         }
@@ -1288,7 +1308,10 @@ fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
             .assert()
             .code(2)
             .stdout(contains("Outcome: incomplete (code=2)"))
-            .stdout(contains("Reasons: generation_missing, scan_incomplete"));
+            .stdout(contains("Reasons: generation_missing, scan_incomplete"))
+            .stdout(contains("Service installed: no"))
+            .stdout(contains("Service enabled: no"))
+            .stdout(contains("Service running: no"));
     }
 }
 
@@ -1358,6 +1381,14 @@ fn health_and_status_json_share_authority_diagnostics() {
         assert!(report["data"]
             .get("service_environment_divergence")
             .is_some());
+        assert_eq!(
+            report["data"]["service"],
+            serde_json::json!({
+                "installed": false,
+                "enabled": false,
+                "running": false
+            })
+        );
         reports.push(report);
     }
 
