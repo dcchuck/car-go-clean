@@ -356,6 +356,7 @@ fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
     write_file(&excluded.join("target/blob.bin"), &[0; 2048]);
     let canonical_primary = primary.canonicalize().unwrap();
     let canonical_excluded = excluded.canonicalize().unwrap();
+    let excluded_candidate = root.path().join("excluded/team/../team/worktree");
 
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("state.db");
@@ -408,7 +409,7 @@ fn first_v4_scan_reconciles_v3_cached_excluded_worktree_without_provenance() {
                 project_dirs: vec![],
                 excludes: vec!["excluded/team".to_string()],
             },
-            Arc::new(FakeWorktreeResolver::paths(vec![excluded])),
+            Arc::new(FakeWorktreeResolver::paths(vec![excluded_candidate])),
         ),
         Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
         DaemonOptions {
