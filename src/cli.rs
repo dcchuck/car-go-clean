@@ -7,7 +7,7 @@ use crate::identity::{BootSessionId, SystemIdentityProvider};
 use crate::lockfile;
 use crate::logging::Logger;
 use crate::outcome::CommandOutcome;
-use crate::policy::{ProcessEnvironment, ScopePolicy};
+use crate::policy::{ProcessEnvironment, ProtectedRootKind, RootProvenance, ScopePolicy};
 use crate::safety::{
     bind_review_to_observation, review_project_with_identity_provider, review_summary,
     CleanDecision, ProjectClass, ProjectReview, SafetyOptions, SkipReason,
@@ -16,9 +16,10 @@ use crate::scanner::{Scanner, ScannerOptions};
 use crate::service::{
     resolve_service_binary, ServiceAction, ServiceManager, ServicePlatform, SystemCommandRunner,
 };
-use crate::store::{ErrorRecord, Store};
+use crate::store::{DiscoveryOriginKind, ErrorRecord, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal};
@@ -173,6 +174,8 @@ enum Commands {
         state_dir: Option<PathBuf>,
         #[arg(long)]
         skip_cargo: bool,
+        #[arg(long)]
+        json: bool,
     },
     Config {
         #[command(subcommand)]
@@ -187,6 +190,8 @@ enum Commands {
         state_dir: Option<PathBuf>,
         #[arg(long)]
         refresh: bool,
+        #[arg(long)]
+        json: bool,
     },
     Projects {
         #[arg(long)]
@@ -326,7 +331,8 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             config,
             state_dir,
             skip_cargo,
-        } => health(config, state_dir, skip_cargo).map(|_| CommandOutcome::Complete),
+            json,
+        } => health(config, state_dir, skip_cargo, json).map(|_| CommandOutcome::Complete),
         Commands::Config { command, config } => match command {
             None => {
                 let cfg = load_config(config)?;
@@ -350,7 +356,8 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             config,
             state_dir,
             refresh,
-        } => status(config, state_dir, refresh),
+            json,
+        } => status(config, state_dir, refresh, json),
         Commands::Projects {
             config,
             state_dir,
@@ -467,8 +474,10 @@ fn health(
     config_path: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     skip_cargo: bool,
+    json: bool,
 ) -> Result<()> {
-    let cfg = load_config(config_path)?;
+    let (cfg, config_source) = load_config_with_source(config_path)?;
+    let policy = build_policy(&cfg, &config_source)?;
     for dir in &cfg.scan_dirs {
         if !dir.is_dir() {
             return Err(anyhow!("scan_dir {} does not exist", dir.display()));
@@ -486,12 +495,18 @@ fn health(
     let store = open_store(state_dir.as_deref())?;
     let since = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let errors = store.errors_since(since)?;
-    println!("OK");
-    if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
-        println!("WARN: legacy `excludes` is deprecated; run `car-go-clean config migrate`");
-    }
-    if !errors.is_empty() {
-        println!("WARN: {} errors in last 24h", errors.len());
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+    } else {
+        println!("OK");
+        if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
+            println!("WARN: legacy `excludes` is deprecated; run `car-go-clean config migrate`");
+        }
+        if !errors.is_empty() {
+            println!("WARN: {} errors in last 24h", errors.len());
+        }
+        print_cleanup_authority_diagnostics(&diagnostics);
     }
     Ok(())
 }
@@ -500,6 +515,7 @@ fn status(
     config_path: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     refresh: bool,
+    json: bool,
 ) -> Result<CommandOutcome> {
     let (cfg, config_source) = load_config_with_source(config_path)?;
     let policy = build_policy(&cfg, &config_source)?;
@@ -527,8 +543,15 @@ fn status(
 
     let cached_projects = store.project_count()?;
     let total = store.total_bytes_recovered(SystemTime::UNIX_EPOCH)?;
+    let diagnostics = cleanup_authority_diagnostics(&policy, &store)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        return Ok(outcome);
+    }
 
     print_heading("Status");
+    print_cleanup_authority_diagnostics(&diagnostics);
     print_section("Cache");
     print_row("Cached projects", format_count(cached_projects));
 
@@ -565,6 +588,205 @@ fn status(
     print_section("Schedule");
     print_scheduler_status(&store, &cfg)?;
     Ok(outcome)
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CleanupAuthorityDiagnostics {
+    config_source: PathBuf,
+    canonical_scope_roots: CanonicalScopeRootsDiagnostics,
+    policy_hash: String,
+    current_generation: Option<CurrentGenerationDiagnostics>,
+    protected_roots: Vec<ProtectedRootDiagnostics>,
+    incomplete_origins: Vec<IncompleteOriginDiagnostics>,
+    service_environment_divergence: Option<bool>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CanonicalScopeRootsDiagnostics {
+    scan_dirs: Vec<PathBuf>,
+    project_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CurrentGenerationDiagnostics {
+    id: i64,
+    policy_hash: String,
+    boot_session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProtectedRootDiagnostics {
+    path: PathBuf,
+    kind: &'static str,
+    provenance: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct IncompleteOriginDiagnostics {
+    kind: &'static str,
+    configured_path: PathBuf,
+    canonical_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+fn cleanup_authority_diagnostics(
+    policy: &ScopePolicy,
+    store: &Store,
+) -> Result<CleanupAuthorityDiagnostics> {
+    let policy_diagnostics = policy.diagnostics();
+    let current_generation = store.current_generation(policy.hash())?;
+    let incomplete_origins = match current_generation.as_ref() {
+        Some(generation) => store
+            .discovery_origins(generation.id)?
+            .into_iter()
+            .filter(|origin| !origin.completed)
+            .map(|origin| IncompleteOriginDiagnostics {
+                kind: discovery_origin_kind_label(origin.kind),
+                configured_path: origin.configured_path,
+                canonical_path: origin.canonical_path,
+                error: origin.error,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let current_generation = current_generation.map(|generation| CurrentGenerationDiagnostics {
+        id: generation.id,
+        policy_hash: generation.policy_hash,
+        boot_session_id: generation.boot_session_id,
+    });
+    let protected_roots = policy_diagnostics
+        .protected_roots
+        .iter()
+        .map(|root| ProtectedRootDiagnostics {
+            path: root.path.clone(),
+            kind: protected_root_kind_label(&root.kind),
+            provenance: root_provenance_label(&root.provenance),
+        })
+        .collect();
+
+    Ok(CleanupAuthorityDiagnostics {
+        config_source: policy_diagnostics.config_source.to_path_buf(),
+        canonical_scope_roots: CanonicalScopeRootsDiagnostics {
+            scan_dirs: policy_diagnostics.canonical_scan_roots.to_vec(),
+            project_dirs: policy_diagnostics.canonical_project_paths.to_vec(),
+        },
+        policy_hash: policy.hash().to_string(),
+        current_generation,
+        protected_roots,
+        incomplete_origins,
+        // Runtime Slice A does not yet capture service-manager environment.
+        // `null` means the comparison is not knowable from the installed
+        // definition; Operator Control populates it once definitions capture
+        // the supported root variables.
+        service_environment_divergence: None,
+    })
+}
+
+fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics) {
+    print_section("Cleanup authority");
+    print_row(
+        "Config source",
+        diagnostics.config_source.display().to_string(),
+    );
+    print_row(
+        "Canonical scan roots",
+        format_paths(&diagnostics.canonical_scope_roots.scan_dirs),
+    );
+    print_row(
+        "Canonical project roots",
+        format_paths(&diagnostics.canonical_scope_roots.project_dirs),
+    );
+    print_row("Policy hash", &diagnostics.policy_hash);
+    print_row(
+        "Current generation",
+        diagnostics
+            .current_generation
+            .as_ref()
+            .map(|generation| {
+                format!(
+                    "id={} boot_session={}",
+                    generation.id,
+                    generation.boot_session_id.as_deref().unwrap_or("<unknown>")
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string()),
+    );
+    print_row(
+        "Protected roots",
+        format_count(diagnostics.protected_roots.len()),
+    );
+    for root in &diagnostics.protected_roots {
+        println!(
+            "    {} ({}, {})",
+            root.path.display(),
+            root.kind,
+            root.provenance
+        );
+    }
+    print_row(
+        "Incomplete origins",
+        format_count(diagnostics.incomplete_origins.len()),
+    );
+    for origin in &diagnostics.incomplete_origins {
+        let canonical_path = origin
+            .canonical_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        println!(
+            "    {} ({}, canonical={}, {})",
+            origin.configured_path.display(),
+            origin.kind,
+            canonical_path,
+            origin.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    print_row(
+        "Service environment divergence",
+        diagnostics
+            .service_environment_divergence
+            .map(|diverges| if diverges { "detected" } else { "none" })
+            .unwrap_or("<unknown>"),
+    );
+}
+
+fn format_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        "<none>".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn discovery_origin_kind_label(kind: DiscoveryOriginKind) -> &'static str {
+    match kind {
+        DiscoveryOriginKind::ScanRoot => "scan_root",
+        DiscoveryOriginKind::ExplicitProject => "explicit_project",
+    }
+}
+
+fn protected_root_kind_label(kind: &ProtectedRootKind) -> &'static str {
+    match kind {
+        ProtectedRootKind::Cargo => "cargo",
+        ProtectedRootKind::Rustup => "rustup",
+        ProtectedRootKind::GoModule => "go_module",
+        ProtectedRootKind::Bun => "bun",
+        ProtectedRootKind::ManagedCache => "managed_cache",
+        ProtectedRootKind::Container => "container",
+    }
+}
+
+fn root_provenance_label(provenance: &RootProvenance) -> String {
+    match provenance {
+        RootProvenance::Default => "default".to_string(),
+        RootProvenance::Environment(variable) => format!("environment:{variable}"),
+        RootProvenance::ServiceDefinition => "service_definition".to_string(),
+        RootProvenance::Structural => "structural".to_string(),
+    }
 }
 
 fn projects(

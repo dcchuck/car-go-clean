@@ -157,6 +157,39 @@ fn configuration_reference_preserves_operational_contract() {
 }
 
 #[test]
+fn readme_diagnostic_json_example_executes_successfully() {
+    let readme = repo_file("README.md");
+    let example = shell_block_containing(
+        &readme,
+        &["car-go-clean health --json", "car-go-clean status --json"],
+    );
+    let work = tempdir().unwrap();
+    let home = work.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_car-go-clean"));
+    let mut path_entries = vec![binary.parent().unwrap().to_path_buf()];
+    path_entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path_entries).unwrap();
+
+    let output = Command::new("sh")
+        .args(["-eu", "-c", &example])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", work.path().join("config"))
+        .env("XDG_STATE_HOME", work.path().join("state"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "documented diagnostic example failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn release_packaging_documents_tagged_binary_distribution() {
     let release = repo_file("packaging/release/README.md");
 

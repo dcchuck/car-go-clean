@@ -82,6 +82,19 @@ One-shot commands exit `0` for complete coverage, `2` for valid results with
 incomplete discovery coverage, and `1` for failures. A macOS home scan can
 legitimately return `2` when privacy-protected directories cannot be read.
 
+Inspect the cleanup authority in human-readable or machine-readable form:
+
+```sh
+car-go-clean health --json
+car-go-clean status --json
+```
+
+Both JSON commands use the same diagnostic shape. It names the effective
+config source, canonical scan and project roots, policy hash, current
+discovery generation, protected roots and their provenance, incomplete scan
+origins, and service-environment divergence when the installed definition
+contains enough information to compare it with the current shell.
+
 ## Agent Quick Start
 
 Copy this prompt into your coding agent:
@@ -189,8 +202,13 @@ safety, worktree, state, log, and scheduler behavior.
 ## Safe Cleaning Model
 
 By default, `car-go-clean` is safe against a broad `~` scan. It only runs
-`cargo clean` for cached projects that pass all safety gates:
+`cargo clean` for projects with current cleanup authority that pass all safety
+gates:
 
+- Cached projects are history, not authority. Cleanup requires a current
+  discovery generation created under the exact current policy hash.
+- `--no-scan` skips discovery only. It never bypasses generation, scope,
+  exclusion, identity, activity, quiet-period, or protected-storage checks.
 - `project/target` exists directly under the cached project path.
 - The direct target directory can be read and measured.
 - The newest non-symlink file under `target/` is at least
@@ -200,6 +218,15 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
   descendant path for the project.
 - No running process has a cwd or command argument inside the project or
   `target/`.
+- Project and target filesystem identities are checked during review and
+  again immediately before Cargo runs. This narrows, but cannot eliminate,
+  the residual time-of-check/time-of-use race.
+
+A database migrated from an older path-only schema retains project and
+recovery history but grants no current cleanup authority. A cached-only run
+returns exit `2` until a successful scan creates a matching generation.
+Optional default exclusion roots that are absent on a machine are normal and
+do not make a scan incomplete.
 
 ## Commands
 
@@ -208,8 +235,8 @@ By default, `car-go-clean` is safe against a broad `~` scan. It only runs
 | `car-go-clean daemon` | Long-running scheduler. |
 | `car-go-clean scan` | Refresh the project cache. |
 | `car-go-clean run` | Scan, then run one cleanup review/cycle now. |
-| `car-go-clean health` | Validate config, Cargo availability, and state DB access. |
-| `car-go-clean status` | Show cached project count, last saved safety review, scheduler timing, and last run summary. |
+| `car-go-clean health` | Validate config, Cargo availability, and state DB access; add `--json` for authority diagnostics. |
+| `car-go-clean status` | Show authority, cache, review, scheduler, and recovery state; add `--json` for the shared diagnostic shape. |
 | `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |
 | `car-go-clean stats` | Show recovered bytes and top projects. |
 | `car-go-clean logs` | Tail logs or show recent stored errors. |

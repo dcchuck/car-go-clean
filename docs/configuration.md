@@ -79,6 +79,12 @@ package-manager and container storage remains a separate cleanup gate and is
 skipped unless the applicable command explicitly uses
 `--include-managed-cache`.
 
+Default and platform-specific exclusion roots are speculative: most machines
+do not have every supported package manager, container runtime, or VM manager
+installed. A missing optional absolute exclusion is normal. An absolute
+exclusion that exists but cannot be canonicalized is an authority error and
+blocks that cycle.
+
 ## Legacy key and migration
 
 In v0.4, legacy `excludes` still loads with a deprecation warning. It has the
@@ -137,6 +143,52 @@ cannot transfer or clear an old failure.
   review.
 - `logs --errors-only` shows scan, review, and clean diagnostics.
 
+## Cleanup authority and diagnostics
+
+The historical `projects` table is not cleanup authority. Before a project can
+reach Cargo, car-go-clean requires:
+
+- A policy hash built from the effective config source, canonical scan and
+  explicit-project roots, lexical and canonical exclusions, protected roots
+  with provenance, quiet period, and scan interval.
+- A current discovery generation whose policy hash matches exactly.
+- A completed origin that authorized the project in that generation.
+- Matching project and target filesystem identity during review and again
+  immediately before cleanup.
+
+`run --no-scan` skips only the discovery step. It still requires the matching
+policy and generation and applies every other safety gate. State migrated from
+an older path-only schema keeps historical projects, events, errors, and
+recovery totals, but it deliberately has no current generation. A cached-only
+run therefore exits `2` without invoking Cargo until a successful scan creates
+current authority.
+
+Use either command to inspect the same authority facts:
+
+```sh
+car-go-clean health --json
+car-go-clean status --json
+```
+
+Text output contains the same cleanup-authority section. JSON includes:
+
+- `config_source` and `canonical_scope_roots`;
+- `policy_hash` and `current_generation`;
+- `protected_roots`, including each root's kind and provenance;
+- `incomplete_origins` from the current generation;
+- `service_environment_divergence`, which is `null` when the installed
+  definition does not expose enough captured environment to compare.
+
+Service definitions may run with different manager-root variables than the
+current shell. When that comparison is knowable, diagnostics report the
+divergence instead of inventing provenance. Missing optional/default roots are
+not reported as errors.
+
+The final identity and safety check happens immediately before Cargo. It
+substantially narrows path-replacement races, but no user-space check can
+eliminate the residual time-of-check/time-of-use window after validation and
+before Cargo opens the project.
+
 ## Outcomes, state, logs, and scheduling
 
 One-shot `scan`, `run`, `status --refresh`, and `projects` commands use this
@@ -144,7 +196,8 @@ outcome taxonomy:
 
 - exit `0`: complete coverage. Safety skips alone stay at exit `0`.
 - exit `2`: valid results with incomplete discovery coverage, such as an
-  unreadable privacy-protected directory during a broad macOS home scan.
+  unreadable privacy-protected directory during a broad macOS home scan or
+  migrated path-only state used with `run --no-scan`.
 - exit `1`: a failure, including configuration errors, lock or state errors,
   or a nonzero Cargo clean attempt. Exit `1` outranks exit `2` when both occur.
 

@@ -4,7 +4,31 @@ use car_go_clean::store::Store;
 use predicates::prelude::*;
 use predicates::str::contains;
 use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+
+fn seed_incomplete_diagnostic_state(work: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    let root = work.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+    let home = work.path().join("home");
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .assert()
+        .code(2);
+
+    (config, state, home)
+}
 
 #[test]
 fn unknown_argument_exits_one_instead_of_incomplete() {
@@ -543,6 +567,14 @@ fn config_command_keeps_warning_off_round_trippable_stdout() {
     assert!(!stdout.lines().any(|line| line.starts_with("excludes =")));
     fs::write(&round_trip, stdout).unwrap();
     assert!(load(&round_trip).unwrap().warnings().is_empty());
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["config", "--config"])
+        .arg(&round_trip)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scan_dirs"));
 }
 
 #[cfg(unix)]
@@ -994,6 +1026,101 @@ fn health_passes_with_defaults_when_cargo_check_is_skipped() {
         .assert()
         .success()
         .stdout(contains("OK"));
+}
+
+#[test]
+fn health_and_status_json_share_authority_diagnostics() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home) = seed_incomplete_diagnostic_state(&work);
+    let canonical_root = work.path().join("root").canonicalize().unwrap();
+    let mut reports = Vec::new();
+
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{subcommand} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        assert_eq!(report["config_source"], config.to_string_lossy().as_ref());
+        assert_eq!(
+            report["canonical_scope_roots"]["scan_dirs"][0],
+            canonical_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            report["canonical_scope_roots"]["project_dirs"],
+            serde_json::json!([])
+        );
+        assert_eq!(report["policy_hash"].as_str().unwrap().len(), 64);
+        assert!(report["current_generation"]["id"].as_i64().unwrap() > 0);
+        assert_eq!(
+            report["current_generation"]["policy_hash"],
+            report["policy_hash"]
+        );
+        assert!(report["protected_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|root| root.get("path").is_some()
+                && root.get("kind").is_some()
+                && root.get("provenance").is_some()));
+        assert_eq!(
+            report["incomplete_origins"][0]["configured_path"],
+            work.path().join("root").to_string_lossy().as_ref()
+        );
+        assert!(report["incomplete_origins"][0]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
+        assert!(report.get("service_environment_divergence").is_some());
+        reports.push(report);
+    }
+
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+fn health_and_status_text_share_authority_diagnostics() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home) = seed_incomplete_diagnostic_state(&work);
+
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        command
+            .assert()
+            .success()
+            .stdout(contains("Cleanup authority"))
+            .stdout(contains("Config source:"))
+            .stdout(contains("Canonical scan roots:"))
+            .stdout(contains("Policy hash:"))
+            .stdout(contains("Current generation: id="))
+            .stdout(contains("boot_session="))
+            .stdout(contains("Protected roots:"))
+            .stdout(contains("Incomplete origins:"))
+            .stdout(contains("canonical="));
+    }
 }
 
 #[test]

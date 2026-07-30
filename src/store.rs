@@ -1275,6 +1275,50 @@ impl Store {
         Ok(self.current_generation(policy_hash)?.is_some())
     }
 
+    pub fn discovery_origins(&self, generation_id: i64) -> Result<Vec<DiscoveryOriginRecord>> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT
+                id,
+                generation_id,
+                kind,
+                configured_path,
+                canonical_path,
+                completed,
+                error
+            FROM discovery_origins
+            WHERE generation_id = ?1
+            ORDER BY id
+            ",
+        )?;
+        let rows = statement.query_map([generation_id], |row| {
+            let kind: String = row.get(2)?;
+            let kind = match kind.as_str() {
+                "scan_root" => DiscoveryOriginKind::ScanRoot,
+                "explicit_project" => DiscoveryOriginKind::ExplicitProject,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown discovery origin kind {other:?}").into(),
+                    ));
+                }
+            };
+            let configured_path: String = row.get(3)?;
+            let canonical_path: Option<String> = row.get(4)?;
+            Ok(DiscoveryOriginRecord {
+                id: row.get(0)?,
+                generation_id: row.get(1)?,
+                kind,
+                configured_path: PathBuf::from(configured_path),
+                canonical_path: canonical_path.map(PathBuf::from),
+                completed: row.get(5)?,
+                error: row.get(6)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     pub fn authorized_observations(&self, generation_id: i64) -> Result<Vec<ProjectObservation>> {
         let mut statement = self.conn.prepare(
             "
