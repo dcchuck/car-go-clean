@@ -110,17 +110,41 @@ fn downgrade_runtime_database_to_version_nine(database: &Path) {
         .unwrap();
     if sqlite_column_exists(&connection, "project_observations", "project_mount_id") {
         connection
-            .execute(
-                "ALTER TABLE project_observations DROP COLUMN project_mount_id",
-                [],
-            )
-            .unwrap();
-    }
-    if sqlite_column_exists(&connection, "project_observations", "target_mount_id") {
-        connection
-            .execute(
-                "ALTER TABLE project_observations DROP COLUMN target_mount_id",
-                [],
+            .execute_batch(
+                "
+                ALTER TABLE project_observations RENAME TO project_observations_current;
+                CREATE TABLE project_observations (
+                    generation_id INTEGER NOT NULL
+                        REFERENCES discovery_generations(id) ON DELETE CASCADE,
+                    origin_id INTEGER NOT NULL
+                        REFERENCES discovery_origins(id) ON DELETE CASCADE,
+                    project_path TEXT NOT NULL,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    observed_at INTEGER NOT NULL,
+                    authorized INTEGER NOT NULL,
+                    blocked_reason TEXT,
+                    PRIMARY KEY(generation_id, origin_id, project_path)
+                );
+                INSERT INTO project_observations
+                SELECT
+                    generation_id,
+                    origin_id,
+                    project_path,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    observed_at,
+                    authorized,
+                    blocked_reason
+                FROM project_observations_current;
+                DROP TABLE project_observations_current;
+                CREATE INDEX idx_project_observations_authorized
+                    ON project_observations(generation_id, authorized, project_path);
+                ",
             )
             .unwrap();
     }
@@ -135,14 +159,6 @@ fn downgrade_runtime_database_to_version_nine(database: &Path) {
     if sqlite_column_exists(&connection, "scheduler_state", "scan_retry_at") {
         connection
             .execute("ALTER TABLE scheduler_state DROP COLUMN scan_retry_at", [])
-            .unwrap();
-    }
-    if sqlite_column_exists(&connection, "project_observations", "boot_session_id") {
-        connection
-            .execute(
-                "ALTER TABLE project_observations DROP COLUMN boot_session_id",
-                [],
-            )
             .unwrap();
     }
     if sqlite_column_exists(&connection, "discovery_generations", "authority_valid") {
@@ -3866,6 +3882,9 @@ fn runner_failure_is_persisted_and_counted_once_without_success_accounting() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].outcome, CleanAttemptOutcome::RunnerFailure);
     assert_eq!(events[0].exit_code, None);
+    assert_eq!(events[0].bytes_before, 2_048);
+    assert_eq!(events[0].bytes_after, events[0].bytes_before);
+    assert!(!events[0].measurement_failed);
     assert_eq!(
         store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
         1
@@ -3953,10 +3972,8 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
         .find(|event| event.path == unmeasurable.to_string_lossy())
         .unwrap();
     assert_eq!(unmeasurable_event.exit_code, Some(0));
-    assert_eq!(
-        unmeasurable_event.outcome,
-        CleanAttemptOutcome::MeasurementFailure
-    );
+    assert_eq!(unmeasurable_event.outcome, CleanAttemptOutcome::Success);
+    assert!(unmeasurable_event.measurement_failed);
     assert_eq!(
         unmeasurable_event.stderr_excerpt,
         "cargo completed with a warning"
@@ -3994,6 +4011,94 @@ fn post_cargo_measurement_failure_preserves_audit_and_continues_other_projects()
         .unwrap()
         .last_cleaned_at
         .is_some());
+}
+
+#[test]
+fn cargo_nonzero_and_post_measurement_failure_are_recorded_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+    let project = project.canonicalize().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(store_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    store.upsert_project(&project, SystemTime::now()).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let runner = FakeRunner {
+        delete_target: true,
+        replace_target_with_file_for: Some(project.clone()),
+        exit_code: 7,
+        stderr: "cargo failed after replacing target".to_string(),
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner, Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::from_millis(1),
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::from_millis(1),
+                include_managed_cache: false,
+                include_active: false,
+                force: true,
+            },
+            &NoopProcessInspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.bytes_recovered, 0);
+    assert_eq!(result.errors, 2);
+    assert_eq!(result.cargo_failures, 1);
+    assert_eq!(result.measurement_failures, 1);
+    assert_eq!(result.cleanup_failures, 0);
+
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, Some(7));
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::CargoNonzero);
+    assert_eq!(events[0].bytes_after, events[0].bytes_before);
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.message.contains("cargo clean exited 7"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.message.contains("measure target after cargo clean"))
+            .count(),
+        1
+    );
+    assert!(store.all_projects().unwrap()[0].last_cleaned_at.is_none());
 }
 
 #[test]

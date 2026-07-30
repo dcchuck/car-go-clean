@@ -265,9 +265,31 @@ fn read_required(path: &Path) -> Result<String> {
 fn read_optional_default(path: &Path) -> Result<Option<String>> {
     match fs::symlink_metadata(path) {
         Ok(_) => read_required(path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            verify_missing_default_ancestors(path)?;
+            Ok(None)
+        }
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }
+}
+
+fn verify_missing_default_ancestors(path: &Path) -> Result<()> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::metadata(&prefix)
+                    .with_context(|| format!("resolve symlink {}", prefix.display()))?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", prefix.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn environment_root(variable: &str, home: &Path) -> Result<PathBuf> {

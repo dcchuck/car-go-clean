@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use car_go_clean::cleaner::CleanAttemptOutcome;
 use car_go_clean::config::load;
 use car_go_clean::store::Store;
 use predicates::prelude::*;
@@ -1084,6 +1085,34 @@ fn config_command_rejects_a_dangling_explicit_path() {
         .assert()
         .code(1)
         .stderr(contains(format!("read {}", explicit.display())));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_command_rejects_a_dangling_implicit_default_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let work = tempfile::tempdir().unwrap();
+    let xdg_config = work.path().join("config-root");
+    fs::create_dir(&xdg_config).unwrap();
+    let dangling_ancestor = xdg_config.join("car-go-clean");
+    symlink(
+        work.path().join("missing-config-directory"),
+        &dangling_ancestor,
+    )
+    .unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .arg("config")
+        .env("HOME", work.path().join("home"))
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .assert()
+        .code(1)
+        .stderr(contains(format!(
+            "resolve symlink {}",
+            dangling_ancestor.display()
+        )));
 }
 
 #[test]
@@ -2233,12 +2262,10 @@ fn post_cargo_measurement_failure_exits_one_without_losing_the_audit_event() {
 fn combined_cargo_and_measurement_failures_retain_both_reasons() {
     let work = tempfile::tempdir().unwrap();
     let root = work.path().join("tree");
-    for name in ["cargo-fails", "measurement-fails"] {
-        let project = root.join(name);
-        fs::create_dir_all(project.join("target")).unwrap();
-        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
-        fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
-    }
+    let project = root.join("both-fail");
+    fs::create_dir_all(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/blob.bin"), vec![0; 2048]).unwrap();
     std::thread::sleep(Duration::from_millis(10));
     let config = work.path().join("config.toml");
     fs::write(
@@ -2254,7 +2281,7 @@ fn combined_cargo_and_measurement_failures_retain_both_reasons() {
     fs::create_dir_all(&bin).unwrap();
     write_executable(
         &bin.join("cargo"),
-        "#!/bin/sh\ncase \"$PWD\" in\n  */cargo-fails) printf cargo-failed >&2; exit 7 ;;\n  *) rm -rf target; printf replacement > target; exit 0 ;;\nesac\n",
+        "#!/bin/sh\nrm -rf target\nprintf replacement > target\nprintf cargo-failed >&2\nexit 7\n",
     );
     let mut path = bin.into_os_string();
     path.push(":");
@@ -2278,6 +2305,37 @@ fn combined_cargo_and_measurement_failures_retain_both_reasons() {
         serde_json::json!(["cargo_failed", "measurement_failed"])
     );
     assert_eq!(report["data"]["errors"], 2);
+
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, Some(7));
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::CargoNonzero);
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+    let errors = store.errors_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.message.contains("cargo clean exited 7"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.message.contains("measure target after cargo clean"))
+            .count(),
+        1
+    );
 }
 
 #[cfg(unix)]

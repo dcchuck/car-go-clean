@@ -48,6 +48,7 @@ pub struct CleanEvent {
     pub exit_code: Option<i32>,
     pub stderr_excerpt: String,
     pub outcome: CleanAttemptOutcome,
+    pub measurement_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -830,6 +831,7 @@ impl Store {
                 [],
             )?;
             tx.execute("UPDATE discovery_generations SET authority_valid = 0", [])?;
+            tx.execute("DELETE FROM review_plans", [])?;
             tx.execute(
                 "
                 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -848,6 +850,12 @@ impl Store {
             let tx = self.conn.unchecked_transaction()?;
             migrate_lossless_identities_and_attempt_outcomes(&tx)?;
             tx.execute("INSERT INTO schema_version(version) VALUES (14)", [])?;
+            tx.commit()?;
+        }
+        if current < 15 {
+            let tx = self.conn.unchecked_transaction()?;
+            migrate_independent_clean_attempt_results(&tx)?;
+            tx.execute("INSERT INTO schema_version(version) VALUES (15)", [])?;
             tx.commit()?;
         }
         self.prune_review_plans(SystemTime::now(), None)?;
@@ -1731,9 +1739,10 @@ impl Store {
                     duration_ms,
                     exit_code,
                     stderr_excerpt,
-                    attempt_outcome
+                    attempt_outcome,
+                    measurement_failed
                 )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ",
             params![
                 event.run_id,
@@ -1745,6 +1754,7 @@ impl Store {
                 event.exit_code,
                 event.stderr_excerpt,
                 event.outcome.as_str(),
+                event.measurement_failed,
             ],
         )?;
         Ok(())
@@ -1763,7 +1773,8 @@ impl Store {
                 duration_ms,
                 exit_code,
                 stderr_excerpt,
-                attempt_outcome
+                attempt_outcome,
+                measurement_failed
             FROM clean_events WHERE ts >= ?1 ORDER BY ts
             ",
         )?;
@@ -1789,6 +1800,7 @@ impl Store {
                 exit_code: row.get(7)?,
                 stderr_excerpt: row.get(8)?,
                 outcome,
+                measurement_failed: row.get(10)?,
             })
         })?;
         collect_rows(rows)
@@ -1887,7 +1899,9 @@ impl Store {
             "
             SELECT COALESCE(SUM(MAX(bytes_before - bytes_after, 0)), 0)
             FROM clean_events
-            WHERE ts >= ?1 AND attempt_outcome = 'success'
+            WHERE ts >= ?1
+              AND attempt_outcome = 'success'
+              AND measurement_failed = 0
             ",
             [to_epoch(since)?],
             |row| row.get(0),
@@ -1900,7 +1914,9 @@ impl Store {
             "
             SELECT path, SUM(MAX(bytes_before - bytes_after, 0)) AS recovered
             FROM clean_events
-            WHERE ts >= ?1 AND attempt_outcome = 'success'
+            WHERE ts >= ?1
+              AND attempt_outcome = 'success'
+              AND measurement_failed = 0
             GROUP BY path
             ORDER BY recovered DESC
             LIMIT ?2
@@ -1921,7 +1937,11 @@ impl Store {
                 "
                 SELECT COUNT(*)
                 FROM clean_events
-                WHERE ts >= ?1 AND attempt_outcome <> 'success'
+                WHERE ts >= ?1
+                  AND (
+                      attempt_outcome <> 'success'
+                      OR measurement_failed = 1
+                  )
                 ",
                 [to_epoch(since)?],
                 |row| row.get(0),
@@ -2474,7 +2494,93 @@ struct LegacyCleanEvent {
     duration_ms: i64,
     exit_code: Option<i32>,
     stderr_excerpt: String,
-    outcome: CleanAttemptOutcome,
+    outcome: LegacyCleanAttemptOutcome,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LegacyCleanAttemptOutcome {
+    Success,
+    CargoNonzero,
+    RunnerFailure,
+    MeasurementFailure,
+}
+
+impl LegacyCleanAttemptOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::CargoNonzero => "cargo_nonzero",
+            Self::RunnerFailure => "runner_failure",
+            Self::MeasurementFailure => "measurement_failure",
+        }
+    }
+}
+
+fn validate_legacy_project_observation(
+    observation: &LegacyProjectObservation,
+    generation_authority_valid: bool,
+) -> Result<()> {
+    let legacy_revoked = !observation.authorized && !generation_authority_valid;
+    if observation.project_mount_id.is_none() && !legacy_revoked {
+        bail!(
+            "project_observations project identity is incomplete for generation {} origin {} \
+             path {:?}: project_device, project_inode, and project_mount_id must all be present",
+            observation.generation_id,
+            observation.origin_id,
+            observation.project_path
+        );
+    }
+
+    let target_device_present = observation.target_device.is_some();
+    let target_inode_present = observation.target_inode.is_some();
+    let target_mount_present = observation.target_mount_id.is_some();
+    let target_absent = !target_device_present && !target_inode_present && !target_mount_present;
+    let target_complete = target_device_present && target_inode_present && target_mount_present;
+    let legacy_revoked_target =
+        legacy_revoked && target_device_present && target_inode_present && !target_mount_present;
+    if !target_absent && !target_complete && !legacy_revoked_target {
+        bail!(
+            "project_observations target identity is incomplete for generation {} origin {} \
+             path {:?}: target_device, target_inode, and target_mount_id must be all NULL or \
+             all present",
+            observation.generation_id,
+            observation.origin_id,
+            observation.project_path
+        );
+    }
+    Ok(())
+}
+
+fn validate_legacy_review_plan_target(target: &LegacyReviewPlanTarget) -> Result<()> {
+    let project_device_present = target.project_device.is_some();
+    let project_inode_present = target.project_inode.is_some();
+    let project_mount_present = target.project_mount_id.is_some();
+    let target_device_present = target.target_device.is_some();
+    let target_inode_present = target.target_inode.is_some();
+    let target_mount_present = target.target_mount_id.is_some();
+    let identity_absent = !project_device_present
+        && !project_inode_present
+        && !project_mount_present
+        && !target_device_present
+        && !target_inode_present
+        && !target_mount_present
+        && target.review_boot_session_id.is_none();
+    let identity_complete = project_device_present
+        && project_inode_present
+        && project_mount_present
+        && target_device_present
+        && target_inode_present
+        && target_mount_present;
+    if !identity_absent && !identity_complete {
+        bail!(
+            "review_plan_targets identity is incomplete for plan {} ordinal {} path {:?}: \
+             project and target device, inode, and mount triples must be all absent or all present",
+            target.plan_id,
+            target.ordinal,
+            target.project_path
+        );
+    }
+    Ok(())
 }
 
 fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Result<()> {
@@ -2518,6 +2624,18 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
         })?;
         collect_rows(rows)?
     };
+    for observation in &project_observations {
+        let generation_authority_valid = tx.query_row(
+            "
+            SELECT authority_valid
+            FROM discovery_generations
+            WHERE id = ?1
+            ",
+            [observation.generation_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        validate_legacy_project_observation(observation, generation_authority_valid)?;
+    }
 
     let review_plan_targets = {
         let mut statement = tx.prepare(
@@ -2567,9 +2685,53 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
         })?;
         collect_rows(rows)?
     };
+    for target in &review_plan_targets {
+        validate_legacy_review_plan_target(target)?;
+    }
 
     let clean_events_have_outcome =
         transaction_column_exists(tx, "clean_events", "attempt_outcome")?;
+    if !clean_events_have_outcome {
+        let ambiguous = tx
+            .query_row(
+                "
+                SELECT
+                    clean_events.ts,
+                    clean_events.path,
+                    COUNT(DISTINCT clean_events.id),
+                    COUNT(DISTINCT errors.id)
+                FROM clean_events
+                JOIN errors
+                  ON errors.ts = clean_events.ts
+                 AND errors.category = 'clean'
+                 AND errors.path = clean_events.path
+                 AND errors.message LIKE
+                     'measure target after cargo clean:%'
+                GROUP BY clean_events.ts, clean_events.path
+                HAVING COUNT(DISTINCT clean_events.id) <> 1
+                    OR COUNT(DISTINCT errors.id) <> 1
+                ORDER BY clean_events.ts, clean_events.path
+                LIMIT 1
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((timestamp, path, clean_event_count, matching_error_count)) = ambiguous {
+            bail!(
+                "ambiguous measurement failure audit at timestamp {timestamp} for {path:?}: \
+                 found {clean_event_count} clean event(s) and {matching_error_count} matching \
+                 error(s); expected exactly one of each"
+            );
+        }
+    }
     let clean_events = {
         let outcome_expression = if clean_events_have_outcome {
             "attempt_outcome"
@@ -2610,7 +2772,7 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
         let mut statement = tx.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             let label = row.get::<_, String>(9)?;
-            let outcome = parse_clean_attempt_outcome(&label).ok_or_else(|| {
+            let outcome = parse_legacy_clean_attempt_outcome(&label).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
                     9,
                     rusqlite::types::Type::Text,
@@ -2661,6 +2823,25 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
             authorized INTEGER NOT NULL CHECK(authorized IN (0, 1)),
             blocked_reason TEXT,
             boot_session_id TEXT,
+            CHECK(project_mount_id IS NOT NULL OR authorized = 0),
+            CHECK(
+                (
+                    target_device IS NULL
+                    AND target_inode IS NULL
+                    AND target_mount_id IS NULL
+                )
+                OR (
+                    target_device IS NOT NULL
+                    AND target_inode IS NOT NULL
+                    AND target_mount_id IS NOT NULL
+                )
+                OR (
+                    authorized = 0
+                    AND target_device IS NOT NULL
+                    AND target_inode IS NOT NULL
+                    AND target_mount_id IS NULL
+                )
+            ),
             PRIMARY KEY(generation_id, origin_id, project_path)
         );
 
@@ -2704,15 +2885,19 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
                 (
                     project_device IS NULL
                     AND project_inode IS NULL
+                    AND project_mount_id IS NULL
                     AND target_device IS NULL
                     AND target_inode IS NULL
+                    AND target_mount_id IS NULL
                     AND review_boot_session_id IS NULL
                 )
                 OR (
                     project_device IS NOT NULL
                     AND project_inode IS NOT NULL
+                    AND project_mount_id IS NOT NULL
                     AND target_device IS NOT NULL
                     AND target_inode IS NOT NULL
+                    AND target_mount_id IS NOT NULL
                 )
             ),
             CHECK(
@@ -2903,6 +3088,77 @@ fn migrate_lossless_identities_and_attempt_outcomes(tx: &Transaction<'_>) -> Res
     Ok(())
 }
 
+fn migrate_independent_clean_attempt_results(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE clean_events_v15 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id),
+            ts INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            bytes_before INTEGER NOT NULL,
+            bytes_after INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER,
+            stderr_excerpt TEXT NOT NULL DEFAULT '',
+            attempt_outcome TEXT NOT NULL
+                CHECK(attempt_outcome IN (
+                    'success',
+                    'cargo_nonzero',
+                    'runner_failure'
+                )),
+            measurement_failed INTEGER NOT NULL DEFAULT 0
+                CHECK(measurement_failed IN (0, 1)),
+            CHECK(
+                (attempt_outcome = 'success' AND exit_code = 0)
+                OR (attempt_outcome = 'cargo_nonzero'
+                    AND exit_code IS NOT NULL AND exit_code <> 0)
+                OR (attempt_outcome = 'runner_failure' AND exit_code IS NULL)
+            )
+        );
+
+        INSERT INTO clean_events_v15 (
+            id,
+            run_id,
+            ts,
+            path,
+            bytes_before,
+            bytes_after,
+            duration_ms,
+            exit_code,
+            stderr_excerpt,
+            attempt_outcome,
+            measurement_failed
+        )
+        SELECT
+            id,
+            run_id,
+            ts,
+            path,
+            bytes_before,
+            bytes_after,
+            duration_ms,
+            exit_code,
+            stderr_excerpt,
+            CASE
+                WHEN attempt_outcome = 'measurement_failure' AND exit_code = 0
+                    THEN 'success'
+                WHEN attempt_outcome = 'measurement_failure'
+                    THEN 'cargo_nonzero'
+                ELSE attempt_outcome
+            END,
+            CASE WHEN attempt_outcome = 'measurement_failure' THEN 1 ELSE 0 END
+        FROM clean_events
+        ORDER BY id;
+
+        DROP TABLE clean_events;
+        ALTER TABLE clean_events_v15 RENAME TO clean_events;
+        CREATE INDEX idx_clean_events_ts ON clean_events(ts);
+        ",
+    )?;
+    Ok(())
+}
+
 fn transaction_column_exists(
     transaction: &Transaction<'_>,
     table: &str,
@@ -2957,14 +3213,18 @@ fn optional_u64_identity(
                 rusqlite::Error::FromSqlConversionFailure(
                     index,
                     rusqlite::types::Type::Text,
-                    Box::new(error),
+                    invalid_data_error(format!(
+                        "{column} contains invalid UTF-8 decimal text: {error}"
+                    )),
                 )
             })?;
             value.parse::<u64>().map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     index,
                     rusqlite::types::Type::Text,
-                    Box::new(error),
+                    invalid_data_error(format!(
+                        "{column} must contain a u64 decimal value: {error}"
+                    )),
                 )
             })?
         }
@@ -2986,7 +3246,16 @@ fn parse_clean_attempt_outcome(label: &str) -> Option<CleanAttemptOutcome> {
         "success" => Some(CleanAttemptOutcome::Success),
         "cargo_nonzero" => Some(CleanAttemptOutcome::CargoNonzero),
         "runner_failure" => Some(CleanAttemptOutcome::RunnerFailure),
-        "measurement_failure" => Some(CleanAttemptOutcome::MeasurementFailure),
+        _ => None,
+    }
+}
+
+fn parse_legacy_clean_attempt_outcome(label: &str) -> Option<LegacyCleanAttemptOutcome> {
+    match label {
+        "success" => Some(LegacyCleanAttemptOutcome::Success),
+        "cargo_nonzero" => Some(LegacyCleanAttemptOutcome::CargoNonzero),
+        "runner_failure" => Some(LegacyCleanAttemptOutcome::RunnerFailure),
+        "measurement_failure" => Some(LegacyCleanAttemptOutcome::MeasurementFailure),
         _ => None,
     }
 }

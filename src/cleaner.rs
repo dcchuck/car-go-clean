@@ -17,7 +17,6 @@ pub enum CleanAttemptOutcome {
     Success,
     CargoNonzero,
     RunnerFailure,
-    MeasurementFailure,
 }
 
 impl CleanAttemptOutcome {
@@ -26,7 +25,6 @@ impl CleanAttemptOutcome {
             Self::Success => "success",
             Self::CargoNonzero => "cargo_nonzero",
             Self::RunnerFailure => "runner_failure",
-            Self::MeasurementFailure => "measurement_failure",
         }
     }
 }
@@ -125,6 +123,7 @@ impl<R: CommandRunner> Cleaner<R> {
         }
 
         result.bytes_before = dir_size(&target_dir)?;
+        result.bytes_after = result.bytes_before;
         let start = Instant::now();
         let mut cmd = Command::new(&self.cargo_bin);
         cmd.arg("clean")
@@ -144,6 +143,13 @@ impl<R: CommandRunner> Cleaner<R> {
                 result.duration = start.elapsed();
                 result.outcome = Some(CleanAttemptOutcome::RunnerFailure);
                 result.attempt_error = Some(error.to_string());
+                match dir_size(&target_dir) {
+                    Ok(bytes_after) => result.bytes_after = bytes_after,
+                    Err(error) => {
+                        result.measurement_error =
+                            Some(format!("measure target after cargo clean: {error:#}"));
+                    }
+                }
                 return Ok(result);
             }
         };
@@ -158,8 +164,6 @@ impl<R: CommandRunner> Cleaner<R> {
         match dir_size(&target_dir) {
             Ok(bytes_after) => result.bytes_after = bytes_after,
             Err(error) => {
-                result.bytes_after = result.bytes_before;
-                result.outcome = Some(CleanAttemptOutcome::MeasurementFailure);
                 result.measurement_error =
                     Some(format!("measure target after cargo clean: {error:#}"));
             }
@@ -281,17 +285,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn signal_terminated_process_is_not_fabricated_as_exit_one() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "kill -KILL $$"]);
+    fn signal_terminated_process_preserves_runner_failure_and_remeasures_bytes() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let error = RealRunner.run(Path::new("."), &mut command).unwrap_err();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("target")).unwrap();
+        fs::write(project.path().join("target/removed.bin"), [0; 2_048]).unwrap();
+        fs::write(project.path().join("target/retained.bin"), [0; 1_024]).unwrap();
+        let cargo = project.path().join("signal-cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nrm \"$PWD/target/removed.bin\"\nkill -KILL $$\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("cargo clean terminated without an exit code"),
-            "{error:#}"
-        );
+        let result = Cleaner::new(cargo, RealRunner, Duration::from_secs(60))
+            .clean(project.path())
+            .unwrap();
+
+        assert_eq!(result.outcome, Some(CleanAttemptOutcome::RunnerFailure));
+        assert_eq!(result.exit_code, None);
+        assert!(result
+            .attempt_error
+            .as_deref()
+            .unwrap()
+            .contains("cargo clean terminated without an exit code"));
+        assert_eq!(result.bytes_before, 3_072);
+        assert_eq!(result.bytes_after, 1_024);
+        assert!(result.measurement_error.is_none());
     }
 }

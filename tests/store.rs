@@ -187,7 +187,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 14);
+    assert_eq!(schema_version, 15);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -415,6 +415,7 @@ fn reconcile_excluded_discovery_state_prunes_only_matching_active_state() {
             exit_code: Some(0),
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::Success,
+            measurement_failed: false,
         })
         .unwrap();
     let review_summary = ReviewSummary {
@@ -1288,6 +1289,7 @@ fn records_runs_clean_events_errors_and_stats() {
             exit_code: Some(0),
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::Success,
+            measurement_failed: false,
         })
         .unwrap();
     store
@@ -1302,6 +1304,7 @@ fn records_runs_clean_events_errors_and_stats() {
             exit_code: Some(9),
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::CargoNonzero,
+            measurement_failed: false,
         })
         .unwrap();
     store
@@ -1316,6 +1319,7 @@ fn records_runs_clean_events_errors_and_stats() {
             exit_code: Some(0),
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::Success,
+            measurement_failed: false,
         })
         .unwrap();
     store
@@ -1330,6 +1334,7 @@ fn records_runs_clean_events_errors_and_stats() {
             exit_code: None,
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::RunnerFailure,
+            measurement_failed: false,
         })
         .unwrap();
     store
@@ -1343,7 +1348,8 @@ fn records_runs_clean_events_errors_and_stats() {
             duration_ms: 10,
             exit_code: Some(0),
             stderr_excerpt: String::new(),
-            outcome: CleanAttemptOutcome::MeasurementFailure,
+            outcome: CleanAttemptOutcome::Success,
+            measurement_failed: true,
         })
         .unwrap();
     store
@@ -1875,7 +1881,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 14);
+        assert_eq!(schema_version, 15);
     }
 }
 
@@ -2042,7 +2048,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 14);
+    assert_eq!(schema_version, 15);
 }
 
 #[test]
@@ -2090,10 +2096,78 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
             .execute_batch(
                 "
                 DROP INDEX idx_discovery_generations_single_valid;
-                ALTER TABLE project_observations DROP COLUMN project_mount_id;
-                ALTER TABLE project_observations DROP COLUMN target_mount_id;
-                ALTER TABLE review_plan_targets DROP COLUMN project_mount_id;
-                ALTER TABLE review_plan_targets DROP COLUMN target_mount_id;
+                ALTER TABLE project_observations RENAME TO project_observations_current;
+                CREATE TABLE project_observations (
+                    generation_id INTEGER NOT NULL,
+                    origin_id INTEGER NOT NULL,
+                    project_path TEXT NOT NULL,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    observed_at INTEGER NOT NULL,
+                    authorized INTEGER NOT NULL,
+                    blocked_reason TEXT,
+                    boot_session_id TEXT,
+                    PRIMARY KEY(generation_id, origin_id, project_path)
+                );
+                INSERT INTO project_observations
+                SELECT
+                    generation_id,
+                    origin_id,
+                    project_path,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    observed_at,
+                    authorized,
+                    blocked_reason,
+                    boot_session_id
+                FROM project_observations_current;
+                DROP TABLE project_observations_current;
+                CREATE INDEX idx_project_observations_authorized
+                    ON project_observations(generation_id, authorized, project_path);
+
+                ALTER TABLE review_plan_targets RENAME TO review_plan_targets_current;
+                CREATE TABLE review_plan_targets (
+                    plan_id INTEGER NOT NULL
+                        REFERENCES review_plans(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    project_path TEXT NOT NULL,
+                    canonical_project_path TEXT,
+                    project_class TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    review_boot_session_id TEXT,
+                    reviewed_bytes INTEGER NOT NULL,
+                    decision TEXT NOT NULL,
+                    skip_reason TEXT,
+                    skip_newest_age_secs INTEGER,
+                    PRIMARY KEY(plan_id, ordinal)
+                );
+                INSERT INTO review_plan_targets
+                SELECT
+                    plan_id,
+                    ordinal,
+                    project_path,
+                    canonical_project_path,
+                    project_class,
+                    target_path,
+                    project_device,
+                    project_inode,
+                    target_device,
+                    target_inode,
+                    review_boot_session_id,
+                    reviewed_bytes,
+                    decision,
+                    skip_reason,
+                    skip_newest_age_secs
+                FROM review_plan_targets_current;
+                DROP TABLE review_plan_targets_current;
                 DELETE FROM schema_version WHERE version >= 13;
                 ",
             )
@@ -2120,7 +2194,7 @@ fn version_twelve_mount_identity_migration_revokes_observations_and_review_plans
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        14
+        15
     );
     assert_eq!(
         inspection
@@ -2999,7 +3073,7 @@ fn version_thirteen_signed_identities_migrate_losslessly_without_revoking_author
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        14
+        15
     );
     for table in ["project_observations", "review_plan_targets"] {
         let storage = inspection
@@ -3047,6 +3121,276 @@ fn version_thirteen_signed_identities_migrate_losslessly_without_revoking_author
     }
 }
 
+fn create_permissive_v13_identity_fixture(database: &Path) {
+    let now = SystemTime::now();
+    {
+        let store = test_store(database);
+        let generation = store
+            .reconcile_generation(
+                now,
+                &GenerationReconciliation {
+                    policy_hash: "policy-malformed-v13".to_string(),
+                    boot_session_id: Some("generation-boot".to_string()),
+                    origins: vec![completed_origin(
+                        "/workspace",
+                        vec![observed_project(
+                            "/workspace/project",
+                            7,
+                            11,
+                            Some((7, 12)),
+                            now,
+                        )],
+                    )],
+                },
+            )
+            .unwrap();
+        let review = persisted_review(
+            "/workspace/project",
+            Some("/workspace/project"),
+            ProjectClass::Workspace,
+            100,
+            Some((7, 11, 7, 12, Some("review-boot"))),
+            CleanDecision::Cleanable,
+        );
+        store
+            .create_review_plan(
+                now,
+                "policy-malformed-v13",
+                generation.id,
+                false,
+                100,
+                std::slice::from_ref(&review),
+            )
+            .unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "
+            ALTER TABLE project_observations RENAME TO project_observations_strict;
+            CREATE TABLE project_observations (
+                generation_id INTEGER,
+                origin_id INTEGER,
+                project_path TEXT,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                observed_at INTEGER,
+                authorized INTEGER,
+                blocked_reason TEXT,
+                boot_session_id TEXT,
+                PRIMARY KEY(generation_id, origin_id, project_path)
+            );
+            INSERT INTO project_observations
+            SELECT * FROM project_observations_strict;
+            DROP TABLE project_observations_strict;
+            CREATE INDEX idx_project_observations_authorized
+                ON project_observations(generation_id, authorized, project_path);
+
+            ALTER TABLE review_plan_targets RENAME TO review_plan_targets_strict;
+            CREATE TABLE review_plan_targets (
+                plan_id INTEGER,
+                ordinal INTEGER,
+                project_path TEXT,
+                canonical_project_path TEXT,
+                project_class TEXT,
+                target_path TEXT,
+                project_device,
+                project_inode,
+                project_mount_id,
+                target_device,
+                target_inode,
+                target_mount_id,
+                review_boot_session_id TEXT,
+                reviewed_bytes INTEGER,
+                decision TEXT,
+                skip_reason TEXT,
+                skip_newest_age_secs INTEGER,
+                PRIMARY KEY(plan_id, ordinal)
+            );
+            INSERT INTO review_plan_targets
+            SELECT * FROM review_plan_targets_strict;
+            DROP TABLE review_plan_targets_strict;
+
+            DELETE FROM schema_version WHERE version >= 14;
+            ",
+        )
+        .unwrap();
+}
+
+fn identity_migration_snapshot(
+    connection: &rusqlite::Connection,
+) -> (Vec<(String, String)>, Vec<String>, i64) {
+    let schema = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT name, sql
+                FROM sqlite_master
+                WHERE name IN (
+                    'project_observations',
+                    'review_plan_targets',
+                    'clean_events',
+                    'idx_project_observations_authorized',
+                    'idx_clean_events_ts'
+                )
+                ORDER BY name
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                    'observation|' || generation_id || '|' || origin_id || '|' ||
+                    project_path || '|' ||
+                    typeof(project_device) || ':' || hex(project_device) || '|' ||
+                    typeof(project_inode) || ':' || hex(project_inode) || '|' ||
+                    typeof(project_mount_id) || ':' || hex(project_mount_id) || '|' ||
+                    typeof(target_device) || ':' || hex(target_device) || '|' ||
+                    typeof(target_inode) || ':' || hex(target_inode) || '|' ||
+                    typeof(target_mount_id) || ':' || hex(target_mount_id)
+                FROM project_observations
+                UNION ALL
+                SELECT
+                    'review|' || plan_id || '|' || ordinal || '|' ||
+                    project_path || '|' ||
+                    typeof(project_device) || ':' || hex(project_device) || '|' ||
+                    typeof(project_inode) || ':' || hex(project_inode) || '|' ||
+                    typeof(project_mount_id) || ':' || hex(project_mount_id) || '|' ||
+                    typeof(target_device) || ':' || hex(target_device) || '|' ||
+                    typeof(target_inode) || ':' || hex(target_inode) || '|' ||
+                    typeof(target_mount_id) || ':' || hex(target_mount_id)
+                FROM review_plan_targets
+                ORDER BY 1
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let version = connection
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    (schema, rows, version)
+}
+
+#[test]
+fn version_thirteen_malformed_identity_groups_fail_atomically_and_idempotently() {
+    for (name, mutation, expected_message) in [
+        (
+            "project-incomplete-target-triple",
+            "UPDATE project_observations SET target_mount_id = NULL",
+            "project_observations target identity",
+        ),
+        (
+            "project-missing-required-mount",
+            "UPDATE project_observations SET project_mount_id = NULL",
+            "project_observations project identity",
+        ),
+        (
+            "review-incomplete-project-triple",
+            "UPDATE review_plan_targets SET project_mount_id = NULL",
+            "review_plan_targets identity",
+        ),
+        (
+            "negative-integer",
+            "UPDATE project_observations SET project_device = -1",
+            "project_device",
+        ),
+        (
+            "required-null",
+            "UPDATE project_observations SET project_inode = NULL",
+            "project_inode",
+        ),
+        (
+            "short-blob",
+            "UPDATE project_observations SET project_device = X'00010203040506'",
+            "project_device",
+        ),
+        (
+            "long-blob",
+            "UPDATE project_observations SET project_device = X'000102030405060708'",
+            "project_device",
+        ),
+        (
+            "overflow-decimal",
+            "UPDATE project_observations SET project_device = '18446744073709551616'",
+            "project_device",
+        ),
+        (
+            "malformed-decimal",
+            "UPDATE project_observations SET project_device = 'not-a-number'",
+            "project_device",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!("{name}.db"));
+        create_permissive_v13_identity_fixture(&database);
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute(mutation, []).unwrap();
+        }
+
+        let before = {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            identity_migration_snapshot(&connection)
+        };
+        assert_eq!(before.2, 13, "{name}");
+
+        let store = Store::open(&database).unwrap();
+        let first_error = store.migrate().unwrap_err().to_string();
+        assert!(
+            first_error.contains(expected_message),
+            "{name}: {first_error}"
+        );
+        let second_error = store.migrate().unwrap_err().to_string();
+        assert_eq!(second_error, first_error, "{name}");
+        drop(store);
+
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(identity_migration_snapshot(&inspection), before, "{name}");
+        for temporary_table in [
+            "project_observations_v14",
+            "review_plan_targets_v14",
+            "clean_events_v14",
+            "clean_events_v15",
+        ] {
+            assert_eq!(
+                inspection
+                    .query_row(
+                        "
+                        SELECT COUNT(*)
+                        FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                        ",
+                        [temporary_table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "{name}: {temporary_table}"
+            );
+        }
+    }
+}
+
 #[test]
 fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
     let directory = tempfile::tempdir().unwrap();
@@ -3055,19 +3399,21 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
     {
         let store = test_store(&database);
         let run_id = store.start_run(started_at).unwrap();
-        for (offset, path, exit_code, outcome) in [
-            (1, "/success", Some(0), CleanAttemptOutcome::Success),
+        for (offset, path, exit_code, outcome, measurement_failed) in [
+            (1, "/success", Some(0), CleanAttemptOutcome::Success, false),
             (
                 2,
                 "/cargo-nonzero",
                 Some(7),
                 CleanAttemptOutcome::CargoNonzero,
+                false,
             ),
             (
                 3,
                 "/measurement",
                 Some(0),
-                CleanAttemptOutcome::MeasurementFailure,
+                CleanAttemptOutcome::Success,
+                true,
             ),
         ] {
             store
@@ -3082,6 +3428,7 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
                     exit_code,
                     stderr_excerpt: String::new(),
                     outcome,
+                    measurement_failed,
                 })
                 .unwrap();
         }
@@ -3152,8 +3499,15 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
         vec![
             CleanAttemptOutcome::Success,
             CleanAttemptOutcome::CargoNonzero,
-            CleanAttemptOutcome::MeasurementFailure,
+            CleanAttemptOutcome::Success,
         ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.measurement_failed)
+            .collect::<Vec<_>>(),
+        vec![false, false, true]
     );
     assert_eq!(
         store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
@@ -3170,8 +3524,302 @@ fn version_thirteen_clean_events_gain_deterministic_typed_outcomes() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        14
+        15
     );
+}
+
+#[test]
+fn version_fourteen_measurement_failure_recovers_the_retained_execution_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(650);
+    {
+        let store = test_store(&database);
+        let run_id = store.start_run(timestamp).unwrap();
+        store
+            .record_clean_event(&CleanEvent {
+                id: 0,
+                run_id,
+                ts: timestamp,
+                path: "/combined-failure".to_string(),
+                bytes_before: 1_000,
+                bytes_after: 1_000,
+                duration_ms: 5,
+                exit_code: Some(7),
+                stderr_excerpt: "cargo failed".to_string(),
+                outcome: CleanAttemptOutcome::CargoNonzero,
+                measurement_failed: true,
+            })
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE clean_events_v14_legacy (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    ts INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    bytes_before INTEGER NOT NULL,
+                    bytes_after INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    exit_code INTEGER,
+                    stderr_excerpt TEXT NOT NULL DEFAULT '',
+                    attempt_outcome TEXT NOT NULL
+                );
+                INSERT INTO clean_events_v14_legacy (
+                    id,
+                    run_id,
+                    ts,
+                    path,
+                    bytes_before,
+                    bytes_after,
+                    duration_ms,
+                    exit_code,
+                    stderr_excerpt,
+                    attempt_outcome
+                )
+                SELECT
+                    id,
+                    run_id,
+                    ts,
+                    path,
+                    bytes_before,
+                    bytes_after,
+                    duration_ms,
+                    exit_code,
+                    stderr_excerpt,
+                    'measurement_failure'
+                FROM clean_events;
+                DROP TABLE clean_events;
+                ALTER TABLE clean_events_v14_legacy RENAME TO clean_events;
+                CREATE INDEX idx_clean_events_ts ON clean_events(ts);
+                DELETE FROM schema_version WHERE version >= 15;
+                ",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    let events = store.clean_events_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, Some(7));
+    assert_eq!(events[0].outcome, CleanAttemptOutcome::CargoNonzero);
+    assert!(events[0].measurement_failed);
+    assert_eq!(
+        store.failed_clean_attempts(SystemTime::UNIX_EPOCH).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.total_bytes_recovered(SystemTime::UNIX_EPOCH).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn version_thirteen_measurement_inference_rejects_ambiguous_collisions_atomically() {
+    for (clean_event_count, measurement_error_count) in [(2, 1), (1, 2)] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!(
+            "collision-{clean_event_count}-{measurement_error_count}.db"
+        ));
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(700);
+        {
+            let store = test_store(&database);
+            let run_id = store.start_run(timestamp).unwrap();
+            for _ in 0..clean_event_count {
+                store
+                    .record_clean_event(&CleanEvent {
+                        id: 0,
+                        run_id,
+                        ts: timestamp,
+                        path: "/collision".to_string(),
+                        bytes_before: 1_000,
+                        bytes_after: 1_000,
+                        duration_ms: 5,
+                        exit_code: Some(0),
+                        stderr_excerpt: String::new(),
+                        outcome: CleanAttemptOutcome::Success,
+                        measurement_failed: false,
+                    })
+                    .unwrap();
+            }
+            for ordinal in 0..measurement_error_count {
+                store
+                    .record_error(&ErrorRecord {
+                        id: 0,
+                        ts: timestamp,
+                        category: "clean".to_string(),
+                        path: Some("/collision".to_string()),
+                        message: format!(
+                            "measure target after cargo clean: injected collision {ordinal}"
+                        ),
+                    })
+                    .unwrap();
+            }
+        }
+        let expected_events = {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE clean_events_v13 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id INTEGER NOT NULL REFERENCES runs(id),
+                        ts INTEGER NOT NULL,
+                        path TEXT NOT NULL,
+                        bytes_before INTEGER NOT NULL,
+                        bytes_after INTEGER NOT NULL,
+                        duration_ms INTEGER NOT NULL DEFAULT 0,
+                        exit_code INTEGER NOT NULL DEFAULT 0,
+                        stderr_excerpt TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO clean_events_v13 (
+                        id,
+                        run_id,
+                        ts,
+                        path,
+                        bytes_before,
+                        bytes_after,
+                        duration_ms,
+                        exit_code,
+                        stderr_excerpt
+                    )
+                    SELECT
+                        id,
+                        run_id,
+                        ts,
+                        path,
+                        bytes_before,
+                        bytes_after,
+                        duration_ms,
+                        exit_code,
+                        stderr_excerpt
+                    FROM clean_events;
+                    DROP TABLE clean_events;
+                    ALTER TABLE clean_events_v13 RENAME TO clean_events;
+                    CREATE INDEX idx_clean_events_ts ON clean_events(ts);
+                    DELETE FROM schema_version WHERE version >= 14;
+                    ",
+                )
+                .unwrap();
+            let mut statement = connection
+                .prepare(
+                    "
+                    SELECT
+                        id, run_id, ts, path, bytes_before, bytes_after,
+                        duration_ms, exit_code, stderr_excerpt
+                    FROM clean_events
+                    ORDER BY id
+                    ",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        let store = Store::open(&database).unwrap();
+        let first_error = store.migrate().unwrap_err().to_string();
+        assert!(
+            first_error.contains("ambiguous measurement failure audit"),
+            "{first_error}"
+        );
+        assert!(first_error.contains(&format!("{clean_event_count} clean event")));
+        assert!(first_error.contains(&format!("{measurement_error_count} matching error")));
+        let second_error = store.migrate().unwrap_err().to_string();
+        assert_eq!(second_error, first_error);
+        drop(store);
+
+        let inspection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            inspection
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            13
+        );
+        let actual_events = {
+            let mut statement = inspection
+                .prepare(
+                    "
+                    SELECT
+                        id, run_id, ts, path, bytes_before, bytes_after,
+                        duration_ms, exit_code, stderr_excerpt
+                    FROM clean_events
+                    ORDER BY id
+                    ",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(actual_events, expected_events);
+        for temporary_table in ["clean_events_v14", "clean_events_v15"] {
+            assert_eq!(
+                inspection
+                    .query_row(
+                        "
+                        SELECT COUNT(*)
+                        FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                        ",
+                        [temporary_table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "{temporary_table}"
+            );
+        }
+        let columns = {
+            let mut statement = inspection
+                .prepare("SELECT name FROM pragma_table_info('clean_events') ORDER BY cid")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(!columns.iter().any(|column| column == "attempt_outcome"));
+        assert!(!columns.iter().any(|column| column == "measurement_failed"));
+    }
 }
 
 #[test]
@@ -3558,6 +4206,7 @@ fn versions_ten_and_eleven_add_review_plans_without_changing_history() {
                     exit_code: Some(0),
                     stderr_excerpt: String::new(),
                     outcome: CleanAttemptOutcome::Success,
+                    measurement_failed: false,
                 })
                 .unwrap();
             store
@@ -3577,8 +4226,41 @@ fn versions_ten_and_eleven_add_review_plans_without_changing_history() {
                 .execute_batch(&format!(
                     "
                     DROP INDEX idx_discovery_generations_single_valid;
-                    ALTER TABLE project_observations DROP COLUMN project_mount_id;
-                    ALTER TABLE project_observations DROP COLUMN target_mount_id;
+                    ALTER TABLE project_observations
+                        RENAME TO project_observations_current;
+                    CREATE TABLE project_observations (
+                        generation_id INTEGER NOT NULL
+                            REFERENCES discovery_generations(id) ON DELETE CASCADE,
+                        origin_id INTEGER NOT NULL
+                            REFERENCES discovery_origins(id) ON DELETE CASCADE,
+                        project_path TEXT NOT NULL,
+                        project_device,
+                        project_inode,
+                        target_device,
+                        target_inode,
+                        observed_at INTEGER NOT NULL,
+                        authorized INTEGER NOT NULL,
+                        blocked_reason TEXT,
+                        boot_session_id TEXT,
+                        PRIMARY KEY(generation_id, origin_id, project_path)
+                    );
+                    INSERT INTO project_observations
+                    SELECT
+                        generation_id,
+                        origin_id,
+                        project_path,
+                        project_device,
+                        project_inode,
+                        target_device,
+                        target_inode,
+                        observed_at,
+                        authorized,
+                        blocked_reason,
+                        boot_session_id
+                    FROM project_observations_current;
+                    DROP TABLE project_observations_current;
+                    CREATE INDEX idx_project_observations_authorized
+                        ON project_observations(generation_id, authorized, project_path);
                     DROP TABLE review_plan_targets;
                     DROP TABLE review_plans;
                     DELETE FROM schema_version WHERE version > {version};
@@ -3621,7 +4303,7 @@ fn versions_ten_and_eleven_add_review_plans_without_changing_history() {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            14
+            15
         );
     }
 }
@@ -3650,6 +4332,7 @@ fn review_plan_pruning_preserves_run_clean_project_error_and_recovery_history() 
             exit_code: Some(0),
             stderr_excerpt: String::new(),
             outcome: CleanAttemptOutcome::Success,
+            measurement_failed: false,
         })
         .unwrap();
     store

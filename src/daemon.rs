@@ -661,6 +661,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                         exit_code: result.exit_code,
                         stderr_excerpt: result.stderr_excerpt.clone(),
                         outcome,
+                        measurement_failed: result.measurement_error.is_some(),
                     })?;
                     if prepared.reverified_across_boot
                         && outcome != CleanAttemptOutcome::RunnerFailure
@@ -677,9 +678,12 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     }
                     match outcome {
                         CleanAttemptOutcome::Success => {
-                            projects_cleaned += 1;
-                            bytes_recovered += (result.bytes_before - result.bytes_after).max(0);
-                            self.store.mark_project_cleaned(&path, now)?;
+                            if result.measurement_error.is_none() {
+                                projects_cleaned += 1;
+                                bytes_recovered +=
+                                    (result.bytes_before - result.bytes_after).max(0);
+                                self.store.mark_project_cleaned(&path, now)?;
+                            }
                         }
                         CleanAttemptOutcome::CargoNonzero => {
                             errors_count += 1;
@@ -714,20 +718,17 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                                     .context("runner failure is missing its audit message")?,
                             })?;
                         }
-                        CleanAttemptOutcome::MeasurementFailure => {
-                            errors_count += 1;
-                            measurement_failures += 1;
-                            self.store.record_error(&ErrorRecord {
-                                id: 0,
-                                ts: now,
-                                category: "clean".to_string(),
-                                path: path.to_str().map(str::to_owned),
-                                message: result
-                                    .measurement_error
-                                    .clone()
-                                    .context("measurement failure is missing its audit message")?,
-                            })?;
-                        }
+                    }
+                    if let Some(measurement_error) = &result.measurement_error {
+                        errors_count += 1;
+                        measurement_failures += 1;
+                        self.store.record_error(&ErrorRecord {
+                            id: 0,
+                            ts: now,
+                            category: "clean".to_string(),
+                            path: path.to_str().map(str::to_owned),
+                            message: measurement_error.clone(),
+                        })?;
                     }
                 }
                 Err(err) => {

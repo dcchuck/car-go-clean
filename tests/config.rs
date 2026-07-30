@@ -153,6 +153,24 @@ fn load_dangling_implicit_default_is_not_treated_as_absent() {
 
 #[cfg(unix)]
 #[test]
+fn load_dangling_implicit_default_ancestor_is_not_treated_as_absent() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dangling_ancestor = dir.path().join("config-root");
+    symlink(dir.path().join("missing-config-root"), &dangling_ancestor).unwrap();
+    let path = dangling_ancestor.join("car-go-clean/config.toml");
+
+    let error = format!("{:#}", load_default(&path).unwrap_err());
+
+    assert!(
+        error.contains(&format!("resolve symlink {}", dangling_ancestor.display())),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn load_inaccessible_explicit_path_is_an_error_when_permissions_are_enforced() {
     use std::os::unix::fs::PermissionsExt;
 
