@@ -504,6 +504,34 @@ impl Store {
         }
         if current < 8 {
             let tx = self.conn.unchecked_transaction()?;
+            let affected_runs = {
+                let mut statement = tx.prepare(
+                    "
+                    SELECT runs.id, runs.errors_count, COUNT(*)
+                    FROM runs
+                    JOIN clean_events ON clean_events.run_id = runs.id
+                    WHERE clean_events.exit_code <> 0
+                    GROUP BY runs.id, runs.errors_count
+                    ORDER BY runs.id
+                    ",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+                collect_rows(rows)?
+            };
+            for (run_id, errors_count, repair_count) in affected_runs {
+                errors_count.checked_add(repair_count).with_context(|| {
+                    format!(
+                        "v7 clean error count overflow for run {run_id}: \
+                         stored {errors_count}, historical repairs {repair_count}"
+                    )
+                })?;
+            }
             tx.execute_batch(
                 "
                 UPDATE runs

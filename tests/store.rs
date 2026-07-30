@@ -34,6 +34,198 @@ fn sqlite_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     )?))
 }
 
+fn create_authentic_v7_accounting_fixture(database: &Path, errors_count: i64) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (7);
+            CREATE TABLE projects (
+                path TEXT PRIMARY KEY,
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_cleaned_at INTEGER
+            );
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                projects_cleaned INTEGER NOT NULL DEFAULT 0,
+                bytes_recovered INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE clean_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                ts INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                bytes_before INTEGER NOT NULL,
+                bytes_after INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER NOT NULL DEFAULT 0,
+                stderr_excerpt TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                path TEXT,
+                message TEXT NOT NULL
+            );
+            INSERT INTO projects (
+                path, discovered_at, last_seen_at, last_cleaned_at
+            ) VALUES ('/v7-failed', 10, 30, 999);
+            INSERT INTO errors (ts, category, path, message)
+            VALUES (5, 'scan', NULL, 'preexisting diagnostic');
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO runs (
+                id, started_at, finished_at, projects_cleaned, bytes_recovered, errors_count
+            ) VALUES (1, 10, 30, 4, 75, ?1)
+            ",
+            [errors_count],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO clean_events (
+                id, run_id, ts, path, bytes_before, bytes_after,
+                duration_ms, exit_code, stderr_excerpt
+            ) VALUES (1, 1, 20, '/v7-failed', 100, 25, 5, 7, 'legacy failure')
+            ",
+            [],
+        )
+        .unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct V7AccountingState {
+    schema_version: i64,
+    runs: Vec<(i64, i64, i64, String, String)>,
+    projects: Vec<(String, Option<i64>)>,
+    errors: Vec<(i64, String, Option<String>, String)>,
+}
+
+fn v7_accounting_state(database: &Path) -> V7AccountingState {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let runs = {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                    id,
+                    projects_cleaned,
+                    bytes_recovered,
+                    CAST(errors_count AS TEXT),
+                    typeof(errors_count)
+                FROM runs
+                ORDER BY id
+                ",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let projects = {
+        let mut statement = connection
+            .prepare("SELECT path, last_cleaned_at FROM projects ORDER BY path")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let errors = {
+        let mut statement = connection
+            .prepare("SELECT ts, category, path, message FROM errors ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    V7AccountingState {
+        schema_version: connection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        runs,
+        projects,
+        errors,
+    }
+}
+
+#[test]
+fn version_seven_accounting_repair_rejects_run_count_overflow_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    create_authentic_v7_accounting_fixture(&database, i64::MAX);
+    let before = v7_accounting_state(&database);
+    let mut first_error = None;
+
+    for _ in 0..2 {
+        let store = Store::open(&database).unwrap();
+        let error = store.migrate().unwrap_err().to_string();
+        assert!(error.contains("v7 clean error count overflow"), "{error}");
+        assert!(error.contains("run 1"), "{error}");
+        if let Some(first_error) = &first_error {
+            assert_eq!(&error, first_error);
+        } else {
+            first_error = Some(error);
+        }
+        drop(store);
+        assert_eq!(v7_accounting_state(&database), before);
+    }
+
+    assert_eq!(before.schema_version, 7);
+    assert_eq!(
+        before.runs,
+        vec![(1, 4, 75, i64::MAX.to_string(), "integer".to_string())]
+    );
+}
+
+#[test]
+fn version_seven_accounting_repair_accepts_exact_i64_boundary_as_integer() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    create_authentic_v7_accounting_fixture(&database, i64::MAX - 1);
+
+    let store = Store::open(&database).unwrap();
+    store.migrate().unwrap();
+    drop(store);
+
+    let state = v7_accounting_state(&database);
+    assert_eq!(state.schema_version, 16);
+    assert_eq!(
+        state.runs,
+        vec![(1, 0, 0, i64::MAX.to_string(), "integer".to_string())]
+    );
+    assert_eq!(state.projects, vec![("/v7-failed".to_string(), None)]);
+    assert_eq!(state.errors.len(), 2);
+}
+
 #[test]
 fn open_creates_file_and_migrations_create_tables() {
     let dir = tempfile::tempdir().unwrap();

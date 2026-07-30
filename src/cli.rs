@@ -2191,7 +2191,17 @@ fn stats(
     json: bool,
 ) -> Result<CommandOutcome> {
     let since_time = match since {
-        Some(value) => SystemTime::now() - parse_since(&value)?,
+        Some(value) => {
+            let now = SystemTime::now();
+            let duration = parse_since(&value)?;
+            let since_time = now.checked_sub(duration).ok_or_else(|| {
+                anyhow!("invalid duration {value:?}: exceeds the supported clock range")
+            })?;
+            if since_time < SystemTime::UNIX_EPOCH {
+                bail!("invalid duration {value:?}: predates the Unix epoch");
+            }
+            since_time
+        }
         None => SystemTime::UNIX_EPOCH,
     };
     let store = open_store(state_dir.as_deref())?;
@@ -2396,15 +2406,29 @@ fn scanner_for(cfg: &Config, policy: &ScopePolicy) -> Scanner {
 }
 
 fn parse_since(value: &str) -> Result<Duration> {
-    if let Some(days) = value.strip_suffix('d') {
-        return Ok(Duration::from_secs(days.parse::<u64>()? * 24 * 60 * 60));
+    let simple_units: [(&str, u64); 5] = [
+        ("w", 7 * 24 * 60 * 60),
+        ("d", 24 * 60 * 60),
+        ("h", 60 * 60),
+        ("m", 60),
+        ("s", 1),
+    ];
+    for (suffix, seconds_per_unit) in simple_units {
+        let Some(amount) = value.strip_suffix(suffix) else {
+            continue;
+        };
+        if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let amount = amount
+            .parse::<u64>()
+            .with_context(|| format!("invalid duration {value:?}"))?;
+        let seconds = amount
+            .checked_mul(seconds_per_unit)
+            .with_context(|| format!("invalid duration {value:?}: seconds overflow"))?;
+        return Ok(Duration::from_secs(seconds));
     }
-    if let Some(weeks) = value.strip_suffix('w') {
-        return Ok(Duration::from_secs(
-            weeks.parse::<u64>()? * 7 * 24 * 60 * 60,
-        ));
-    }
-    humantime::parse_duration(value).map_err(Into::into)
+    humantime::parse_duration(value).with_context(|| format!("invalid duration {value:?}"))
 }
 
 fn tail_file_lines(path: &Path, n: usize) -> Result<Vec<String>> {

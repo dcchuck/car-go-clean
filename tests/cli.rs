@@ -172,6 +172,50 @@ fn top_level_version_parse_request_exits_zero() {
 }
 
 #[test]
+fn stats_since_rejects_duration_multiplication_overflow_without_panicking() {
+    let work = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["stats", "--since", &format!("{}d", u64::MAX), "--state-dir"])
+        .arg(work.path().join("state"))
+        .assert()
+        .code(1)
+        .stderr(contains("invalid duration"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
+fn stats_since_rejects_duration_before_unix_epoch_without_panicking() {
+    let work = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["stats", "--since", "100000d", "--state-dir"])
+        .arg(work.path().join("state"))
+        .assert()
+        .code(1)
+        .stderr(contains("invalid duration"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
+fn stats_since_accepts_normal_seconds_minutes_hours_and_days() {
+    let work = tempfile::tempdir().unwrap();
+    let state = work.path().join("state");
+
+    for duration in ["1s", "2m", "3h", "4d"] {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .args(["stats", "--since", duration, "--state-dir"])
+            .arg(&state)
+            .assert()
+            .success()
+            .stdout(contains("Bytes recovered: 0"));
+    }
+}
+
+#[test]
 fn exit_code_zero_for_complete_scan() {
     let work = tempfile::tempdir().unwrap();
     let root = work.path().join("root");
