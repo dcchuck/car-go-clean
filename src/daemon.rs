@@ -1,4 +1,4 @@
-use crate::activity::ProcessInspector;
+use crate::activity::{ActivitySampler, ActivitySignal, ProcessInspector};
 use crate::cache::Cache;
 use crate::cleaner::{Cleaner, CommandRunner};
 use crate::logging::Logger;
@@ -19,10 +19,12 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+const FORCED_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ShutdownFlag;
@@ -49,6 +51,31 @@ impl ShutdownFlag {
 impl Default for ShutdownFlag {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> SystemTime;
+
+    fn wait_until_or_shutdown(&self, deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
+        loop {
+            if shutdown.is_requested() {
+                return true;
+            }
+            let Some(wait_for) = wall_clock_wait_chunk(deadline, self.now()) else {
+                return false;
+            };
+            thread::sleep(wait_for);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
     }
 }
 
@@ -94,6 +121,7 @@ pub struct Daemon<'a, R: CommandRunner> {
     cleaner: Cleaner<R>,
     opts: DaemonOptions,
     logger: Option<Logger>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<'a, R: CommandRunner> Daemon<'a, R> {
@@ -111,11 +139,17 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             cleaner,
             opts,
             logger: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
     pub fn with_logger(mut self, logger: Logger) -> Self {
         self.logger = Some(logger);
+        self
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -125,7 +159,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn scan_cycle(&self) -> Result<ScanCycleResult> {
-        let now = SystemTime::now();
+        let now = self.clock.now();
         let report = self.scanner.scan_with_errors()?;
         let error_count = report.errors.len();
         for error in &report.errors {
@@ -209,7 +243,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         inspector: &impl ProcessInspector,
     ) -> Result<RunCycleResult> {
         self.reconcile_cached_state()?;
-        let started = SystemTime::now();
+        let started = self.clock.now();
         let run_id = self.store.start_run(started)?;
         let (observations, generation) = self.authorized_observations()?;
         let generation_missing = generation.is_none();
@@ -227,7 +261,9 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let discovery_blocks = self.store.blocked_worktree_discovery_paths()?;
         let coverage_incomplete =
             generation_missing || scan_coverage_incomplete || !discovery_blocks.is_empty();
-        let activity = inspector.active_projects(&project_paths)?;
+        let mut activity_sampler = ActivitySampler::new(inspector);
+        let activity =
+            activity_signals(activity_sampler.active_projects_at(&project_paths, started)?);
         let mut reviews = Vec::with_capacity(observations.len());
 
         let mut projects_cleaned = 0;
@@ -282,15 +318,19 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 // measures the target and spawns Cargo. The filesystem can still
                 // change after this returns, so this narrows but cannot eliminate
                 // the residual TOCTOU window.
+                let revalidation_now = self.clock.now();
                 review.decision = match self.scanner.policy() {
                     Some(policy) => revalidate_before_clean(
                         &review,
                         policy,
                         self.scanner.identity_provider(),
-                        inspector,
+                        &activity_signals(
+                            activity_sampler
+                                .active_projects_at(&project_paths, revalidation_now)?,
+                        ),
                         &scan_errors,
                         &discovery_blocks,
-                        SystemTime::now(),
+                        revalidation_now,
                         &safety,
                     )?,
                     None => CleanDecision::Skipped(SkipReason::OutOfScope),
@@ -309,7 +349,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             {
                 self.store.record_error(&ErrorRecord {
                     id: 0,
-                    ts: SystemTime::now(),
+                    ts: self.clock.now(),
                     category: "review".to_string(),
                     path: review.target_path.to_str().map(str::to_owned),
                     message: "target read error: unable to read direct target directory"
@@ -327,7 +367,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     cleaner_skipped += 1;
                 }
                 Ok(result) => {
-                    let now = SystemTime::now();
+                    let now = self.clock.now();
                     self.store.record_clean_event(&CleanEvent {
                         id: 0,
                         run_id,
@@ -380,7 +420,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     errors_count += 1;
                     self.store.record_error(&ErrorRecord {
                         id: 0,
-                        ts: SystemTime::now(),
+                        ts: self.clock.now(),
                         category: "clean".to_string(),
                         path: path.to_str().map(str::to_owned),
                         message: err.to_string(),
@@ -394,7 +434,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         self.store.record_review_status(started, "run", &summary)?;
         self.store.finish_run(
             run_id,
-            SystemTime::now(),
+            self.clock.now(),
             projects_cleaned,
             bytes_recovered,
             errors_count,
@@ -452,42 +492,85 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
     }
 
     pub fn run_until_shutdown(&self, shutdown: &ShutdownFlag) -> Result<()> {
-        let initial_scan_error = if !self
-            .store
-            .has_matching_generation(self.scanner.policy_hash())?
-        {
-            self.scan_cycle().err()
-        } else {
-            None
-        };
         let mut schedule = self.scheduler_status_or_initialize()?;
-        if let Some(err) = initial_scan_error {
-            self.defer_after_scan_failure(&mut schedule, &err)?;
+        self.schedule_missing_generation_scan(&mut schedule)?;
+        if self.scanner.policy().is_some()
+            && !self
+                .store
+                .has_matching_generation(self.scanner.policy_hash())?
+            && self.clock.now() >= schedule.next_scan_at
+        {
+            if let Err(err) = self.scan_cycle() {
+                self.defer_after_scan_failure(&mut schedule, &err)?;
+            } else {
+                schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
+                self.store.record_scheduler_status(
+                    self.clock.now(),
+                    schedule.next_clean_at,
+                    schedule.next_scan_at,
+                )?;
+            }
         }
         while !shutdown.is_requested() {
+            self.schedule_missing_generation_scan(&mut schedule)?;
             let next_due = if schedule.next_clean_at <= schedule.next_scan_at {
                 schedule.next_clean_at
             } else {
                 schedule.next_scan_at
             };
-            if wait_until_or_shutdown(next_due, shutdown) {
+            if self.clock.wait_until_or_shutdown(next_due, shutdown) {
                 break;
             }
 
-            let now = SystemTime::now();
+            let now = self.clock.now();
             if now >= schedule.next_scan_at {
                 if let Err(err) = self.scan_cycle() {
                     self.defer_after_scan_failure(&mut schedule, &err)?;
                     continue;
                 }
-                schedule.next_scan_at = SystemTime::now() + self.opts.scan_interval;
+                schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
             }
             if now >= schedule.next_clean_at {
                 self.run_cycle()?;
-                schedule.next_clean_at = SystemTime::now() + self.opts.clean_interval;
+                schedule.next_clean_at = self.clock.now() + self.opts.clean_interval;
             }
             self.store.record_scheduler_status(
-                SystemTime::now(),
+                self.clock.now(),
+                schedule.next_clean_at,
+                schedule.next_scan_at,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn schedule_missing_generation_scan(&self, schedule: &mut SchedulerStatus) -> Result<()> {
+        if self.scanner.policy().is_none()
+            || self
+                .store
+                .has_matching_generation(self.scanner.policy_hash())?
+        {
+            return Ok(());
+        }
+
+        let now = self.clock.now();
+        let last_attempt = self.store.last_forced_scan_at()?;
+        let rate_limit_elapsed = last_attempt.is_none_or(|last| {
+            now.duration_since(last)
+                .is_ok_and(|elapsed| elapsed >= FORCED_SCAN_MIN_INTERVAL)
+        });
+        let next_scan_at = if rate_limit_elapsed {
+            self.store.record_forced_scan_at(now)?;
+            now
+        } else {
+            last_attempt
+                .and_then(|last| last.checked_add(FORCED_SCAN_MIN_INTERVAL))
+                .unwrap_or_else(|| now.checked_add(FORCED_SCAN_MIN_INTERVAL).unwrap_or(now))
+        };
+
+        if schedule.next_scan_at != next_scan_at {
+            schedule.next_scan_at = next_scan_at;
+            self.store.record_scheduler_status(
+                now,
                 schedule.next_clean_at,
                 schedule.next_scan_at,
             )?;
@@ -501,14 +584,24 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         err: &anyhow::Error,
     ) -> Result<()> {
         let retry_delay = self.opts.scan_interval.max(Duration::from_secs(1));
-        let retry_at = SystemTime::now() + retry_delay;
+        let now = self.clock.now();
+        let mut retry_at = now + retry_delay;
+        if !self
+            .store
+            .has_matching_generation(self.scanner.policy_hash())?
+        {
+            if let Some(forced_at) = self.store.last_forced_scan_at()? {
+                retry_at = retry_at.max(
+                    forced_at
+                        .checked_add(FORCED_SCAN_MIN_INTERVAL)
+                        .unwrap_or(forced_at),
+                );
+            }
+        }
         schedule.next_scan_at = retry_at;
         schedule.next_clean_at = schedule.next_clean_at.max(retry_at);
-        self.store.record_scheduler_status(
-            SystemTime::now(),
-            schedule.next_clean_at,
-            schedule.next_scan_at,
-        )?;
+        self.store
+            .record_scheduler_status(now, schedule.next_clean_at, schedule.next_scan_at)?;
         if let Some(logger) = &self.logger {
             logger.error(format!("scan cycle failed; retry scheduled: {err}"));
         }
@@ -519,7 +612,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         if let Some(mut status) = self.store.scheduler_status()? {
             let next_scan_at = clamp_next_scan_at(
                 status.next_scan_at,
-                SystemTime::now(),
+                self.clock.now(),
                 self.opts.scan_interval,
             );
             if next_scan_at != status.next_scan_at {
@@ -533,7 +626,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             return Ok(status);
         }
 
-        let now = SystemTime::now();
+        let now = self.clock.now();
         let next_clean_at = self
             .store
             .last_run()
@@ -553,6 +646,18 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         )?;
         Ok(status)
     }
+}
+
+fn activity_signals(active: &BTreeSet<PathBuf>) -> Vec<ActivitySignal> {
+    active
+        .iter()
+        .cloned()
+        .map(|project_path| ActivitySignal {
+            pid: 0,
+            project_path,
+            reason: "bounded activity sample".to_string(),
+        })
+        .collect()
 }
 
 fn generation_reconciliation(
@@ -610,18 +715,6 @@ pub fn clamp_next_scan_at(
     interval: Duration,
 ) -> SystemTime {
     persisted.min(now + interval)
-}
-
-fn wait_until_or_shutdown(deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
-    loop {
-        if shutdown.is_requested() {
-            return true;
-        }
-        let Some(wait_for) = wall_clock_wait_chunk(deadline, SystemTime::now()) else {
-            return false;
-        };
-        thread::sleep(wait_for);
-    }
 }
 
 fn wall_clock_wait_chunk(deadline: SystemTime, now: SystemTime) -> Option<Duration> {

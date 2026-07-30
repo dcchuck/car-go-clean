@@ -14,7 +14,7 @@ use car_go_clean::activity::{
 use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::{CleanOutcome, Cleaner, CommandRunner};
 use car_go_clean::config;
-use car_go_clean::daemon::{clamp_next_scan_at, Daemon, DaemonOptions, ShutdownFlag};
+use car_go_clean::daemon::{clamp_next_scan_at, Clock, Daemon, DaemonOptions, ShutdownFlag};
 use car_go_clean::identity::{
     BootSessionId, FilesystemIdentity, IdentityProvider, SystemIdentityProvider,
 };
@@ -1104,6 +1104,113 @@ struct ActiveOnSecondInspector {
     project: PathBuf,
 }
 
+struct FixedClock {
+    now: SystemTime,
+}
+
+impl Clock for FixedClock {
+    fn now(&self) -> SystemTime {
+        self.now
+    }
+
+    fn wait_until_or_shutdown(&self, deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
+        if deadline <= self.now {
+            false
+        } else {
+            shutdown.request();
+            true
+        }
+    }
+}
+
+struct AdvancingClock {
+    initial: SystemTime,
+    step: Duration,
+    calls: AtomicUsize,
+}
+
+type ScheduledClockHook = (usize, Box<dyn Fn() + Send + Sync>);
+
+struct HookClock {
+    now: Mutex<SystemTime>,
+    calls: AtomicUsize,
+    hook: Mutex<Option<ScheduledClockHook>>,
+}
+
+impl HookClock {
+    fn new(now: SystemTime) -> Self {
+        Self {
+            now: Mutex::new(now),
+            calls: AtomicUsize::new(0),
+            hook: Mutex::new(None),
+        }
+    }
+
+    fn set_now(&self, now: SystemTime) {
+        *self.now.lock().unwrap() = now;
+    }
+
+    fn on_second_next_call(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let call = self.calls.load(Ordering::SeqCst) + 2;
+        *self.hook.lock().unwrap() = Some((call, Box::new(hook)));
+    }
+}
+
+impl Clock for HookClock {
+    fn now(&self) -> SystemTime {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let hook = {
+            let mut hook = self.hook.lock().unwrap();
+            if hook
+                .as_ref()
+                .is_some_and(|(hook_call, _)| *hook_call == call)
+            {
+                hook.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+        *self.now.lock().unwrap()
+    }
+
+    fn wait_until_or_shutdown(&self, deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
+        if deadline <= self.now() {
+            false
+        } else {
+            shutdown.request();
+            true
+        }
+    }
+}
+
+impl AdvancingClock {
+    fn by(step: Duration) -> Self {
+        Self {
+            initial: SystemTime::now(),
+            step,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Clock for AdvancingClock {
+    fn now(&self) -> SystemTime {
+        self.initial + self.step * self.calls.fetch_add(1, Ordering::SeqCst) as u32
+    }
+
+    fn wait_until_or_shutdown(&self, deadline: SystemTime, shutdown: &ShutdownFlag) -> bool {
+        if deadline <= self.now() {
+            false
+        } else {
+            shutdown.request();
+            true
+        }
+    }
+}
+
 struct SwitchableIdentityProvider {
     boot_phase: AtomicUsize,
     target_revision: AtomicUsize,
@@ -1852,7 +1959,8 @@ fn target_identity_replacement_after_review_is_revalidated_before_cargo() {
             target_quiet_period: Duration::ZERO,
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
     daemon.scan_cycle().unwrap();
 
     let project_for_mutation = project.clone();
@@ -1913,7 +2021,8 @@ fn project_identity_replacement_after_review_is_revalidated_before_cargo() {
             target_quiet_period: Duration::ZERO,
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
     daemon.scan_cycle().unwrap();
 
     let project_for_mutation = project.clone();
@@ -1980,7 +2089,8 @@ fn target_symlink_swap_after_review_is_rejected_before_cargo() {
             target_quiet_period: Duration::ZERO,
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
     daemon.scan_cycle().unwrap();
 
     let project_for_mutation = project.clone();
@@ -2055,7 +2165,8 @@ fn cross_device_target_change_after_review_is_rejected_before_cargo() {
             target_quiet_period: Duration::ZERO,
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
     daemon.scan_cycle().unwrap();
 
     let identity_for_mutation = identity.clone();
@@ -2107,7 +2218,8 @@ fn activity_that_appears_after_review_blocks_cargo() {
             target_quiet_period: Duration::ZERO,
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(Arc::new(AdvancingClock::by(Duration::from_secs(31))));
     daemon.scan_cycle().unwrap();
 
     let inspector = ActiveOnSecondInspector {
@@ -2134,6 +2246,63 @@ fn activity_that_appears_after_review_blocks_cargo() {
 }
 
 #[test]
+fn activity_refresh_reuses_one_enumeration_for_multiple_targets_within_thirty_seconds() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    for project in [&first, &second] {
+        write_file(&project.join("Cargo.toml"), b"[package]\n");
+        write_file(&project.join("target/original.bin"), &[0; 2048]);
+    }
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let now = SystemTime::now();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    daemon.scan_cycle().unwrap();
+    let inspector = MutatingProcessInspector {
+        calls: AtomicUsize::new(0),
+        mutate_on_call: usize::MAX,
+        mutation: Box::new(|| {}),
+    };
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 2);
+    assert_eq!(inspector.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn recent_write_after_review_blocks_cargo() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("proj");
@@ -2147,6 +2316,7 @@ fn recent_write_after_review_blocks_cargo() {
         delete_target: true,
         ..FakeRunner::default()
     };
+    let clock = Arc::new(HookClock::new(SystemTime::now()));
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
@@ -2160,12 +2330,14 @@ fn recent_write_after_review_blocks_cargo() {
             target_quiet_period: Duration::from_millis(50),
             ..DaemonOptions::default()
         },
-    );
+    )
+    .with_clock(clock.clone());
     daemon.scan_cycle().unwrap();
     thread::sleep(Duration::from_millis(75));
 
     let project_for_mutation = project.clone();
-    let inspector = MutatingProcessInspector::on_second_call(move || {
+    clock.set_now(SystemTime::now());
+    clock.on_second_next_call(move || {
         write_file(&project_for_mutation.join("target/new-write.bin"), &[0; 16]);
     });
     let result = daemon
@@ -2176,7 +2348,7 @@ fn recent_write_after_review_blocks_cargo() {
                 include_active: false,
                 force: false,
             },
-            &inspector,
+            &NoopProcessInspector,
         )
         .unwrap();
 
@@ -4893,6 +5065,234 @@ fn daemon_clamps_only_legacy_scan_deadlines_beyond_the_current_interval() {
     assert_eq!(
         clamp_next_scan_at(earlier_deadline, now, interval),
         earlier_deadline
+    );
+}
+
+#[test]
+fn forced_scan_overrides_a_distant_deadline_and_records_the_attempt() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50_000);
+    store
+        .record_scheduler_status(
+            now,
+            now + Duration::from_secs(60 * 60),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+    let scanner = authoritative_scanner(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    let shutdown = ShutdownFlag::new();
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+
+    assert_eq!(store.all_projects().unwrap().len(), 1);
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(now));
+}
+
+#[test]
+fn forced_scan_restart_inside_five_minutes_does_not_scan_again() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50_000);
+    let last_attempt = now - Duration::from_secs(60);
+    store
+        .record_scheduler_status(
+            now,
+            now + Duration::from_secs(60 * 60),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+    store.record_forced_scan_at(last_attempt).unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_project_upsert
+            BEFORE INSERT ON projects
+            BEGIN
+                SELECT RAISE(FAIL, 'unexpected forced scan');
+            END;
+            ",
+        )
+        .unwrap();
+    let scanner = authoritative_scanner(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    let shutdown = ShutdownFlag::new();
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+
+    assert!(store
+        .errors_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(last_attempt));
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        last_attempt + Duration::from_secs(5 * 60)
+    );
+}
+
+#[test]
+fn forced_scan_clock_rollback_does_not_bypass_the_persisted_guard() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50_000);
+    let future_attempt = now + Duration::from_secs(60);
+    store
+        .record_scheduler_status(
+            now,
+            now + Duration::from_secs(60 * 60),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+    store.record_forced_scan_at(future_attempt).unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_project_upsert_after_rollback
+            BEFORE INSERT ON projects
+            BEGIN
+                SELECT RAISE(FAIL, 'clock rollback bypassed the guard');
+            END;
+            ",
+        )
+        .unwrap();
+    let scanner = authoritative_scanner(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    let shutdown = ShutdownFlag::new();
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+
+    assert!(store
+        .errors_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(future_attempt));
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        future_attempt + Duration::from_secs(5 * 60)
+    );
+}
+
+#[test]
+fn forced_scan_rate_limit_keeps_missing_generation_cleanup_incomplete() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+    write_file(&project.join("target/blob.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50_000);
+    let last_attempt = now - Duration::from_secs(60);
+    store
+        .record_scheduler_status(
+            now,
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+    store.record_forced_scan_at(last_attempt).unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let scanner = authoritative_scanner(ScannerOptions {
+        roots: vec![root.path().to_path_buf()],
+        project_dirs: vec![],
+        excludes: vec![],
+    });
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        scanner,
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            clean_interval: Duration::from_secs(60 * 60),
+            scan_interval: Duration::from_secs(60 * 60),
+            target_quiet_period: Duration::ZERO,
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    let shutdown = ShutdownFlag::new();
+
+    daemon.run_until_shutdown(&shutdown).unwrap();
+
+    assert_eq!(store.last_run().unwrap().projects_cleaned, 0);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/blob.bin").exists());
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        last_attempt + Duration::from_secs(5 * 60)
     );
 }
 

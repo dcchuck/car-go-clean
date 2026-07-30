@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -6,7 +7,10 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use sysinfo::System;
+
+pub const ACTIVITY_MAX_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivitySignal {
@@ -17,6 +21,43 @@ pub struct ActivitySignal {
 
 pub trait ProcessInspector {
     fn active_projects(&self, projects: &[PathBuf]) -> Result<Vec<ActivitySignal>>;
+}
+
+pub struct ActivitySampler<'a, I: ProcessInspector + ?Sized> {
+    inspector: &'a I,
+    sampled_at: Option<SystemTime>,
+    active: BTreeSet<PathBuf>,
+}
+
+impl<'a, I: ProcessInspector + ?Sized> ActivitySampler<'a, I> {
+    pub fn new(inspector: &'a I) -> Self {
+        Self {
+            inspector,
+            sampled_at: None,
+            active: BTreeSet::new(),
+        }
+    }
+
+    pub fn active_projects_at(
+        &mut self,
+        projects: &[PathBuf],
+        now: SystemTime,
+    ) -> Result<&BTreeSet<PathBuf>> {
+        let refresh = self.sampled_at.is_none_or(|sampled_at| {
+            now.duration_since(sampled_at)
+                .is_ok_and(|age| age > ACTIVITY_MAX_AGE)
+        });
+        if refresh {
+            self.active = self
+                .inspector
+                .active_projects(projects)?
+                .into_iter()
+                .map(|signal| signal.project_path)
+                .collect();
+            self.sampled_at = Some(now);
+        }
+        Ok(&self.active)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

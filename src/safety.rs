@@ -1,4 +1,4 @@
-use crate::activity::{path_is_within, ActivitySignal, ProcessInspector};
+use crate::activity::{path_is_within, ActivitySignal};
 use crate::identity::{
     compare_persisted, BootSessionId, FilesystemIdentity, IdentityComparison, IdentityProvider,
     ReviewedIdentity, SystemIdentityProvider,
@@ -456,7 +456,7 @@ pub fn revalidate_before_clean(
     review: &ProjectReview,
     policy: &ScopePolicy,
     identity_provider: &dyn IdentityProvider,
-    activity: &dyn ProcessInspector,
+    activity: &[ActivitySignal],
     scan_error_paths: &[PathBuf],
     discovery_blocked_paths: &[PathBuf],
     now: SystemTime,
@@ -475,12 +475,11 @@ pub fn revalidate_before_clean(
         return Ok(CleanDecision::Skipped(reason));
     }
 
-    let activity = activity.active_projects(std::slice::from_ref(&review.path))?;
     let refreshed = review_project_with_identity_provider(
         &review.path,
         scan_error_paths,
         discovery_blocked_paths,
-        &activity,
+        activity,
         now,
         opts,
         identity_provider,

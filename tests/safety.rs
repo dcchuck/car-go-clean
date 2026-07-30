@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use car_go_clean::activity::{
-    activity_signals_for_process, path_is_within, process_matches_project, ActivitySignal,
+    activity_signals_for_process, path_is_within, process_matches_project, ActivitySampler,
+    ActivitySignal, ProcessInspector,
 };
 use car_go_clean::safety::{
     classify_project, review_project, review_project_with_discovery_blocks, review_summary,
@@ -22,6 +24,84 @@ fn options() -> SafetyOptions {
         include_active: false,
         force: false,
     }
+}
+
+struct CountingInspector {
+    enumerations: AtomicUsize,
+    first_active: PathBuf,
+    second_active: PathBuf,
+}
+
+impl CountingInspector {
+    fn enumerations(&self) -> usize {
+        self.enumerations.load(Ordering::SeqCst)
+    }
+}
+
+impl ProcessInspector for CountingInspector {
+    fn active_projects(&self, _projects: &[PathBuf]) -> anyhow::Result<Vec<ActivitySignal>> {
+        let enumeration = self.enumerations.fetch_add(1, Ordering::SeqCst);
+        let project_path = if enumeration == 0 {
+            self.first_active.clone()
+        } else {
+            self.second_active.clone()
+        };
+        Ok(vec![ActivitySignal {
+            pid: 42,
+            project_path,
+            reason: "controlled activity sample".to_string(),
+        }])
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeClock {
+    now: SystemTime,
+}
+
+impl FakeClock {
+    fn advance(&mut self, duration: Duration) {
+        self.now += duration;
+    }
+}
+
+#[test]
+fn activity_refresh_reuses_snapshot_until_max_age_then_refreshes() {
+    let first = PathBuf::from("/workspace/first");
+    let second = PathBuf::from("/workspace/second");
+    let projects = vec![first.clone(), second.clone()];
+    let inspector = CountingInspector {
+        enumerations: AtomicUsize::new(0),
+        first_active: first.clone(),
+        second_active: second.clone(),
+    };
+    let mut clock = FakeClock {
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+    };
+    let mut sampler = ActivitySampler::new(&inspector);
+
+    let initial = sampler
+        .active_projects_at(&projects, clock.now)
+        .unwrap()
+        .clone();
+    assert_eq!(initial, [first.clone()].into_iter().collect());
+    assert_eq!(inspector.enumerations(), 1);
+
+    clock.advance(Duration::from_secs(30));
+    let at_boundary = sampler
+        .active_projects_at(&projects, clock.now)
+        .unwrap()
+        .clone();
+    assert_eq!(at_boundary, [first].into_iter().collect());
+    assert_eq!(inspector.enumerations(), 1);
+
+    clock.advance(Duration::from_secs(1));
+    let refreshed = sampler
+        .active_projects_at(&projects, clock.now)
+        .unwrap()
+        .clone();
+    assert_eq!(refreshed, [second].into_iter().collect());
+    assert_eq!(inspector.enumerations(), 2);
 }
 
 #[test]
