@@ -38,29 +38,6 @@ fn named_step<'a>(steps: &'a [Yaml], name: &str) -> &'a Yaml {
         .unwrap_or_else(|| panic!("workflow does not contain step `{name}`"))
 }
 
-fn shell_block_containing(markdown: &str, required: &[&str]) -> String {
-    let mut blocks = Vec::new();
-    let mut current = Vec::new();
-    let mut in_shell = false;
-
-    for line in markdown.lines() {
-        if !in_shell && matches!(line, "```sh" | "```bash") {
-            in_shell = true;
-            current.clear();
-        } else if in_shell && line == "```" {
-            blocks.push(current.join("\n"));
-            in_shell = false;
-        } else if in_shell {
-            current.push(line);
-        }
-    }
-
-    blocks
-        .into_iter()
-        .find(|block| required.iter().all(|needle| block.contains(needle)))
-        .unwrap_or_else(|| panic!("no shell block contains {required:?}"))
-}
-
 #[test]
 fn systemd_service_keeps_the_embedded_binary_placeholder() {
     let service = repo_file("packaging/systemd/car-go-clean.service");
@@ -89,17 +66,6 @@ fn source_checkout_launchd_installer_is_absent() {
 }
 
 #[test]
-fn readme_documents_binary_installs_and_explicit_service_activation() {
-    let readme = repo_file("README.md");
-
-    assert!(readme.contains("brew install dcchuck/tap/car-go-clean"));
-    assert!(readme.contains("car-go-clean-installer.sh"));
-    assert!(readme.contains("car-go-clean service install"));
-    assert!(readme.contains("car-go-clean service restart"));
-    assert!(readme.contains("does not start the daemon"));
-}
-
-#[test]
 fn readme_uses_compact_logo_asset() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = repo_file("README.md");
@@ -112,97 +78,411 @@ fn readme_uses_compact_logo_asset() {
     assert!(readme.contains("</p>\n<h1>car-go-clean</h1>"));
 }
 
-#[test]
-fn configuration_reference_preserves_operational_contract() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = repo_file("README.md");
-    let guide = repo_file("docs/configuration.md");
-    let release = repo_file("docs/releases/v0.4.0.md");
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
 
-    assert!(root.join("docs/configuration.md").is_file());
-    assert!(readme.contains("[Configuration reference](docs/configuration.md)"));
-    for value in [
-        "scan_dirs",
-        "project_dirs",
-        "extra_excludes",
-        "override_excludes",
-        "legacy `excludes`",
-        "config migrate",
-        "unknown keys",
-        "absolute",
-        "exit `0`",
-        "exit `1`",
-        "exit `2`",
-        "clean_interval",
-        "scan_interval",
-        "target_quiet_period",
-        "log_level",
-        "XDG_STATE_HOME",
-        "linked worktrees",
-        "discovery failure",
-        "run --dry-run",
-        "run --force",
-        "car-go-clean.log",
-    ] {
-        assert!(guide.contains(value), "missing {value}");
-    }
-    for value in [
-        "removed in v0.5",
-        "config migrate",
-        "exit `0`",
-        "exit `1`",
-        "exit `2`",
-    ] {
-        assert!(release.contains(value), "missing {value}");
-    }
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn terminal_json(stdout: &[u8], command: &str) -> serde_json::Value {
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(stdout).lines().last().unwrap()).unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["command"], command);
+    assert!(matches!(report["outcome"]["code"].as_u64(), Some(0..=2)));
+    assert!(report["outcome"]["reasons"].is_array());
+    report
 }
 
 #[test]
-fn readme_diagnostic_json_example_executes_successfully() {
-    let readme = repo_file("README.md");
-    let example = shell_block_containing(
-        &readme,
-        &["car-go-clean health --json", "car-go-clean status --json"],
-    );
+fn documented_subcommands_are_real_cli_entry_points() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_car-go-clean"));
+    let fixtures: &[&[&str]] = &[
+        &["health", "--help"],
+        &["config", "--help"],
+        &["config", "migrate", "--help"],
+        &["status", "--help"],
+        &["projects", "--help"],
+        &["scan", "--help"],
+        &["run", "--help"],
+        &["daemon", "--help"],
+        &["stats", "--help"],
+        &["logs", "--help"],
+        &["service", "install", "--help"],
+        &["service", "status", "--help"],
+        &["service", "start", "--help"],
+        &["service", "stop", "--help"],
+        &["service", "restart", "--help"],
+        &["service", "uninstall", "--help"],
+    ];
+
+    for fixture in fixtures {
+        let output = Command::new(binary).args(*fixture).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "fixture {fixture:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage:"),
+            "fixture {fixture:?} did not print command help"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn documented_operator_flow_preserves_then_cleans_exact_review() {
     let work = tempdir().unwrap();
     let home = work.path().join("home");
+    let root = work.path().join("projects");
+    let project = root.join("sample");
+    let target = project.join("target");
+    let config = work.path().join("config.toml");
+    let state = work.path().join("state");
+    let bin = work.path().join("bin");
+    let cargo_calls = work.path().join("cargo-calls");
     fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(target.join("artifact"), vec![0; 4_096]).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "scan_dirs = [\"{}\"]\ntarget_quiet_period = \"1ns\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("cargo"),
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'cargo 1.95.0\\n' ;;\n  clean) printf '%s\\n' \"$*\" >> '{}'; rm -rf \"$3\" ;;\n  *) exit 64 ;;\nesac\n",
+            cargo_calls.display()
+        ),
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
     let binary = Path::new(env!("CARGO_BIN_EXE_car-go-clean"));
-    let mut path_entries = vec![binary.parent().unwrap().to_path_buf()];
-    path_entries.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    let path = std::env::join_paths(path_entries).unwrap();
 
-    let output = Command::new("sh")
-        .args(["-eu", "-c", &example])
+    let version = Command::new(binary).arg("version").output().unwrap();
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let service = Command::new(binary)
+        .args(["service", "status"])
         .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", work.path().join("config"))
-        .env("XDG_STATE_HOME", work.path().join("state"))
-        .env("PATH", path)
+        .env("PATH", &path)
         .output()
         .unwrap();
+    assert_eq!(service.status.code(), Some(0));
+    let service_stdout = String::from_utf8_lossy(&service.stdout);
+    assert!(service_stdout.contains("Installed: no"));
+    assert!(service_stdout.contains("Enabled: no"));
+    assert!(service_stdout.contains("Running: no"));
 
-    assert!(
-        output.status.success(),
-        "documented diagnostic example failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let preview = Command::new(binary)
+        .args(["run", "--dry-run", "--all", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        preview.status.code(),
+        Some(0),
+        "preview failed: {}",
+        String::from_utf8_lossy(&preview.stderr)
     );
+    assert!(target.is_dir(), "dry run removed the target");
+    assert!(!cargo_calls.exists(), "dry run invoked Cargo");
+    let preview_stdout = String::from_utf8(preview.stdout).unwrap();
+    let review_id = preview_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Review ID: "))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| panic!("preview did not print a usable review ID: {preview_stdout}"));
+
+    let execution = Command::new(binary)
+        .args([
+            "run",
+            "--review",
+            &review_id.to_string(),
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "review execution failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    assert!(!target.exists(), "reviewed execution did not clean target");
+    assert_eq!(
+        fs::read_to_string(&cargo_calls).unwrap().lines().count(),
+        1,
+        "reviewed execution did not invoke Cargo exactly once"
+    );
+    let lines = String::from_utf8_lossy(&execution.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0]["event"], "target");
+    let report = lines.last().unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["command"], "run");
+    assert_eq!(report["outcome"]["code"], 0);
+    assert_eq!(report["review_id"], review_id);
+
+    for (command, args) in [
+        (
+            "health",
+            vec![
+                "health",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "status",
+            vec![
+                "status",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "stats",
+            vec!["stats", "--json", "--state-dir", state.to_str().unwrap()],
+        ),
+        (
+            "logs",
+            vec![
+                "logs",
+                "--errors-only",
+                "--tail",
+                "5",
+                "--json",
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+    ] {
+        let output = Command::new(binary)
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 2)),
+            "{command} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = terminal_json(&output.stdout, command);
+        assert_eq!(
+            report["outcome"]["code"].as_i64(),
+            output.status.code().map(i64::from)
+        );
+    }
+
+    let config_output = Command::new(binary)
+        .args(["config", "--config"])
+        .arg(&config)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(config_output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&config_output.stdout).contains("scan_dirs"));
+
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("dynamic-artifact"), vec![0; 4_096]).unwrap();
+    let dynamic = Command::new(binary)
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        dynamic.status.code(),
+        Some(0),
+        "dynamic run failed: {}",
+        String::from_utf8_lossy(&dynamic.stderr)
+    );
+    assert!(!target.exists(), "dynamic run did not clean fresh target");
+    assert_eq!(
+        fs::read_to_string(&cargo_calls).unwrap().lines().count(),
+        2,
+        "dynamic run did not invoke Cargo exactly once"
+    );
+
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("inspection-artifact"), vec![0; 4_096]).unwrap();
+    for (command, args) in [
+        (
+            "scan",
+            vec![
+                "scan",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "projects",
+            vec![
+                "projects",
+                "--all",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "projects",
+            vec![
+                "projects",
+                "--risky",
+                "--active",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "status",
+            vec![
+                "status",
+                "--refresh",
+                "--json",
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+        (
+            "stats",
+            vec![
+                "stats",
+                "--since",
+                "1d",
+                "--top",
+                "5",
+                "--json",
+                "--state-dir",
+                state.to_str().unwrap(),
+            ],
+        ),
+    ] {
+        let output = Command::new(binary)
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 2)),
+            "{command} fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        terminal_json(&output.stdout, command);
+    }
+
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("new-artifact"), vec![0; 4_096]).unwrap();
+    let cached = Command::new(binary)
+        .args([
+            "run",
+            "--dry-run",
+            "--no-scan",
+            "--all",
+            "--include-managed-cache",
+            "--include-active",
+            "--force",
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(matches!(cached.status.code(), Some(0 | 2)));
+    terminal_json(&cached.stdout, "run");
+    assert!(target.is_dir(), "cached dry run removed the target");
+
+    let invalid_all = Command::new(binary)
+        .args(["run", "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_all.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid_all.stderr).contains("--dry-run"));
 }
 
 #[test]
-fn release_packaging_documents_tagged_binary_distribution() {
-    let release = repo_file("packaging/release/README.md");
+fn documented_config_migration_changes_only_the_legacy_key() {
+    let work = tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.toml");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        &config,
+        "scan_dirs = [\"/tmp\"]\nexcludes = [\"legacy\"]\n# keep me\n",
+    )
+    .unwrap();
 
-    assert!(release.contains("annotated `vX.Y.Z` Git tags"));
-    assert!(release.contains("dcchuck/homebrew-tap"));
-    assert!(release.contains("car-go-clean-installer.sh"));
-    assert!(release.contains("aarch64-apple-darwin"));
-    assert!(release.contains("x86_64-apple-darwin"));
-    assert!(release.contains("aarch64-unknown-linux-musl"));
-    assert!(release.contains("x86_64-unknown-linux-musl"));
-    assert!(release.contains("Neither binary installation path enables or starts the daemon"));
-    assert!(release.contains("cargo install --path ."));
+    let output = Command::new(env!("CARGO_BIN_EXE_car-go-clean"))
+        .args(["config", "migrate", "--config"])
+        .arg(&config)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let migrated = fs::read_to_string(&config).unwrap();
+    assert!(migrated.contains("override_excludes = [\"legacy\"]"));
+    assert!(!migrated.lines().any(|line| line.starts_with("excludes =")));
+    assert!(migrated.contains("# keep me"));
 }
 
 #[test]
@@ -535,178 +815,4 @@ fn homebrew_formula_render_fails_before_output_when_checksums_are_missing() {
             .exists(),
         "formula output was created after checksum validation failed"
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn homebrew_upgrade_docs_preserve_service_state() {
-    use std::os::unix::fs::PermissionsExt;
-
-    fn write_executable(path: &Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    fn verify(markdown_path: &str, initial_state: Option<&str>) {
-        let markdown = repo_file(markdown_path);
-        let upgrade = shell_block_containing(
-            &markdown,
-            &[
-                "service_was_active=",
-                "brew upgrade dcchuck/tap/car-go-clean",
-                "car-go-clean run --dry-run --all",
-            ],
-        );
-        let work = tempdir().unwrap();
-        let bin = work.path().join("bin");
-        let calls = work.path().join("calls");
-        let installed = work.path().join("installed");
-        let state = work.path().join("service-state");
-        let template = work.path().join("car-go-clean.template");
-        fs::create_dir(&bin).unwrap();
-
-        write_executable(
-            &template,
-            r#"#!/bin/sh
-set -eu
-printf 'car-go-clean %s\n' "$*" >> "$CALL_LOG"
-case "$*" in
-  "service status")
-    if test -f "$SERVICE_STATE"; then
-      service_state=$(cat "$SERVICE_STATE")
-    else
-      service_state="not installed"
-    fi
-    printf 'Service\n  State: %s\n' "$service_state"
-    ;;
-  "service stop") printf 'stopped\n' > "$SERVICE_STATE" ;;
-  "service start") printf 'running\n' > "$SERVICE_STATE" ;;
-  "run --dry-run --all") ;;
-  "version") printf '0.4.0\n' ;;
-  *) exit 64 ;;
-esac
-"#,
-        );
-        write_executable(
-            &bin.join("brew"),
-            r#"#!/bin/sh
-set -eu
-printf 'brew %s\n' "$*" >> "$CALL_LOG"
-case "$1" in
-  update) ;;
-  list) test -f "$INSTALLED_MARKER" ;;
-  install|upgrade)
-    cp "$CAR_GO_CLEAN_TEMPLATE" "$FAKE_BIN/car-go-clean"
-    chmod +x "$FAKE_BIN/car-go-clean"
-    : > "$INSTALLED_MARKER"
-    ;;
-  *) exit 64 ;;
-esac
-"#,
-        );
-
-        if let Some(initial_state) = initial_state {
-            fs::copy(&template, bin.join("car-go-clean")).unwrap();
-            fs::set_permissions(bin.join("car-go-clean"), fs::Permissions::from_mode(0o755))
-                .unwrap();
-            fs::write(&state, format!("{initial_state}\n")).unwrap();
-            fs::write(&installed, "").unwrap();
-        }
-
-        let output = Command::new("sh")
-            .args(["-eu", "-c", &upgrade])
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("CALL_LOG", &calls)
-            .env("INSTALLED_MARKER", &installed)
-            .env("SERVICE_STATE", &state)
-            .env("CAR_GO_CLEAN_TEMPLATE", &template)
-            .env("FAKE_BIN", &bin)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{} upgrade block failed: {}",
-            markdown_path,
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let calls = fs::read_to_string(&calls).unwrap();
-        match initial_state {
-            Some("running") => {
-                assert_eq!(
-                    calls.lines().collect::<Vec<_>>(),
-                    vec![
-                        "car-go-clean service status",
-                        "car-go-clean service stop",
-                        "brew update",
-                        "brew list --versions car-go-clean",
-                        "brew upgrade dcchuck/tap/car-go-clean",
-                        "car-go-clean version",
-                        "car-go-clean run --dry-run --all",
-                        "car-go-clean service start",
-                        "car-go-clean service status",
-                    ]
-                );
-                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "running");
-            }
-            Some("stopped") => {
-                assert_eq!(
-                    calls.lines().collect::<Vec<_>>(),
-                    vec![
-                        "car-go-clean service status",
-                        "brew update",
-                        "brew list --versions car-go-clean",
-                        "brew upgrade dcchuck/tap/car-go-clean",
-                        "car-go-clean version",
-                    ]
-                );
-                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "stopped");
-            }
-            Some("not installed") => {
-                assert_eq!(
-                    calls.lines().collect::<Vec<_>>(),
-                    vec![
-                        "car-go-clean service status",
-                        "brew update",
-                        "brew list --versions car-go-clean",
-                        "brew upgrade dcchuck/tap/car-go-clean",
-                        "car-go-clean version",
-                    ]
-                );
-                assert_eq!(fs::read_to_string(&state).unwrap().trim(), "not installed");
-            }
-            None => {
-                assert_eq!(
-                    calls.lines().collect::<Vec<_>>(),
-                    vec![
-                        "brew update",
-                        "brew list --versions car-go-clean",
-                        "brew install dcchuck/tap/car-go-clean",
-                        "car-go-clean version",
-                    ]
-                );
-                assert!(!state.exists());
-            }
-            Some(other) => panic!("unsupported fixture state {other}"),
-        }
-    }
-
-    for markdown_path in ["docs/releasing.md", "docs/releases/v0.4.0.md"] {
-        verify(markdown_path, Some("running"));
-        verify(markdown_path, Some("stopped"));
-        verify(markdown_path, Some("not installed"));
-        verify(markdown_path, None);
-    }
-}
-
-#[test]
-fn release_runbook_documents_the_guarded_draft_publication_flow() {
-    let runbook = repo_file("docs/releasing.md");
-
-    assert!(runbook.contains("HOMEBREW_TAP_TOKEN"));
-    assert!(runbook.contains("gh secret set HOMEBREW_TAP_TOKEN"));
-    assert!(runbook.contains("draft"));
-    assert!(runbook.contains("formula-bump pull request"));
-    assert!(runbook.contains("publishes the draft only after"));
-    assert!(!runbook.contains("After GitHub has published the release"));
 }

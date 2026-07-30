@@ -1,12 +1,14 @@
 # Fresh Install Validation
 
-Use a fresh macOS or Linux VM for a released-binary check. The one-shot test
-must begin with an empty state directory and must not run an explicit scan
-first.
+Use a fresh macOS or Linux VM for a released-binary check. Keep the fixture
+under one disposable directory, start with an empty state directory, and do
+not run an explicit scan before the first dry run.
 
 ## Source checkout
 
-From the repository:
+The repository currently tests with Rust 1.95, while release compatibility
+with the declared Rust 1.88 minimum is tracked separately and must be verified
+before publication:
 
 ```sh
 mise exec rust@1.95.0 -- cargo fmt --all -- --check
@@ -14,6 +16,8 @@ mise exec rust@1.95.0 -- cargo clippy --all-targets --locked -- -D warnings
 mise exec rust@1.95.0 -- cargo test --locked
 mise exec rust@1.95.0 -- cargo install --path . --force
 ```
+
+Do not treat the Rust 1.95 pass as proof of Rust 1.88 compatibility.
 
 ## Released binary
 
@@ -30,17 +34,20 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
 ```
 
-Verify that installation alone did not enable the per-user background
-service, then confirm the released version:
+Binary installation must not create or start a service. Confirm the version
+and the three service-state dimensions:
 
 ```sh
 car-go-clean version
 car-go-clean service status
 ```
 
-## Fresh-state one-shot flow
+For a fresh install, status must report `Installed: no`, `Enabled: no`, and
+`Running: no`.
 
-Create and build a small Rust project:
+## Disposable project and preserved dry run
+
+Create and build one small Rust project:
 
 ```sh
 validation_root="$HOME/car-go-clean-validation"
@@ -51,52 +58,102 @@ validation_state="$validation_root/state"
 printf 'scan_dirs = ["%s"]\ntarget_quiet_period = "1s"\n' \
   "$validation_root" > "$validation_config"
 sleep 2
+test -d "$validation_root/sample/target"
+test ! -e "$validation_state/state.db"
 ```
 
-Do not run `car-go-clean scan`. Start with the absent
-`$validation_state/state.db` and run:
+Run the first scan and review as one dry run, capture its stable status, and
+extract the persisted review ID:
 
 ```sh
-car-go-clean health \
-  --config "$validation_config" \
-  --state-dir "$validation_state"
-car-go-clean run --dry-run --all \
-  --config "$validation_config" \
-  --state-dir "$validation_state"
+set +e
+preview_output=$(
+  car-go-clean run --dry-run --all \
+    --config "$validation_config" \
+    --state-dir "$validation_state"
+)
+preview_status=$?
+set -e
+printf '%s\n' "$preview_output"
+case "$preview_status" in 0|2) ;; *) exit "$preview_status" ;; esac
+review_id=$(
+  printf '%s\n' "$preview_output" |
+    sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p'
+)
+test -n "$review_id"
 test -d "$validation_root/sample/target"
 ```
 
-The dry run must print `Scan complete`, report the sample as cleanable, and
-leave its target directory intact. After reviewing that output:
+On this controlled fixture, `preview_status` should be `0`. Exit `2` is still
+a structurally valid preview and is accepted above so its incomplete origins
+can be inspected; do not continue unless they are understood. The output must
+name the sample as cleanable, print exactly one review ID, and leave the
+target intact.
+
+## Exact reviewed cleanup and JSON outcome
+
+Execute only the captured plan. JSON cleanup output is NDJSON: target events
+come first and the final line is the format-v1 terminal envelope.
 
 ```sh
+set +e
+car-go-clean run --review "$review_id" --json \
+  --config "$validation_config" \
+  --state-dir "$validation_state" \
+  > "$validation_root/reviewed-run.ndjson"
+review_status=$?
+set -e
+test "$review_status" -eq 0
+test ! -d "$validation_root/sample/target"
+tail -n 1 "$validation_root/reviewed-run.ndjson"
+```
+
+The target event must name only the disposable sample. The terminal envelope
+must have `format_version: 1`, `command: "run"`, the captured `review_id`, and
+`outcome.code: 0`. No target created after the preview may be added, and any
+reviewed target that fails revalidation must be skipped.
+
+Inspect the resulting authority and accounting:
+
+```sh
+car-go-clean status --json \
+  --config "$validation_config" \
+  --state-dir "$validation_state"
+car-go-clean stats --json --state-dir "$validation_state"
+car-go-clean logs --errors-only --json --state-dir "$validation_state"
+```
+
+Each command must end with a format-v1 envelope whose process exit matches
+`outcome.code`. A clean fixture reports no errors and records recovered bytes.
+
+## Dynamic run and explicit discovery
+
+Bare `run` deliberately selects and cleans a fresh dynamic target set. Test it
+only inside this disposable fixture:
+
+```sh
+cargo build --manifest-path "$validation_root/sample/Cargo.toml"
+sleep 2
 car-go-clean run \
   --config "$validation_config" \
   --state-dir "$validation_state"
 test ! -d "$validation_root/sample/target"
-car-go-clean stats --state-dir "$validation_state"
 ```
 
-The real run must print `Scan complete`, clean the sample target, and record
-recovered bytes.
-
-## Explicit discovery and diagnostics
-
-Rebuild the sample, then validate the still-supported explicit discovery and
-inspection commands:
+Rebuild once more to validate the explicit inspection commands:
 
 ```sh
 cargo build --manifest-path "$validation_root/sample/Cargo.toml"
 car-go-clean scan \
   --config "$validation_config" \
   --state-dir "$validation_state"
-car-go-clean status --state-dir "$validation_state"
 car-go-clean projects --all \
   --config "$validation_config" \
   --state-dir "$validation_state"
-car-go-clean logs --errors-only --state-dir "$validation_state"
+car-go-clean status --refresh \
+  --config "$validation_config" \
+  --state-dir "$validation_state"
 ```
 
-`status` must show cached projects and the saved review. `projects --all`
-must explain every decision. `logs --errors-only` may be empty on a clean
-fixture; any entry must name its category and path.
+Historical cache is not authority: `run --no-scan` still requires the matching
+policy and discovery generation and never bypasses any cleanup gate.

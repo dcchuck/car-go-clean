@@ -75,9 +75,16 @@ and active worktree-discovery state are removed while project files and
 historical diagnostics remain.
 
 Discovery exclusions do not authorize cleanup in protected storage. Managed
-package-manager and container storage remains a separate cleanup gate and is
-skipped unless the applicable command explicitly uses
-`--include-managed-cache`.
+package-manager and container storage has two independent gates:
+
+1. The project must be admitted by the configured scan/project scope and must
+   not match the effective discovery exclusions.
+2. The dry run that creates the plan must explicitly use
+   `--include-managed-cache`.
+
+`run --review ID` carries only the managed-storage approval persisted in that
+plan. It has no option that can broaden the plan during execution. Removing a
+default exclusion with `override_excludes` satisfies only the first gate.
 
 Default and platform-specific exclusion roots are speculative: most machines
 do not have every supported package manager, container runtime, or VM manager
@@ -133,8 +140,9 @@ cannot transfer or clear an old failure.
 
 - `run --dry-run` refreshes and saves the review without deleting targets.
 - `run --dry-run --all` lists every cleanable target.
-- `run --include-managed-cache` and `run --include-active` expand the review
-  policy for those named risks.
+- `run --dry-run --include-managed-cache` and
+  `run --dry-run --include-active` expand that persisted review for the named
+  risks.
 - `run --force` bypasses scan-error, activity, and quiet-period gates; it does
   not bypass the direct readable-target requirement or managed-storage
   authorization.
@@ -191,6 +199,37 @@ substantially narrows path-replacement races, but no user-space check can
 eliminate the residual time-of-check/time-of-use window after validation and
 before Cargo opens the project.
 
+## Review plans and execution
+
+The recommended manual flow separates target selection from cleanup:
+
+```sh
+car-go-clean run --dry-run --all
+car-go-clean run --review REVIEW_ID
+```
+
+Every dry run with a valid current discovery generation persists a review
+plan and prints its ID, policy hash, generation, creation time, expiry, and
+candidate bytes. Plans expire after 30 minutes; creation and store open prune
+expired and superseded-generation plans. Creating or loading a plan under the
+current authority also removes policy/generation mismatches, and only the
+newest 20 plans are kept.
+
+A reviewed run requires the exact current policy hash and discovery
+generation. It does not discover or append targets. Each persisted target is
+revalidated for current policy, path, identity, activity, scan errors, quiet
+period, and direct-target safety immediately before Cargo. Targets that became
+unsafe are removed from execution; newly eligible targets are never added.
+
+Bare `car-go-clean run` is intentionally different: it scans, reviews, and
+destructively cleans the fresh dynamic target set in one command. Use it only
+when that changing target set is explicitly acceptable. `--all` controls only
+dry-run display and is rejected without `--dry-run`.
+
+`--no-scan` skips discovery but grants no authority. Historical cache rows are
+diagnostic history, not permission to clean. A current matching generation
+and all normal gates are still required.
+
 ## Outcomes, state, logs, and scheduling
 
 One-shot `scan`, `run`, `status --refresh`, and `projects` commands use this
@@ -202,6 +241,19 @@ outcome taxonomy:
   migrated path-only state used with `run --no-scan`.
 - exit `1`: a failure, including configuration errors, lock or state errors,
   or a nonzero Cargo clean attempt. Exit `1` outranks exit `2` when both occur.
+
+On macOS, privacy/TCC denial of an ordinary home-scan origin is a normal
+example of exit `2`. The report and bounded review plan may still be usable;
+the operator must inspect the incomplete origins and target list. A
+service-status or captured-environment warning is diagnostic and does not
+change the authority outcome.
+
+Machine-readable commands use format version 1. A command that has no stream
+events writes one JSON envelope. Cleanup writes newline-delimited JSON:
+one `target` event before each actual Cargo invocation, followed by the
+terminal envelope. Its `outcome` contains the stable code, kind, and reason
+list; the envelope also carries policy hash, generation, review ID, scan
+errors, and command-specific data.
 
 Every Cargo invocation is audited. Only successful invocations contribute to
 `stats` recovered-byte totals, top projects, successful-clean counts, and
@@ -215,3 +267,26 @@ newline-delimited JSON logs at `car-go-clean.log`. Logs rotate as
 `car-go-clean.log.1`, `car-go-clean.log.2`, and later files. The daemon
 persists the next scan and clean times, resuming that schedule after restart
 instead of waiting for a full interval from process startup.
+
+## Service state and captured roots
+
+Installing or upgrading the binary never installs or starts the daemon.
+`car-go-clean service install` writes the per-user definition, captures the
+supported root environment used by policy construction, enables the
+definition, and starts it. `service status`, `status`, and `health` distinguish
+installed, enabled, and running state and report manager-root divergence when
+it can be determined.
+
+`service stop` disables and stops persistently across login and reboot.
+`service start` re-enables and starts. `service uninstall` removes only the
+definition and leaves configuration, state, logs, reviews, and history in
+place. Re-run `service install` when you intentionally want to recapture the
+current shell's supported roots.
+
+Linux systemd user services may require lingering to run without an active
+login. car-go-clean does not change that account policy. Enable it manually
+only when desired:
+
+```sh
+loginctl enable-linger "$USER"
+```

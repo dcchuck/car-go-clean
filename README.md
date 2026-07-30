@@ -41,46 +41,69 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 Both installation paths install or upgrade only the binary, and the installer does not start the daemon.
 Activate daemon management explicitly after installation.
 
+If upgrading a v0.2.0 or v0.3.0 installation, especially one with an installed
+service, use the state-preserving two-phase
+[v0.4 upgrade helper](docs/releases/v0.4.0.md#v02v03-upgrade-helper) instead
+of replacing the binary directly.
+
 ## Quick Start
 
-Check the installation and preview every eligible cleanup target:
+Check the binary and service state, then create a review:
 
 ```sh
+car-go-clean version
+car-go-clean service status
 car-go-clean health
 car-go-clean run --dry-run --all
 ```
 
-`run` scans automatically before it reviews or cleans. The preview does not
-invoke Cargo, and installation does not start the background service. The
-default quiet period, active-process checks, scan-error checks, managed-storage
-checks, and direct-target checks all remain in effect.
+The dry run scans automatically, applies every safety gate, invokes no Cargo
+command, and prints a numeric `Review ID`. It also records the exact policy
+hash, discovery generation, target list, and filesystem identities that you
+reviewed. Execute that exact plan by replacing `REVIEW_ID` with the printed
+number:
 
-If the service is already active, stop it for the preview and resume it
-afterward:
+```sh
+car-go-clean run --review REVIEW_ID
+car-go-clean stats
+```
+
+Review plans expire after 30 minutes, and only the newest 20 are retained. A
+plan is rejected if its policy or discovery generation changed. Immediately
+before Cargo runs, car-go-clean revalidates every persisted target. That check
+may remove a target that became unsafe; it can never add a target that was not
+in the review. `--all` only expands dry-run display—it cannot be used for a
+destructive run.
+
+Bare `car-go-clean run` remains available, but it is dynamic and destructive:
+it scans and accepts the fresh target set in one operation. Use it only when
+you intentionally accept that behavior. The reviewed two-command flow above
+is the recommended manual path.
+
+If the service is running, stop it before the preview and start it only after
+the reviewed run:
 
 ```sh
 car-go-clean service stop
 car-go-clean run --dry-run --all
+car-go-clean run --review REVIEW_ID
 car-go-clean service start
 ```
 
-`service stop` preserves the installed service definition; `service start`
-resumes it after you approve the preview.
+`service stop` is persistent across login and reboot. `service start`
+re-enables and starts the installed definition.
 
-After reviewing the preview:
-
-```sh
-car-go-clean run
-car-go-clean stats
-```
-
-A real run has no interactive confirmation. For advanced cached-only use,
-`car-go-clean run --no-scan` skips discovery but does not relax any safety
-gate.
+For advanced cached-only inspection, `car-go-clean run --dry-run --no-scan`
+skips discovery. It does not make historical cache rows authoritative and
+never bypasses policy, generation, scope, exclusion, identity, activity,
+quiet-period, or managed-storage checks.
 
 One-shot commands exit `0` for complete coverage, `2` for valid results with
-incomplete discovery coverage, and `1` for failures. A macOS home scan can
-legitimately return `2` when privacy-protected directories cannot be read.
+incomplete discovery coverage, and `1` for failures. A broad macOS home scan
+can legitimately return `2` when privacy-protected directories cannot be
+read. That preview may still contain a valid review ID; inspect its incomplete
+origins before deciding whether its bounded target set is acceptable. Exit
+`1` always outranks `2`.
 
 Inspect the cleanup authority in human-readable or machine-readable form:
 
@@ -89,13 +112,13 @@ car-go-clean health --json || test $? -eq 2
 car-go-clean status --json || test $? -eq 2
 ```
 
-Exit `2` is expected when cleanup authority is incomplete; stdout still
-contains a valid report. Both commands use the format-v1 terminal envelope.
-Authority facts under `data` name the effective config source, canonical scan
-and project roots, policy hash, current discovery generation, protected roots
-and their provenance, incomplete scan origins, and service-environment
-divergence when the installed definition contains enough information to
-compare it with the current shell.
+Exit `2` still writes a valid report. With `--json`, every command ends with a
+format-v1 JSON envelope. A cleanup execution uses NDJSON: each actual target
+is emitted as a `target` event before the terminal envelope. The envelope
+contains `outcome.code`, `outcome.kind`, explicit reasons, policy and
+generation context, scan errors, and command data. Service-state probe or
+environment-divergence warnings are reported, but do not change the cleanup
+authority outcome.
 
 ## Agent Quick Start
 
@@ -117,48 +140,81 @@ Copy this prompt into your coding agent:
 >
 > First inspect this machine's operating system, architecture, available
 > package manager, Cargo availability, existing `car-go-clean` installation,
-> configuration, and service status. Recommend Homebrew or the verified shell
-> installer and briefly explain why.
+> configuration, current service state, how often Rust projects are built,
+> and whether the user wants one-shot cleanup or an always-on per-user daemon.
+> Recommend Homebrew or the verified shell installer, and recommend one-shot
+> or daemon operation based on those answers. Briefly explain each choice.
+> If the existing binary is v0.2.0 or v0.3.0, follow the repository's v0.4
+> state-preserving upgrade-helper instructions; do not replace it with a plain
+> package-manager upgrade.
 >
-> Install or upgrade the binary, verify the installed version, and run:
+> Install or upgrade only the binary, verify the installed version, and run:
 >
 > ```sh
+> car-go-clean version
+> car-go-clean service status
 > car-go-clean health
 > car-go-clean run --dry-run --all
 > ```
 >
-> Explain what would be cleaned, what would be skipped, and why. Then
-> recommend either one-shot usage or the background service based on how this
-> machine is used.
+> Record whether each command exits `0` (complete), `2` (valid but incomplete),
+> or `1` (failed). Treat ordinary macOS privacy/TCC scan denials as incomplete,
+> not success or failure; explain their origins. From the preview, capture the
+> numeric review ID, policy hash, discovery generation, expiry, cleanable
+> targets, skipped targets, and managed-storage decisions. Explain that the
+> plan lasts 30 minutes, is one of at most 20 retained plans, and execution
+> can remove newly unsafe targets but never add new ones.
 >
 > Inspection, installation or upgrade, health checks, and the dry run are
 > authorized by this prompt. Ask before:
 >
-> - Performing actual cleanup.
+> - Executing the exact preview with
+>   `car-go-clean run --review REVIEW_ID`.
 > - Installing or enabling the background service.
 > - Changing configuration or exclusions.
 > - Using `--force`, `--include-active`, or `--include-managed-cache`.
 > - Cloning and building from source.
 >
 > Do not weaken safety checks, manually delete `target/` directories, or work
-> around scan errors or process locks. Report blockers and final results
-> clearly.
+> around scan errors or process locks. Never execute dynamic bare
+> `car-go-clean run` on the user's behalf. If daemon operation is approved,
+> use `car-go-clean service install`, re-check installed/enabled/running state,
+> and explain any environment-recapture warning. Report blockers, exit codes,
+> service state, and final results clearly.
 
 ## Background Service (Optional)
 
 `car-go-clean` uses a per-user launchd service on macOS and a per-user systemd
-service on Linux. Installation does not enable either service. Manage it only
-when you choose to:
+service on Linux. Homebrew and the shell installer only install the binary;
+they do not create, enable, or start a service. Manage it explicitly:
 
 ```sh
 car-go-clean service install
 car-go-clean service status
+car-go-clean service stop
+car-go-clean service start
 car-go-clean service restart
 car-go-clean service uninstall
 ```
 
-After upgrading a binary, run `car-go-clean service restart` if you have
-already installed the service and want the daemon to use the new binary.
+`service install` writes the per-user definition, captures the supported
+manager/root environment used by cleanup policy, enables the definition, and
+starts it. Status reports `Installed`, `Enabled`, and `Running` separately.
+`stop` disables and stops persistently; `start` re-enables and starts.
+`uninstall` removes only the service definition and retains configuration,
+state, logs, and cleanup history.
+
+If the current shell resolves protected roots differently from the captured
+service environment, `status` and `health` warn about the divergence. Re-run
+`car-go-clean service install` to recapture after reviewing the new roots.
+
+On Linux, a systemd user service may stop when the login session ends unless
+login lingering is enabled. car-go-clean never enables it automatically. If
+daemon operation without an active login is desired, opt in manually:
+
+```sh
+loginctl enable-linger "$USER"
+```
 
 ## Configuration
 
@@ -191,12 +247,14 @@ scan_interval = "1d"
 - `override_excludes` is an advanced option that replaces editable discovery
   defaults; protected-storage cleanup gates remain independent.
 - The v0.4 binary still accepts legacy `excludes` with a warning. Run
-  `car-go-clean config migrate` before v0.5.
+  `car-go-clean config migrate` before upgrading to v0.5, where the legacy key
+  is removed.
 - Unknown keys, unset path variables, unterminated `${NAME` expressions, and
   an empty effective scope are configuration errors.
 - Git-reported linked worktrees are discovered conservatively. A discovery
   failure blocks the affected primary/worktree set until a later success.
-- Review before cleanup with `car-go-clean run --dry-run`.
+- Review before cleanup with `car-go-clean run --dry-run --all`, then execute
+  only the printed plan with `car-go-clean run --review REVIEW_ID`.
 
 See the [Configuration reference](docs/configuration.md) for the complete
 safety, worktree, state, log, and scheduler behavior.
@@ -215,7 +273,10 @@ gates:
 - The direct target directory can be read and measured.
 - The newest non-symlink file under `target/` is at least
   `target_quiet_period` old.
-- The project is not under a known managed cache or container storage path.
+- A managed cache or container target must first be admitted into discovery
+  scope by configuration and must also receive explicit plan-time approval
+  with `run --dry-run --include-managed-cache`. A reviewed run carries only
+  that persisted approval; it has no flag that can expand the plan.
 - No recent scan recorded a physically related unreadable ancestor or
   descendant path for the project.
 - No running process has a cwd or command argument inside the project or
@@ -236,7 +297,9 @@ do not make a scan incomplete.
 | --- | --- |
 | `car-go-clean daemon` | Long-running scheduler. |
 | `car-go-clean scan` | Refresh the project cache. |
-| `car-go-clean run` | Scan, then run one cleanup review/cycle now. |
+| `car-go-clean run --dry-run --all` | Scan and persist a complete displayed review without cleaning. |
+| `car-go-clean run --review ID` | Execute only the persisted, still-safe targets in one review. |
+| `car-go-clean run` | Dynamically scan and clean a fresh target set; destructive and intentionally unreviewed. |
 | `car-go-clean health` | Validate config, Cargo availability, and state DB access; add `--json` for authority diagnostics. |
 | `car-go-clean status` | Show authority, cache, review, scheduler, and recovery state; add `--json` for the shared diagnostic shape. |
 | `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |

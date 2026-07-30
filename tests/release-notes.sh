@@ -9,9 +9,18 @@ printf 'generated install body\n' > "$work/generated.md"
 "$repo_root/scripts/compose-release-notes.sh" \
   v0.4.0 "$work/generated.md" "$work/output.md"
 
-first_line=$(sed -n '1p' "$work/output.md")
-test "$first_line" = "# car-go-clean v0.4.0"
-grep -F 'generated install body' "$work/output.md" >/dev/null
+{
+  cat "$repo_root/docs/releases/v0.4.0.md"
+  printf '\n\n---\n\ngenerated install body\n'
+} > "$work/expected.md"
+cmp "$work/expected.md" "$work/output.md"
+
+if "$repo_root/scripts/compose-release-notes.sh" \
+  v9.9.9 "$work/generated.md" "$work/missing-version.md"
+then
+  echo "missing versioned metadata was accepted" >&2
+  exit 1
+fi
 
 for invalid_tag in v0.4 v1..2 v1.2.3x ' v1.2.3' 'v1.2.3
 junk'
