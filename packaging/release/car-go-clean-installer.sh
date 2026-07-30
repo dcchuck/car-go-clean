@@ -135,21 +135,28 @@ download_release_file "$work_dir/$checksum_name" "$base_url/$checksum_name"
 expected_hash=$(awk -v file="$archive_name" '
     {
         count++
+        if (count == 2 && $0 == "") {
+            next
+        }
+        if (count != 1) {
+            invalid = 1
+            exit 1
+        }
         hash = substr($0, 1, 64)
         separator = substr($0, 65, 1)
         marker = substr($0, 66, 1)
         filename = substr($0, 67)
-        if (count != 1 ||
-            length($0) != 66 + length(file) ||
+        if (length($0) != 66 + length(file) ||
             length(hash) != 64 || hash !~ /^[0-9a-f]+$/ ||
             separator != " " || (marker != " " && marker != "*") ||
             filename != file) {
+            invalid = 1
             exit 1
         }
         print hash
     }
     END {
-        if (count != 1) {
+        if (invalid || count < 1 || count > 2) {
             exit 1
         }
     }

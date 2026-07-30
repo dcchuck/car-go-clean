@@ -79,6 +79,7 @@ case "$url" in
         printf '%s' "$url" >> "$CURL_LOG"
         case "${CHECKSUM_FORMAT-binary}" in
             binary) printf '%s *%s\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
+            binary-dist) printf '%s *%s\n\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
             text) printf '%s  %s\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
             wrong-name) printf '%s *%s-wrong\n' "$EXPECTED_HASH" "$archive_name" > "$output" ;;
             uppercase)
@@ -93,6 +94,21 @@ case "$url" in
                     "$EXPECTED_HASH" "$archive_name" \
                     "$EXPECTED_HASH" "$archive_name" \
                     > "$output"
+                ;;
+            leading-blank)
+                printf '\n%s *%s\n' "$EXPECTED_HASH" "$archive_name" > "$output"
+                ;;
+            embedded-blank)
+                printf '%s *%s\n\n%s *%s\n' \
+                    "$EXPECTED_HASH" "$archive_name" \
+                    "$EXPECTED_HASH" "$archive_name" \
+                    > "$output"
+                ;;
+            two-terminal-blanks)
+                printf '%s *%s\n\n\n' "$EXPECTED_HASH" "$archive_name" > "$output"
+                ;;
+            malformed-marker)
+                printf '%s -%s\n' "$EXPECTED_HASH" "$archive_name" > "$output"
                 ;;
             *) exit 64 ;;
         esac
@@ -169,7 +185,23 @@ CHECKSUM_FORMAT=text run_installer \
     --install-dir "$text_checksum_dir"
 cmp "$fixture_dir/car-go-clean" "$text_checksum_dir/car-go-clean"
 
-for hostile_checksum_format in wrong-name uppercase extra-space extra-line
+: > "$curl_log"
+cargo_dist_checksum_dir="$work_dir/cargo-dist-checksum-install"
+CHECKSUM_FORMAT=binary-dist run_installer \
+    --version 0.2.0 \
+    --download-base-url https://artifacts.example.invalid/releases/v0.2.0 \
+    --install-dir "$cargo_dist_checksum_dir"
+cmp "$fixture_dir/car-go-clean" "$cargo_dist_checksum_dir/car-go-clean"
+
+for hostile_checksum_format in \
+    wrong-name \
+    uppercase \
+    extra-space \
+    extra-line \
+    leading-blank \
+    embedded-blank \
+    two-terminal-blanks \
+    malformed-marker
 do
     : > "$curl_log"
     hostile_dir="$work_dir/hostile-$hostile_checksum_format-install"

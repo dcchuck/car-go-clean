@@ -44,19 +44,23 @@ jobs:
           printf 'value=%s\n' "$evidence_key" >> "$GITHUB_OUTPUT"
           printf 'safe_exact_sha=%s\n' "$safe_exact_sha" >> "$GITHUB_OUTPUT"
       - id: checkout
+        name: Checkout exact release commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch main and release tags
+      - id: fetch_refs
+        name: Fetch main and release tags
         run: |
           git fetch --force origin main:refs/remotes/origin/main
           git fetch --force origin 'refs/tags/*:refs/tags/*'
       - id: validate_inputs
         name: Validate exact SHA and version
         run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      - id: rust_toolchain
+        name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.95.0"
       - id: install_dist
@@ -73,8 +77,11 @@ jobs:
       - name: Write validation evidence
         if: ${{ always() }}
         env:
+          EVIDENCE_KEY_OUTCOME: ${{ steps.evidence_key.outcome }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          FETCH_REFS_OUTCOME: ${{ steps.fetch_refs.outcome }}
           VALIDATE_OUTCOME: ${{ steps.validate_inputs.outcome }}
+          RUST_TOOLCHAIN_OUTCOME: ${{ steps.rust_toolchain.outcome }}
           INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
           DIST_PLAN_OUTCOME: ${{ steps.dist_plan.outcome }}
         run: |
@@ -90,8 +97,11 @@ jobs:
             --arg version "${{ inputs.version }}" \
             --arg runner_os "${{ runner.os }}" \
             --arg runner_arch "${{ runner.arch }}" \
+            --arg evidence_key "$EVIDENCE_KEY_OUTCOME" \
             --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg fetch_refs "$FETCH_REFS_OUTCOME" \
             --arg validation "$VALIDATE_OUTCOME" \
+            --arg rust_toolchain "$RUST_TOOLCHAIN_OUTCOME" \
             --arg install_dist "$INSTALL_DIST_OUTCOME" \
             --arg dist_plan "$DIST_PLAN_OUTCOME" \
             --arg cargo_dist_version "$cargo_dist_version" \
@@ -103,8 +113,11 @@ jobs:
               runner: {os: $runner_os, architecture: $runner_arch},
               cargo_dist_version: $cargo_dist_version,
               outcomes: {
+                evidence_key: $evidence_key,
                 checkout: $checkout,
+                fetch_refs: $fetch_refs,
                 validation: $validation,
+                rust_toolchain: $rust_toolchain,
                 install_cargo_dist: $install_dist,
                 dist_plan: $dist_plan
               },
@@ -158,22 +171,28 @@ jobs:
             expected_uname: x86_64
     steps:
       - id: checkout
+        name: Checkout exact build commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch main and release tags
+      - id: fetch_refs
+        name: Fetch main and release tags
         run: |
           git fetch --force origin main:refs/remotes/origin/main
           git fetch --force origin 'refs/tags/*:refs/tags/*'
-      - name: Revalidate exact checkout
+      - id: revalidate_inputs
+        name: Revalidate exact checkout
         run: scripts/validate-release-inputs.sh "${{ inputs.commit_sha }}" "${{ inputs.version }}"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      - id: rust_toolchain
+        name: Install Rust toolchain and target
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
-      - name: Install Linux build dependencies
+      - id: linux_dependencies
+        name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
         run: |
           sudo apt-get update
@@ -234,6 +253,10 @@ jobs:
         if: ${{ always() }}
         env:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          FETCH_REFS_OUTCOME: ${{ steps.fetch_refs.outcome }}
+          REVALIDATE_OUTCOME: ${{ steps.revalidate_inputs.outcome }}
+          RUST_TOOLCHAIN_OUTCOME: ${{ steps.rust_toolchain.outcome }}
+          LINUX_DEPENDENCIES_OUTCOME: ${{ steps.linux_dependencies.outcome }}
           INSTALL_DIST_OUTCOME: ${{ steps.install_dist.outcome }}
           BUILD_OUTCOME: ${{ steps.build_target.outcome }}
           ATTEST_OUTCOME: ${{ steps.attest_archive.outcome }}
@@ -269,6 +292,10 @@ jobs:
             --arg archive_hash "$archive_hash" \
             --arg cargo_dist_version "$cargo_dist_version" \
             --arg checkout "$CHECKOUT_OUTCOME" \
+            --arg fetch_refs "$FETCH_REFS_OUTCOME" \
+            --arg revalidation "$REVALIDATE_OUTCOME" \
+            --arg rust_toolchain "$RUST_TOOLCHAIN_OUTCOME" \
+            --arg linux_dependencies "$LINUX_DEPENDENCIES_OUTCOME" \
             --arg install_dist "$INSTALL_DIST_OUTCOME" \
             --arg build "$BUILD_OUTCOME" \
             --arg attest "$ATTEST_OUTCOME" \
@@ -289,6 +316,10 @@ jobs:
               cargo_dist_version: $cargo_dist_version,
               outcomes: {
                 checkout: $checkout,
+                fetch_refs: $fetch_refs,
+                revalidation: $revalidation,
+                rust_toolchain: $rust_toolchain,
+                linux_dependencies: $linux_dependencies,
                 install_cargo_dist: $install_dist,
                 build: $build,
                 attestation: $attest,

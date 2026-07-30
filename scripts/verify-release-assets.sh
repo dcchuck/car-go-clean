@@ -57,6 +57,13 @@ checksum_for() {
     expected=$(awk -v archive="$archive" '
         {
             count++
+            if (count == 2 && $0 == "") {
+                next
+            }
+            if (count != 1) {
+                invalid = 1
+                exit 1
+            }
             hash = substr($0, 1, 64)
             separator = substr($0, 65, 1)
             marker = substr($0, 66, 1)
@@ -65,14 +72,15 @@ checksum_for() {
                 length(hash) != 64 || hash !~ /^[0-9a-f]+$/ ||
                 separator != " " || (marker != " " && marker != "*") ||
                 filename != archive) {
-                exit 1
-            }
-        }
-        END {
-            if (count != 1) {
+                invalid = 1
                 exit 1
             }
             print hash
+        }
+        END {
+            if (invalid || count < 1 || count > 2) {
+                exit 1
+            }
         }
     ' "$checksum") || {
         echo "expected exactly one valid checksum for $archive" >&2

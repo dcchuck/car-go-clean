@@ -868,43 +868,195 @@ fn rehearse_release_evidence_records_gate_outcomes_and_rejects_unsafe_artifact_n
         assert_eq!(fs::read_to_string(github_output).unwrap(), expected);
     }
 
-    for (name, id) in [
-        ("Validate exact SHA and version", "validate_inputs"),
-        ("Install verified cargo-dist", "install_dist"),
-        ("Plan exact release", "dist_plan"),
-    ] {
+    let validation_evidence = named_step(validate_steps, "Write validation evidence");
+    let validation_contract = [
+        (
+            "Normalize the evidence key",
+            "evidence_key",
+            "EVIDENCE_KEY_OUTCOME",
+            "evidence_key",
+            "evidence_key",
+        ),
+        (
+            "Checkout exact release commit",
+            "checkout",
+            "CHECKOUT_OUTCOME",
+            "checkout",
+            "checkout",
+        ),
+        (
+            "Fetch main and release tags",
+            "fetch_refs",
+            "FETCH_REFS_OUTCOME",
+            "fetch_refs",
+            "fetch_refs",
+        ),
+        (
+            "Validate exact SHA and version",
+            "validate_inputs",
+            "VALIDATE_OUTCOME",
+            "validation",
+            "validation",
+        ),
+        (
+            "Install Rust toolchain",
+            "rust_toolchain",
+            "RUST_TOOLCHAIN_OUTCOME",
+            "rust_toolchain",
+            "rust_toolchain",
+        ),
+        (
+            "Install verified cargo-dist",
+            "install_dist",
+            "INSTALL_DIST_OUTCOME",
+            "install_dist",
+            "install_cargo_dist",
+        ),
+        (
+            "Plan exact release",
+            "dist_plan",
+            "DIST_PLAN_OUTCOME",
+            "dist_plan",
+            "dist_plan",
+        ),
+    ];
+    for (name, id, env_name, jq_arg, json_key) in validation_contract {
         assert_eq!(
             named_step(validate_steps, name)["id"].as_str(),
             Some(id),
             "{name} needs a stable evidence ID"
         );
+        assert_eq!(
+            validation_evidence["env"][env_name].as_str(),
+            Some(format!("${{{{ steps.{id}.outcome }}}}").as_str()),
+            "{name} outcome is not bound into validation evidence"
+        );
+        let evidence_run = run_command(validation_evidence).unwrap();
+        assert!(
+            evidence_run.contains(&format!("--arg {jq_arg} \"${env_name}\"")),
+            "{name} outcome lacks a jq binding"
+        );
+        assert!(
+            evidence_run.contains(&format!("{json_key}: ${jq_arg}")),
+            "{name} outcome lacks a JSON field"
+        );
     }
-    let validation_evidence = named_step(validate_steps, "Write validation evidence");
-    for (name, value) in [
-        ("VALIDATE_OUTCOME", "${{ steps.validate_inputs.outcome }}"),
-        ("INSTALL_DIST_OUTCOME", "${{ steps.install_dist.outcome }}"),
-        ("DIST_PLAN_OUTCOME", "${{ steps.dist_plan.outcome }}"),
-    ] {
-        assert_eq!(validation_evidence["env"][name].as_str(), Some(value));
-    }
+    let recorded_validation_ids = validate_steps
+        .iter()
+        .take_while(|step| step["name"].as_str() != Some("Write validation evidence"))
+        .map(|step| {
+            step["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("validation gate lacks a stable evidence ID"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded_validation_ids,
+        validation_contract.map(|(_, id, _, _, _)| id),
+        "every validation gate before evidence generation must be enumerated"
+    );
 
     let build_steps = workflow_steps(&rehearsal, "build");
-    assert_eq!(
-        named_step(build_steps, "Attest target archive")["id"].as_str(),
-        Some("attest_archive")
-    );
-    assert_eq!(
-        named_step(build_steps, "Upload target archive and manifest")["id"].as_str(),
-        Some("upload_archive")
-    );
     let build_evidence = named_step(build_steps, "Write target build evidence");
+    let build_contract = [
+        (
+            "Checkout exact build commit",
+            "checkout",
+            "CHECKOUT_OUTCOME",
+            "checkout",
+            "checkout",
+        ),
+        (
+            "Fetch main and release tags",
+            "fetch_refs",
+            "FETCH_REFS_OUTCOME",
+            "fetch_refs",
+            "fetch_refs",
+        ),
+        (
+            "Revalidate exact checkout",
+            "revalidate_inputs",
+            "REVALIDATE_OUTCOME",
+            "revalidation",
+            "revalidation",
+        ),
+        (
+            "Install Rust toolchain and target",
+            "rust_toolchain",
+            "RUST_TOOLCHAIN_OUTCOME",
+            "rust_toolchain",
+            "rust_toolchain",
+        ),
+        (
+            "Install Linux build dependencies",
+            "linux_dependencies",
+            "LINUX_DEPENDENCIES_OUTCOME",
+            "linux_dependencies",
+            "linux_dependencies",
+        ),
+        (
+            "Install verified cargo-dist",
+            "install_dist",
+            "INSTALL_DIST_OUTCOME",
+            "install_dist",
+            "install_cargo_dist",
+        ),
+        (
+            "Build and verify target archive",
+            "build_target",
+            "BUILD_OUTCOME",
+            "build",
+            "build",
+        ),
+        (
+            "Attest target archive",
+            "attest_archive",
+            "ATTEST_OUTCOME",
+            "attest",
+            "attestation",
+        ),
+        (
+            "Upload target archive and manifest",
+            "upload_archive",
+            "ARCHIVE_UPLOAD_OUTCOME",
+            "archive_upload",
+            "archive_upload",
+        ),
+    ];
+    for (name, id, env_name, jq_arg, json_key) in build_contract {
+        assert_eq!(
+            named_step(build_steps, name)["id"].as_str(),
+            Some(id),
+            "{name} needs a stable evidence ID"
+        );
+        assert_eq!(
+            build_evidence["env"][env_name].as_str(),
+            Some(format!("${{{{ steps.{id}.outcome }}}}").as_str()),
+            "{name} outcome is not bound into build evidence"
+        );
+        let evidence_run = run_command(build_evidence).unwrap();
+        assert!(
+            evidence_run.contains(&format!("--arg {jq_arg} \"${env_name}\"")),
+            "{name} outcome lacks a jq binding"
+        );
+        assert!(
+            evidence_run.contains(&format!("{json_key}: ${jq_arg}")),
+            "{name} outcome lacks a JSON field"
+        );
+    }
+    let recorded_build_ids = build_steps
+        .iter()
+        .take_while(|step| step["name"].as_str() != Some("Write target build evidence"))
+        .map(|step| {
+            step["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("build gate lacks a stable evidence ID"))
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        build_evidence["env"]["ATTEST_OUTCOME"].as_str(),
-        Some("${{ steps.attest_archive.outcome }}")
-    );
-    assert_eq!(
-        build_evidence["env"]["ARCHIVE_UPLOAD_OUTCOME"].as_str(),
-        Some("${{ steps.upload_archive.outcome }}")
+        recorded_build_ids,
+        build_contract.map(|(_, id, _, _, _)| id),
+        "every build gate before evidence generation must be enumerated"
     );
 
     for (_, job) in rehearsal["jobs"].as_hash().unwrap() {

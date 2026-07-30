@@ -146,8 +146,9 @@ do
     printf 'archive fixture: %s\n' "$archive" > "$artifacts/$archive"
     case "$archive" in
         car-go-clean-aarch64-apple-darwin.tar.xz)
-            # cargo-dist 0.32.0 emits the binary-mode checksum marker.
-            printf '%s *%s\n' "$(hash_file "$artifacts/$archive")" "$archive" \
+            # Preserve cargo-dist 0.32.0's complete emitted bytes: binary
+            # marker followed by its observed single terminal empty record.
+            printf '%s *%s\n\n' "$(hash_file "$artifacts/$archive")" "$archive" \
                 > "$artifacts/$archive.sha256"
             ;;
         *)
@@ -199,6 +200,26 @@ expect_failure "duplicate checksum lines" "$asset_verifier" v0.4.0 "$artifacts"
 cp "$work/good-checksum" "$checksum"
 
 checksum_hash=$(hash_file "$artifacts/car-go-clean-aarch64-apple-darwin.tar.xz")
+printf '\n%s *%s\n' \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with a leading blank record" \
+    "$asset_verifier" v0.4.0 "$artifacts"
+printf '%s *%s\n\n%s *%s\n' \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with an embedded blank record" \
+    "$asset_verifier" v0.4.0 "$artifacts"
+printf '%s *%s\n\n\n' \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with two terminal blank records" \
+    "$asset_verifier" v0.4.0 "$artifacts"
 printf '%s *%s\n' \
     "$checksum_hash" \
     car-go-clean-wrong-target.tar.xz \
@@ -210,6 +231,12 @@ printf '%s   %s\n' \
     car-go-clean-aarch64-apple-darwin.tar.xz \
     > "$checksum"
 expect_failure "checksum with a nonstandard marker" \
+    "$asset_verifier" v0.4.0 "$artifacts"
+printf '%s -%s\n' \
+    "$checksum_hash" \
+    car-go-clean-aarch64-apple-darwin.tar.xz \
+    > "$checksum"
+expect_failure "checksum with a malformed marker" \
     "$asset_verifier" v0.4.0 "$artifacts"
 printf '%s *%s\n' \
     "$(printf '%s' "$checksum_hash" | tr 'a-f' 'A-F')" \
