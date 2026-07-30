@@ -782,20 +782,27 @@ fn rehearse_release_fails_closed_on_intel_or_tap_gaps_and_aggregates_evidence() 
         "secret-bearing execution must use the successful job gate"
     );
     assert_eq!(
-        capability["env"]["GH_TOKEN"].as_str(),
+        capability["env"]["HOMEBREW_TAP_TOKEN"].as_str(),
         Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
     );
-    assert!(
-        run_command(capability)
-            .unwrap()
-            .contains("scripts/rehearse-tap-capability.sh"),
-        "Task 3 tap script hook is absent"
+    assert_eq!(
+        run_command(capability),
+        Some("scripts/rehearse-tap-capability.sh"),
+        "the guarded script must be the complete secret-bearing command"
     );
     let cleanup = named_step(tap_steps, "Cleanup tap rehearsal");
     assert_eq!(cleanup["if"].as_str(), Some("${{ always() }}"));
     assert_eq!(
-        cleanup["env"]["GH_TOKEN"].as_str(),
+        cleanup["env"]["HOMEBREW_TAP_TOKEN"].as_str(),
         Some("${{ secrets.HOMEBREW_TAP_TOKEN }}")
+    );
+    let tap_job_source = format!("{tap_job:?}");
+    assert_eq!(
+        tap_job_source
+            .matches("${{ secrets.HOMEBREW_TAP_TOKEN }}")
+            .count(),
+        2,
+        "only capability execution and its always-on cleanup may receive the tap token"
     );
     let tap_evidence = named_step(tap_steps, "Write tap-capability evidence");
     assert_eq!(tap_evidence["if"].as_str(), Some("${{ always() }}"));

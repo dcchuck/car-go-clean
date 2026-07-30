@@ -659,19 +659,14 @@ jobs:
       - id: capability
         name: Rehearse tap capability
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPOSITORY: dcchuck/homebrew-tap
-        run: |
-          test -x scripts/rehearse-tap-capability.sh || {
-            echo "Task 3 tap-capability implementation is required before dispatch" >&2
-            exit 1
-          }
-          scripts/rehearse-tap-capability.sh
+        run: scripts/rehearse-tap-capability.sh
       - id: cleanup
         name: Cleanup tap rehearsal
         if: ${{ always() }}
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           cleanup_hook="$RUNNER_TEMP/car-go-clean-tap-rehearsal-cleanup.sh"
           if test -x "$cleanup_hook"
