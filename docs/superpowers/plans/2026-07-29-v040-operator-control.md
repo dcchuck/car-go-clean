@@ -6,7 +6,7 @@
 
 **Architecture:** Persist immutable review plans bound to the Runtime Safety Slice-A policy hash and discovery generation. Route dynamic runs and reviewed runs through one execution engine, with reviewed execution allowed only to remove targets after safety revalidation. Extend the service manager to model definition, enablement, and process state separately, capture protected-root environment into service definitions, and ship a tested upgrade helper that understands exit `0`/`2`/`1`.
 
-**Tech Stack:** Rust 1.88+, clap, serde/serde_json, SQLite/rusqlite, launchctl, systemd user services, POSIX shell integration tests.
+**Tech Stack:** Rust 1.95+, clap, serde/serde_json, SQLite/rusqlite, launchctl, systemd user services, POSIX shell integration tests.
 
 ## Global Constraints
 

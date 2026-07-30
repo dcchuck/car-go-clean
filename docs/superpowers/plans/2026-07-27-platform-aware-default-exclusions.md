@@ -6,7 +6,7 @@
 
 **Architecture:** Build editable, platform-aware exclusion profiles in `config`, continue using the scanner's existing pre-traversal matcher, and expose that matcher to the daemon for state reconciliation. Add one transactional `Store` operation that removes only explicitly excluded project and worktree-discovery state while retaining historical diagnostics.
 
-**Tech Stack:** Rust 2021, Rust 1.95.0 toolchain with a 1.88 minimum, `rusqlite`, existing scanner/config/store abstractions, Cargo integration tests.
+**Tech Stack:** Rust 2021, Rust 1.95.0 toolchain and minimum, `rusqlite`, existing scanner/config/store abstractions, Cargo integration tests.
 
 ## Global Constraints
 

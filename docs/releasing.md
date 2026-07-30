@@ -29,16 +29,9 @@ make test
 dist plan --tag v0.4.0 --output-format=json
 ```
 
-Rust 1.95 is the repository toolchain, but the manifest declares Rust 1.88 as
-the minimum. This compatibility gate is separate and unresolved until the
-minimum-version lane passes (or the declared minimum is deliberately revised):
-
-```bash
-mise exec rust@1.88.0 -- cargo test --locked
-```
-
-Do not tag on the strength of Rust 1.95 alone. Only after both compatibility
-decisions and all remaining release gates are green:
+Rust 1.95 is both the repository toolchain and the declared minimum. The
+`make test` gate verifies those declarations remain aligned. Only after that
+and all remaining release gates are green:
 
 ```bash
 git tag -a v0.4.0 -m "car-go-clean v0.4.0"

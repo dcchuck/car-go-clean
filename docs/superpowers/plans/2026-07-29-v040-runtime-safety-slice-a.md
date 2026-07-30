@@ -6,7 +6,7 @@
 
 **Architecture:** Build one immutable `ScopePolicy` per command or daemon cycle, persist discovery generations and observations bound to its deterministic hash, and select cleanup candidates only from the current matching generation. Capture project and target filesystem identity during review and revalidate it immediately before Cargo; refresh exclusion/protected-root and activity snapshots at bounded intervals rather than trusting startup state.
 
-**Tech Stack:** Rust 1.88+, SQLite/rusqlite, serde/serde_json, SHA-256, sysinfo, macOS `sysctl`, Linux `/proc`, existing CLI/daemon/scanner modules.
+**Tech Stack:** Rust 1.95+, SQLite/rusqlite, serde/serde_json, SHA-256, sysinfo, macOS `sysctl`, Linux `/proc`, existing CLI/daemon/scanner modules.
 
 ## Global Constraints
 

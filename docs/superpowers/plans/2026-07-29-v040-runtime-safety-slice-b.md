@@ -6,7 +6,7 @@
 
 **Architecture:** Parse configuration into a private optional overlay, apply it to `Config::default`, and serialize only the supported public keys so `car-go-clean config` remains round-trippable. Keep Cargo process results as audit records, but let the daemon classify nonzero exits as failed work and let a small `CommandOutcome` value merge failure and incomplete-coverage signals at the CLI boundary. This plan implements Runtime Safety Slice B only; Slice A will feed policy-hash, discovery-generation, exclusion-snapshot, and identity-boundary incompleteness into the same outcome seam.
 
-**Tech Stack:** Rust 2021, minimum supported Rust 1.88, pinned development toolchain 1.95.0, Clap 4.5, Serde, TOML 0.8, `toml_edit` 0.22, `similar` 2, rusqlite 0.32, assert_cmd, predicates, tempfile.
+**Tech Stack:** Rust 2021, minimum supported and pinned development Rust 1.95.0, Clap 4.5, Serde, TOML 0.8, `toml_edit` 0.22, `similar` 2, rusqlite 0.32, assert_cmd, predicates, tempfile.
 
 ## Global Constraints
 

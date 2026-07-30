@@ -6,9 +6,8 @@ not run an explicit scan before the first dry run.
 
 ## Source checkout
 
-The repository currently tests with Rust 1.95, while release compatibility
-with the declared Rust 1.88 minimum is tracked separately and must be verified
-before publication:
+The repository toolchain and declared minimum supported Rust version are both
+Rust 1.95:
 
 ```sh
 mise exec rust@1.95.0 -- cargo fmt --all -- --check
@@ -17,7 +16,7 @@ mise exec rust@1.95.0 -- cargo test --locked
 mise exec rust@1.95.0 -- cargo install --path . --force
 ```
 
-Do not treat the Rust 1.95 pass as proof of Rust 1.88 compatibility.
+The `tests/msrv.sh` gate keeps `Cargo.toml` and `rust-toolchain.toml` aligned.
 
 ## Released binary
 
