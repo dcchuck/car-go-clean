@@ -45,7 +45,8 @@ impl<'a, I: ProcessInspector + ?Sized> ActivitySampler<'a, I> {
     ) -> Result<&BTreeSet<PathBuf>> {
         let refresh = self.sampled_at.is_none_or(|sampled_at| {
             now.duration_since(sampled_at)
-                .is_ok_and(|age| age > ACTIVITY_MAX_AGE)
+                .map(|age| age > ACTIVITY_MAX_AGE)
+                .unwrap_or(true)
         });
         if refresh {
             self.active = self

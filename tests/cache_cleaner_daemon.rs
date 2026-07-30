@@ -81,6 +81,11 @@ fn sqlite_column_exists(connection: &rusqlite::Connection, table: &str, column: 
 
 fn downgrade_runtime_database_to_version_nine(database: &Path) {
     let connection = rusqlite::Connection::open(database).unwrap();
+    if sqlite_column_exists(&connection, "scheduler_state", "scan_retry_at") {
+        connection
+            .execute("ALTER TABLE scheduler_state DROP COLUMN scan_retry_at", [])
+            .unwrap();
+    }
     if sqlite_column_exists(&connection, "project_observations", "boot_session_id") {
         connection
             .execute(
@@ -1127,6 +1132,21 @@ struct AdvancingClock {
     initial: SystemTime,
     step: Duration,
     calls: AtomicUsize,
+}
+
+struct RollbackClock {
+    initial: SystemTime,
+    calls: AtomicUsize,
+}
+
+impl Clock for RollbackClock {
+    fn now(&self) -> SystemTime {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => self.initial,
+            1 => self.initial + Duration::from_secs(100),
+            _ => self.initial + Duration::from_secs(50),
+        }
+    }
 }
 
 type ScheduledClockHook = (usize, Box<dyn Fn() + Send + Sync>);
@@ -2300,6 +2320,63 @@ fn activity_refresh_reuses_one_enumeration_for_multiple_targets_within_thirty_se
     assert_eq!(result.cleaned, 2);
     assert_eq!(inspector.calls.load(Ordering::SeqCst), 1);
     assert_eq!(runner.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn activity_refresh_clock_rollback_reenumerates_and_blocks_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/original.bin"), &[0; 2048]);
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(Arc::new(RollbackClock {
+        initial: SystemTime::now(),
+        calls: AtomicUsize::new(0),
+    }));
+    daemon.scan_cycle().unwrap();
+    let inspector = ActiveOnSecondInspector {
+        calls: AtomicUsize::new(0),
+        project: project.canonicalize().unwrap(),
+    };
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &inspector,
+        )
+        .unwrap();
+
+    assert_eq!(inspector.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.cleaned, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(project.join("target/original.bin").exists());
 }
 
 #[test]
@@ -5293,6 +5370,87 @@ fn forced_scan_rate_limit_keeps_missing_generation_cleanup_incomplete() {
     assert_eq!(
         store.scheduler_status().unwrap().unwrap().next_scan_at,
         last_attempt + Duration::from_secs(5 * 60)
+    );
+}
+
+#[test]
+fn forced_scan_failure_backoff_survives_the_five_minute_guard() {
+    let _guard = shutdown_test_lock();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[workspace]\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("state.db");
+    let store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "
+            CREATE TRIGGER reject_forced_scan_project_upsert
+            BEFORE INSERT ON projects
+            BEGIN
+                SELECT RAISE(FAIL, 'injected forced scan failure');
+            END;
+            ",
+        )
+        .unwrap();
+    let started = SystemTime::UNIX_EPOCH + Duration::from_secs(50_000);
+    store
+        .record_scheduler_status(
+            started,
+            started + Duration::from_secs(60 * 60),
+            started + Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+    let run_at = |now| {
+        let daemon = Daemon::new(
+            &store,
+            Cache::new(&store),
+            authoritative_scanner(ScannerOptions {
+                roots: vec![root.path().to_path_buf()],
+                project_dirs: vec![],
+                excludes: vec![],
+            }),
+            Cleaner::new("cargo", FakeRunner::default(), Duration::from_secs(60)),
+            DaemonOptions {
+                clean_interval: Duration::from_secs(60 * 60),
+                scan_interval: Duration::from_secs(60 * 60),
+                target_quiet_period: Duration::ZERO,
+            },
+        )
+        .with_clock(Arc::new(FixedClock { now }));
+        daemon.run_until_shutdown(&ShutdownFlag::new()).unwrap();
+    };
+
+    run_at(started);
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 1);
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(started));
+    let failure_deadline = started + Duration::from_secs(60 * 60);
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        failure_deadline
+    );
+
+    run_at(started + Duration::from_secs(5 * 60));
+    assert_eq!(
+        store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(),
+        1,
+        "the five-minute guard must not shorten the one-hour failure backoff"
+    );
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(started));
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        failure_deadline
+    );
+
+    run_at(failure_deadline);
+    assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
+    assert_eq!(store.last_forced_scan_at().unwrap(), Some(failure_deadline));
+    assert_eq!(
+        store.scheduler_status().unwrap().unwrap().next_scan_at,
+        failure_deadline + Duration::from_secs(60 * 60)
     );
 }
 

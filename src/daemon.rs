@@ -503,6 +503,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             if let Err(err) = self.scan_cycle() {
                 self.defer_after_scan_failure(&mut schedule, &err)?;
             } else {
+                self.store.clear_scan_retry_at()?;
                 schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
                 self.store.record_scheduler_status(
                     self.clock.now(),
@@ -528,6 +529,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                     self.defer_after_scan_failure(&mut schedule, &err)?;
                     continue;
                 }
+                self.store.clear_scan_retry_at()?;
                 schedule.next_scan_at = self.clock.now() + self.opts.scan_interval;
             }
             if now >= schedule.next_clean_at {
@@ -553,6 +555,20 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         }
 
         let now = self.clock.now();
+        if let Some(retry_at) = self.store.scan_retry_at()? {
+            if retry_at > now {
+                if schedule.next_scan_at != retry_at {
+                    schedule.next_scan_at = retry_at;
+                    self.store.record_scheduler_status(
+                        now,
+                        schedule.next_clean_at,
+                        schedule.next_scan_at,
+                    )?;
+                }
+                return Ok(());
+            }
+            self.store.clear_scan_retry_at()?;
+        }
         let last_attempt = self.store.last_forced_scan_at()?;
         let rate_limit_elapsed = last_attempt.is_none_or(|last| {
             now.duration_since(last)
@@ -600,6 +616,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         }
         schedule.next_scan_at = retry_at;
         schedule.next_clean_at = schedule.next_clean_at.max(retry_at);
+        self.store.record_scan_retry_at(retry_at)?;
         self.store
             .record_scheduler_status(now, schedule.next_clean_at, schedule.next_scan_at)?;
         if let Some(logger) = &self.logger {

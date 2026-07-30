@@ -588,6 +588,26 @@ impl Store {
             }
             tx.commit()?;
         }
+        let has_scan_retry_at = {
+            let mut statement = self.conn.prepare("PRAGMA table_info(scheduler_state)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            collect_rows(columns)?
+                .into_iter()
+                .any(|column| column == "scan_retry_at")
+        };
+        if current < 11 || !has_scan_retry_at {
+            let tx = self.conn.unchecked_transaction()?;
+            if !has_scan_retry_at {
+                tx.execute(
+                    "ALTER TABLE scheduler_state ADD COLUMN scan_retry_at INTEGER",
+                    [],
+                )?;
+            }
+            if current < 11 {
+                tx.execute("INSERT INTO schema_version(version) VALUES (11)", [])?;
+            }
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -1708,6 +1728,49 @@ impl Store {
                 last_forced_scan_at = excluded.last_forced_scan_at
             ",
             [when],
+        )?;
+        Ok(())
+    }
+
+    pub fn scan_retry_at(&self) -> Result<Option<SystemTime>> {
+        self.conn
+            .query_row(
+                "
+                SELECT scan_retry_at
+                FROM scheduler_state
+                WHERE id = 1
+                ",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten().map(from_epoch))
+            .map_err(Into::into)
+    }
+
+    pub fn record_scan_retry_at(&self, when: SystemTime) -> Result<()> {
+        let changed = self.conn.execute(
+            "
+            UPDATE scheduler_state
+            SET scan_retry_at = ?1
+            WHERE id = 1
+            ",
+            [to_epoch(when)?],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("record scan retry deadline without scheduler state");
+        }
+        Ok(())
+    }
+
+    pub fn clear_scan_retry_at(&self) -> Result<()> {
+        self.conn.execute(
+            "
+            UPDATE scheduler_state
+            SET scan_retry_at = NULL
+            WHERE id = 1
+            ",
+            [],
         )?;
         Ok(())
     }

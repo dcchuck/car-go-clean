@@ -167,7 +167,7 @@ fn migration_repairs_historical_false_success_accounting_and_is_idempotent() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 10);
+    assert_eq!(schema_version, 11);
     drop(inspection);
 
     let projects = store.all_projects().unwrap();
@@ -1766,7 +1766,7 @@ fn discovery_generation_migrations_preserve_history_without_granting_authority()
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 10);
+        assert_eq!(schema_version, 11);
     }
 }
 
@@ -1780,6 +1780,13 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             "
             CREATE TABLE schema_version (version INTEGER NOT NULL);
             INSERT INTO schema_version(version) VALUES (9);
+            CREATE TABLE scheduler_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at INTEGER NOT NULL,
+                next_clean_at INTEGER NOT NULL,
+                next_scan_at INTEGER NOT NULL,
+                last_forced_scan_at INTEGER
+            );
             CREATE TABLE discovery_generations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at INTEGER NOT NULL,
@@ -1894,7 +1901,7 @@ fn version_nine_observations_lose_authority_without_manufactured_boot_scope() {
             row.get::<_, i64>(0)
         })
         .unwrap();
-    assert_eq!(schema_version, 10);
+    assert_eq!(schema_version, 11);
 }
 
 #[test]
@@ -2169,4 +2176,20 @@ fn discovery_generation_forced_scan_timestamp_round_trips() {
     assert_eq!(store.last_forced_scan_at().unwrap(), None);
     store.record_forced_scan_at(when).unwrap();
     assert_eq!(store.last_forced_scan_at().unwrap(), Some(when));
+}
+
+#[test]
+fn scheduler_scan_retry_deadline_round_trips_and_clears() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
+    let retry_at = now + Duration::from_secs(60 * 60);
+    store
+        .record_scheduler_status(now, retry_at, retry_at)
+        .unwrap();
+
+    assert_eq!(store.scan_retry_at().unwrap(), None);
+    store.record_scan_retry_at(retry_at).unwrap();
+    assert_eq!(store.scan_retry_at().unwrap(), Some(retry_at));
+    store.clear_scan_retry_at().unwrap();
+    assert_eq!(store.scan_retry_at().unwrap(), None);
 }
