@@ -575,6 +575,16 @@ fn service(command: ServiceCommands) -> Result<()> {
         ServiceAction::Restart => manager.restart()?,
         ServiceAction::Uninstall => manager.uninstall()?,
     };
+    let installed_roots = manager.installed_protected_roots()?.map(|roots| {
+        roots
+            .into_iter()
+            .map(|root| ProtectedRootDiagnostics {
+                path: root.path.clone(),
+                kind: protected_root_kind_label(&root.kind),
+                provenance: root_provenance_label(&root.provenance),
+            })
+            .collect::<Vec<_>>()
+    });
     let environment_divergence = manager.environment_divergence(&ProcessEnvironment)?;
 
     println!("Service");
@@ -584,6 +594,7 @@ fn service(command: ServiceCommands) -> Result<()> {
     print_row("Installed", yes_no(status.installed));
     print_row("Enabled", yes_no(status.enabled));
     print_row("Running", yes_no(status.active));
+    print_installed_service_roots(installed_roots.as_deref());
     print_row(
         "Environment divergence",
         environment_divergence
@@ -773,9 +784,17 @@ struct CleanupAuthorityDiagnostics {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ServiceStateDiagnostics {
-    installed: bool,
-    enabled: bool,
-    running: bool,
+    installed: Option<bool>,
+    enabled: Option<bool>,
+    running: Option<bool>,
+    protected_roots: Option<Vec<ProtectedRootDiagnostics>>,
+    warning: Option<ServiceWarningDiagnostics>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ServiceWarningDiagnostics {
+    kind: &'static str,
+    detail: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -918,7 +937,7 @@ fn cleanup_authority_diagnostics(
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let scan_coverage_incomplete = store.scan_coverage_incomplete_since(scan_error_since)?;
     let scan_error_paths = store.scan_error_paths_since(scan_error_since)?;
-    let (service, service_environment_divergence) = service_diagnostics()?;
+    let (service, service_environment_divergence) = service_diagnostics();
 
     Ok(CleanupAuthorityDiagnostics {
         config_source: policy_diagnostics.config_source.to_path_buf(),
@@ -938,29 +957,40 @@ fn cleanup_authority_diagnostics(
     })
 }
 
-fn service_diagnostics() -> Result<(ServiceStateDiagnostics, Option<bool>)> {
+fn service_diagnostics() -> (ServiceStateDiagnostics, Option<bool>) {
     let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Ok((
+        return (
             ServiceStateDiagnostics {
-                installed: false,
-                enabled: false,
-                running: false,
+                installed: None,
+                enabled: None,
+                running: None,
+                protected_roots: None,
+                warning: Some(ServiceWarningDiagnostics {
+                    kind: "service_probe_failed",
+                    detail: "HOME is unavailable; service definition location is unknown"
+                        .to_string(),
+                }),
             },
             None,
-        ));
+        );
     };
     let platform = match std::env::consts::OS {
         "macos" => ServicePlatform::MacOs,
         "linux" => ServicePlatform::Linux,
         _ => {
-            return Ok((
+            return (
                 ServiceStateDiagnostics {
-                    installed: false,
-                    enabled: false,
-                    running: false,
+                    installed: None,
+                    enabled: None,
+                    running: None,
+                    protected_roots: None,
+                    warning: Some(ServiceWarningDiagnostics {
+                        kind: "service_probe_failed",
+                        detail: "service management is unsupported on this platform".to_string(),
+                    }),
                 },
                 None,
-            ));
+            );
         }
     };
     let mut manager = ServiceManager::new(
@@ -969,16 +999,79 @@ fn service_diagnostics() -> Result<(ServiceStateDiagnostics, Option<bool>)> {
         PathBuf::from("/car-go-clean-service-status-only"),
         SystemCommandRunner,
     );
-    let status = manager.status()?;
-    let divergence = manager.environment_divergence(&ProcessEnvironment)?;
-    Ok((
+    let status = match manager.status() {
+        Ok(status) => status,
+        Err(error) => {
+            return (
+                ServiceStateDiagnostics {
+                    installed: None,
+                    enabled: None,
+                    running: None,
+                    protected_roots: None,
+                    warning: Some(ServiceWarningDiagnostics {
+                        kind: "service_probe_failed",
+                        detail: format!("{error:#}"),
+                    }),
+                },
+                None,
+            );
+        }
+    };
+    let installed_roots = match manager.installed_protected_roots() {
+        Ok(roots) => roots.map(|roots| {
+            roots
+                .into_iter()
+                .map(|root| ProtectedRootDiagnostics {
+                    path: root.path.clone(),
+                    kind: protected_root_kind_label(&root.kind),
+                    provenance: root_provenance_label(&root.provenance),
+                })
+                .collect()
+        }),
+        Err(error) => {
+            return (
+                ServiceStateDiagnostics {
+                    installed: Some(status.installed),
+                    enabled: Some(status.enabled),
+                    running: Some(status.active),
+                    protected_roots: None,
+                    warning: Some(ServiceWarningDiagnostics {
+                        kind: "service_definition_unreadable",
+                        detail: format!("{error:#}"),
+                    }),
+                },
+                None,
+            );
+        }
+    };
+    let divergence = match manager.environment_divergence(&ProcessEnvironment) {
+        Ok(divergence) => divergence,
+        Err(error) => {
+            return (
+                ServiceStateDiagnostics {
+                    installed: Some(status.installed),
+                    enabled: Some(status.enabled),
+                    running: Some(status.active),
+                    protected_roots: installed_roots,
+                    warning: Some(ServiceWarningDiagnostics {
+                        kind: "service_definition_unreadable",
+                        detail: format!("{error:#}"),
+                    }),
+                },
+                None,
+            );
+        }
+    };
+    (
         ServiceStateDiagnostics {
-            installed: status.installed,
-            enabled: status.enabled,
-            running: status.active,
+            installed: Some(status.installed),
+            enabled: Some(status.enabled),
+            running: Some(status.active),
+            protected_roots: installed_roots,
+            warning: None,
         },
         divergence,
-    ))
+    )
 }
 
 fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics) {
@@ -1041,9 +1134,19 @@ fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics
             origin.error.as_deref().unwrap_or("unknown error")
         );
     }
-    print_row("Service installed", yes_no(diagnostics.service.installed));
-    print_row("Service enabled", yes_no(diagnostics.service.enabled));
-    print_row("Service running", yes_no(diagnostics.service.running));
+    print_row(
+        "Service installed",
+        yes_no_unknown(diagnostics.service.installed),
+    );
+    print_row(
+        "Service enabled",
+        yes_no_unknown(diagnostics.service.enabled),
+    );
+    print_row(
+        "Service running",
+        yes_no_unknown(diagnostics.service.running),
+    );
+    print_installed_service_roots(diagnostics.service.protected_roots.as_deref());
     print_row(
         "Service environment divergence",
         diagnostics
@@ -1054,6 +1157,33 @@ fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics
     if diagnostics.service_environment_divergence == Some(true) {
         println!(
             "    Warning: protected-root inputs differ; run `car-go-clean service install` to recapture the current environment."
+        );
+    }
+    if let Some(warning) = &diagnostics.service.warning {
+        print_row("Service warning", warning.kind);
+        println!("    {}", warning.detail);
+    }
+}
+
+fn yes_no_unknown(value: Option<bool>) -> &'static str {
+    value.map(yes_no).unwrap_or("<unknown>")
+}
+
+fn print_installed_service_roots(roots: Option<&[ProtectedRootDiagnostics]>) {
+    let Some(roots) = roots else {
+        print_row("Installed service protected roots", "<unknown>");
+        return;
+    };
+    print_row(
+        "Installed service protected roots",
+        format_count(roots.len()),
+    );
+    for root in roots {
+        println!(
+            "    {} ({}, {})",
+            root.path.display(),
+            root.kind,
+            root.provenance
         );
     }
 }

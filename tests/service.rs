@@ -1,5 +1,5 @@
 use anyhow::Result;
-use car_go_clean::policy::Environment;
+use car_go_clean::policy::{Environment, ProtectedRootKind, RootProvenance};
 use car_go_clean::service::{
     resolve_service_binary, CommandOutput, CommandRunner, ServiceEnvironment, ServiceManager,
     ServicePlatform, ServiceStatus,
@@ -484,6 +484,40 @@ fn restart_uses_only_the_platform_restart_command_after_state_validation() {
 }
 
 #[test]
+fn mac_restart_bootstraps_an_enabled_but_unloaded_definition_before_kickstart() {
+    let work = tempfile::tempdir().unwrap();
+    let plist = work
+        .path()
+        .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "definition").unwrap();
+    let mut manager = ServiceManager::new(
+        ServicePlatform::MacOs,
+        work.path().to_path_buf(),
+        work.path().join("bin/car-go-clean"),
+        FakeRunner::with_outputs([
+            CommandOutput::new(
+                true,
+                "disabled services = {\n}\n".to_string(),
+                String::new(),
+            ),
+            CommandOutput::new(
+                false,
+                String::new(),
+                "Could not find specified service".to_string(),
+            ),
+            CommandOutput::new(true, String::new(), String::new()),
+            CommandOutput::new(true, String::new(), String::new()),
+        ]),
+    );
+
+    manager.restart().unwrap();
+    let calls = call_arguments(&manager.into_runner());
+    assert_eq!(calls[2][0], "bootstrap");
+    assert_eq!(calls[3][0], "kickstart");
+}
+
+#[test]
 fn manager_output_must_match_an_enumerated_state() {
     let work = tempfile::tempdir().unwrap();
     let unit = work
@@ -535,6 +569,89 @@ fn manager_status_errors_preserve_the_underlying_failure() {
         .unwrap_err()
         .to_string()
         .contains("Permission denied"));
+}
+
+#[test]
+fn systemd_status_recognizes_native_enablement_states_independent_of_exit_success() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "unit").unwrap();
+
+    for (state, success, persistent) in [
+        ("enabled", true, true),
+        ("enabled-runtime", true, false),
+        ("static", true, false),
+        ("alias", true, false),
+        ("indirect", true, false),
+        ("generated", true, false),
+        ("disabled", false, false),
+        ("masked", false, false),
+        ("masked-runtime", false, false),
+        ("linked", true, false),
+        ("linked-runtime", true, false),
+        ("transient", true, false),
+        ("bad", false, false),
+        ("not-found", false, false),
+    ] {
+        let mut manager = ServiceManager::new(
+            ServicePlatform::Linux,
+            work.path().to_path_buf(),
+            work.path().join("bin/car-go-clean"),
+            FakeRunner::with_outputs([
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(success, format!("{state}\n"), String::new()),
+                CommandOutput::new(false, "inactive\n".to_string(), String::new()),
+            ]),
+        );
+
+        let status = manager
+            .status()
+            .unwrap_or_else(|error| panic!("{state}: {error:#}"));
+        assert_eq!(status.enabled, persistent, "{state}");
+        assert!(!status.active, "{state}");
+    }
+}
+
+#[test]
+fn systemd_status_recognizes_native_activity_states_independent_of_exit_success() {
+    let work = tempfile::tempdir().unwrap();
+    let unit = work
+        .path()
+        .join(".config/systemd/user/car-go-clean.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "unit").unwrap();
+
+    for (state, success, active) in [
+        ("active", true, true),
+        ("reloading", true, true),
+        ("refreshing", true, true),
+        ("inactive", false, false),
+        ("failed", false, false),
+        ("activating", false, false),
+        ("deactivating", false, false),
+        ("maintenance", false, false),
+        ("unknown", false, false),
+    ] {
+        let mut manager = ServiceManager::new(
+            ServicePlatform::Linux,
+            work.path().to_path_buf(),
+            work.path().join("bin/car-go-clean"),
+            FakeRunner::with_outputs([
+                CommandOutput::new(true, String::new(), String::new()),
+                CommandOutput::new(true, "enabled\n".to_string(), String::new()),
+                CommandOutput::new(success, format!("{state}\n"), String::new()),
+            ]),
+        );
+
+        let status = manager
+            .status()
+            .unwrap_or_else(|error| panic!("{state}: {error:#}"));
+        assert!(status.enabled, "{state}");
+        assert_eq!(status.active, active, "{state}");
+    }
 }
 
 #[test]
@@ -596,6 +713,18 @@ fn captured_environment_is_whitelisted_and_round_trips_through_definitions() {
         Some(captured.clone())
     );
     assert_eq!(linux.environment_divergence(&current).unwrap(), Some(false));
+    let installed_roots = linux.installed_protected_roots().unwrap().unwrap();
+    assert!(!installed_roots.is_empty());
+    assert!(installed_roots
+        .iter()
+        .all(|root| root.provenance == RootProvenance::ServiceDefinition));
+    assert!(installed_roots.iter().any(|root| {
+        root.kind == ProtectedRootKind::Cargo && root.path == Path::new("/cargo/<shared>")
+    }));
+    assert!(installed_roots.iter().any(|root| {
+        root.kind == ProtectedRootKind::Container
+            && root.path == Path::new("/data/\"quoted\"/%done\\slash/docker")
+    }));
 
     let changed = environment(&[
         ("HOME", "/Users/a & b"),

@@ -623,6 +623,288 @@ fn service_status_prints_definition_enablement_and_process_state_separately() {
         .stdout(contains("Running: no"));
 }
 
+#[cfg(unix)]
+#[test]
+fn health_and_status_keep_cleanup_outcome_when_service_probe_fails() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let home = work.path().join("home");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let config = work.path().join("config.toml");
+    let state = work.path().join("state");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let (manager_name, definition) = if cfg!(target_os = "macos") {
+        (
+            "launchctl",
+            home.join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist"),
+        )
+    } else {
+        (
+            "systemctl",
+            home.join(".config/systemd/user/car-go-clean.service"),
+        )
+    };
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    fs::write(&definition, "legacy definition").unwrap();
+    write_executable(
+        &bin.join(manager_name),
+        "#!/bin/sh\nprintf 'service probe denied\\n' >&2\nexit 1\n",
+    );
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home)
+            .env("PATH", &path);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{subcommand}");
+        let report = terminal_report(&output.stdout, subcommand);
+        assert_eq!(
+            report["data"]["service"]["installed"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["data"]["service"]["enabled"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["data"]["service"]["running"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["data"]["service"]["protected_roots"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["data"]["service"]["warning"]["kind"],
+            "service_probe_failed"
+        );
+        assert!(report["data"]["service"]["warning"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("service probe denied"));
+        assert_eq!(
+            report["outcome"]["reasons"],
+            serde_json::json!(["generation_missing", "scan_incomplete"])
+        );
+
+        let mut text_command = Command::cargo_bin("car-go-clean").unwrap();
+        text_command
+            .arg(subcommand)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home)
+            .env("PATH", &path);
+        if subcommand == "health" {
+            text_command.arg("--skip-cargo");
+        }
+        text_command
+            .assert()
+            .code(2)
+            .stdout(contains("Service installed: <unknown>"))
+            .stdout(contains("Service warning: service_probe_failed"))
+            .stdout(contains("service probe denied"));
+    }
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success();
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("HOME", &home)
+            .env("PATH", &path);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{subcommand}");
+        let report = terminal_report(&output.stdout, subcommand);
+        assert_eq!(report["outcome"]["reasons"], serde_json::json!([]));
+        assert_eq!(
+            report["data"]["service"]["warning"]["kind"],
+            "service_probe_failed"
+        );
+    }
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["service", "status"])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .failure()
+        .stderr(contains("service probe denied"));
+}
+
+#[cfg(unix)]
+#[test]
+fn top_level_diagnostics_keep_known_service_state_when_capture_is_malformed() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let home = work.path().join("home");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let config = work.path().join("config.toml");
+    let state = work.path().join("state");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let (manager_name, manager_body, definition, malformed_definition) = if cfg!(
+        target_os = "macos"
+    ) {
+        (
+                "launchctl",
+                "#!/bin/sh\ncase \"$1\" in\n  print-disabled) printf 'disabled services = {\\n}\\n' ;;\n  print) exit 0 ;;\n  *) exit 64 ;;\nesac\n",
+                home.join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist"),
+                "<!-- car-go-clean-service-environment-v1 -->\n",
+            )
+    } else {
+        (
+                "systemctl",
+                "#!/bin/sh\ncase \"$2\" in\n  show-environment) exit 0 ;;\n  is-enabled) printf 'enabled\\n' ;;\n  is-active) printf 'active\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                home.join(".config/systemd/user/car-go-clean.service"),
+                "# car-go-clean-service-environment-v1\nEnvironment=unquoted\n",
+            )
+    };
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    fs::write(&definition, malformed_definition).unwrap();
+    write_executable(&bin.join(manager_name), manager_body);
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report = terminal_report(&output.stdout, "status");
+    assert_eq!(report["data"]["service"]["installed"], true);
+    assert_eq!(report["data"]["service"]["enabled"], true);
+    assert_eq!(report["data"]["service"]["running"], true);
+    assert_eq!(
+        report["data"]["service"]["protected_roots"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        report["data"]["service"]["warning"]["kind"],
+        "service_definition_unreadable"
+    );
+    assert!(report["data"]["service"]["warning"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("malformed captured"));
+}
+
+#[cfg(unix)]
+#[test]
+fn service_diagnostics_expose_installed_roots_with_service_definition_provenance() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    let home = work.path().join("home");
+    let bin = work.path().join("bin");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let config = work.path().join("config.toml");
+    let state = work.path().join("state");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+
+    let (manager_name, manager_body, definition, captured_definition) = if cfg!(target_os = "macos")
+    {
+        (
+                "launchctl",
+                "#!/bin/sh\ncase \"$1\" in\n  print-disabled) printf 'disabled services = {\\n}\\n' ;;\n  print) exit 0 ;;\n  *) exit 64 ;;\nesac\n",
+                home.join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist"),
+                "<!-- car-go-clean-service-environment-v1 -->\n<key>EnvironmentVariables</key>\n<dict>\n<key>HOME</key>\n<string>/service/home</string>\n<key>CARGO_HOME</key>\n<string>/service/cargo</string>\n</dict>\n",
+            )
+    } else {
+        (
+                "systemctl",
+                "#!/bin/sh\ncase \"$2\" in\n  show-environment) exit 0 ;;\n  is-enabled) printf 'enabled\\n' ;;\n  is-active) printf 'active\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                home.join(".config/systemd/user/car-go-clean.service"),
+                "# car-go-clean-service-environment-v1\nEnvironment=\"CARGO_HOME=/service/cargo\"\nEnvironment=\"HOME=/service/home\"\nExecStart=/bin/true\n",
+            )
+    };
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    fs::write(&definition, captured_definition).unwrap();
+    write_executable(&bin.join(manager_name), manager_body);
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let output = Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report = terminal_report(&output.stdout, "status");
+    let roots = report["data"]["service"]["protected_roots"]
+        .as_array()
+        .unwrap();
+    assert!(!roots.is_empty());
+    assert!(roots.iter().all(|root| {
+        root["path"].is_string()
+            && root["kind"].is_string()
+            && root["provenance"] == "service_definition"
+    }));
+    assert!(roots.iter().any(|root| {
+        root["path"] == "/service/cargo"
+            && root["kind"] == "cargo"
+            && root["provenance"] == "service_definition"
+    }));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["service", "status"])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("Installed service protected roots"))
+        .stdout(contains("/service/cargo (cargo, service_definition)"));
+}
+
 #[test]
 fn top_level_help_lists_service_management() {
     Command::cargo_bin("car-go-clean")
@@ -1386,7 +1668,9 @@ fn health_and_status_json_share_authority_diagnostics() {
             serde_json::json!({
                 "installed": false,
                 "enabled": false,
-                "running": false
+                "running": false,
+                "protected_roots": null,
+                "warning": null
             })
         );
         reports.push(report);

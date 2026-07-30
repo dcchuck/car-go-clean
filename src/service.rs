@@ -3,7 +3,7 @@
 //! The service definitions are embedded in the binary so an installed
 //! `car-go-clean` never needs to find files from a source checkout.
 
-use crate::policy::{Environment, ProcessEnvironment};
+use crate::policy::{Environment, ProcessEnvironment, ProtectedRoot, RootProvenance};
 use crate::storage::{protected_roots_for, HostPlatform};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -284,6 +284,16 @@ impl<R: CommandRunner> ServiceManager<R> {
         }
         match self.platform {
             ServicePlatform::MacOs => {
+                if !status.active {
+                    self.run_checked(
+                        Path::new("launchctl"),
+                        &[
+                            OsString::from("bootstrap"),
+                            OsString::from(self.launchd_domain()),
+                            self.launchd_plist_path().into_os_string(),
+                        ],
+                    )?;
+                }
                 self.run_checked(
                     Path::new("launchctl"),
                     &[
@@ -405,6 +415,26 @@ impl<R: CommandRunner> ServiceManager<R> {
             resolved_protected_roots(platform, &installed)
                 != resolved_protected_roots(platform, &current),
         ))
+    }
+
+    pub fn installed_protected_roots(&self) -> Result<Option<Vec<ProtectedRoot>>> {
+        let Some(installed) = self.installed_environment()? else {
+            return Ok(None);
+        };
+        let platform = match self.platform {
+            ServicePlatform::MacOs => HostPlatform::MacOs,
+            ServicePlatform::Linux => HostPlatform::Linux,
+        };
+        let mut roots = resolved_protected_roots(platform, &installed)
+            .into_iter()
+            .map(|mut root| {
+                root.provenance = RootProvenance::ServiceDefinition;
+                root
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        Ok(Some(roots))
     }
 
     fn stop_active_service_for_reinstall(&mut self) -> Result<()> {
@@ -1074,29 +1104,24 @@ fn parse_launchd_enabled(output: &str) -> Result<bool> {
 
 fn parse_systemd_enabled(output: &CommandOutput) -> Result<bool> {
     let value = output.stdout.trim();
-    let enabled = match value {
-        "enabled" => true,
-        "disabled" | "static" | "indirect" | "masked" | "generated" | "transient"
-        | "enabled-runtime" | "linked" | "linked-runtime" | "alias" | "not-found" => false,
+    match value {
+        "enabled" => Ok(true),
+        "enabled-runtime" | "static" | "alias" | "indirect" | "generated" | "disabled"
+        | "masked" | "masked-runtime" | "linked" | "linked-runtime" | "transient" | "bad"
+        | "not-found" => Ok(false),
         _ => bail!("malformed systemctl is-enabled output: {value:?}"),
-    };
-    if output.success != (value == "enabled") {
-        bail!("malformed systemctl is-enabled result for {value:?}");
     }
-    Ok(enabled)
 }
 
 fn parse_systemd_active(output: &CommandOutput) -> Result<bool> {
     let value = output.stdout.trim();
-    let active = match value {
-        "active" => true,
-        "inactive" | "failed" | "activating" | "deactivating" | "reloading" | "unknown" => false,
+    match value {
+        "active" | "reloading" | "refreshing" => Ok(true),
+        "inactive" | "failed" | "activating" | "deactivating" | "maintenance" | "unknown" => {
+            Ok(false)
+        }
         _ => bail!("malformed systemctl is-active output: {value:?}"),
-    };
-    if output.success != active {
-        bail!("malformed systemctl is-active result for {value:?}");
     }
-    Ok(active)
 }
 
 fn is_missing_systemd_unit(output: &CommandOutput) -> bool {
