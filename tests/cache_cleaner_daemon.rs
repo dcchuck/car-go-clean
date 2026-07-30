@@ -3408,16 +3408,11 @@ fn daemon_uses_persisted_overdue_clean_schedule_after_restart() {
             scan_interval: Duration::from_secs(60 * 60),
             target_quiet_period: Duration::ZERO,
         },
-    );
+    )
+    .with_clock(Arc::new(FixedClock { now }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert_eq!(store.last_run().unwrap().projects_cleaned, 1);
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
@@ -3477,16 +3472,11 @@ fn scheduler_scans_before_cleaning_when_equal_deadlines_are_overdue() {
             scan_interval: Duration::from_secs(60 * 60),
             target_quiet_period: Duration::ZERO,
         },
-    );
+    )
+    .with_clock(Arc::new(FixedClock { now }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert!(runner.calls.lock().unwrap().is_empty());
     assert_eq!(
@@ -3551,16 +3541,11 @@ fn scheduler_reconciles_successful_exclusions_before_equal_due_clean() {
             scan_interval: Duration::from_secs(60 * 60),
             target_quiet_period: Duration::ZERO,
         },
-    );
+    )
+    .with_clock(Arc::new(FixedClock { now }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert!(runner.calls.lock().unwrap().is_empty());
     assert_eq!(
@@ -3611,6 +3596,7 @@ fn scheduler_retries_initial_empty_store_scan_persistence_failure() {
     )
     .unwrap();
     let runner = FakeRunner::default();
+    let started = SystemTime::now();
     let daemon = Daemon::new(
         &store,
         Cache::new(&store),
@@ -3626,17 +3612,11 @@ fn scheduler_retries_initial_empty_store_scan_persistence_failure() {
             target_quiet_period: Duration::ZERO,
         },
     )
-    .with_logger(logger);
-    let started = SystemTime::now();
+    .with_logger(logger)
+    .with_clock(Arc::new(FixedClock { now: started }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert!(runner.calls.lock().unwrap().is_empty());
     assert!(store.last_run().is_err());
@@ -3728,16 +3708,11 @@ fn scheduler_defers_clean_and_retry_after_scan_persistence_failure() {
             scan_interval: Duration::ZERO,
             target_quiet_period: Duration::ZERO,
         },
-    );
+    )
+    .with_clock(Arc::new(FixedClock { now }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert!(runner.calls.lock().unwrap().is_empty());
     let schedule = store.scheduler_status().unwrap().unwrap();
@@ -5799,16 +5774,11 @@ fn upgraded_nonempty_cache_prunes_exclusions_when_clean_is_due_before_scan() {
             scan_interval: Duration::from_secs(60 * 60),
             target_quiet_period: Duration::ZERO,
         },
-    );
+    )
+    .with_clock(Arc::new(FixedClock { now }));
     let shutdown = ShutdownFlag::new();
-    let shutdown_for_thread = shutdown;
-    let shutdown_thread = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        shutdown_for_thread.request();
-    });
 
     daemon.run_until_shutdown(&shutdown).unwrap();
-    shutdown_thread.join().unwrap();
 
     assert_eq!(
         runner
