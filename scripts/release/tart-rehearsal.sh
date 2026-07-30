@@ -334,7 +334,7 @@ chmod 600 "$source_map"
 
 ssh_password=${CAR_GO_CLEAN_TART_SSH_PASSWORD:-admin}
 ssh_user=${CAR_GO_CLEAN_TART_SSH_USER:-admin}
-ssh_options="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5"
+ssh_options="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no"
 
 ssh_guest() {
     guest_host=$1
@@ -509,11 +509,11 @@ run_vm() {
         linux)
             base_path=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
             dependency_preflight="command -v python3 >/dev/null && command -v cc >/dev/null && systemctl --user show-environment >/dev/null"
-            normalized_inventory="printf 'platform=linux\\n'; printf 'python=%s\\n' \"\$(python3 --version 2>&1)\"; printf 'cc=%s\\n' \"\$(cc --version | sed -n '1p')\""
+            normalized_inventory="printf 'platform=linux\\n'; printf 'python=%s\\n' \"\$(python3 --version 2>&1)\"; cc_version=\$(cc --version 2>&1) || exit 1; printf 'cc=%s\\n' \"\$(printf '%s\\n' \"\$cc_version\" | sed -n '1p')\""
             ;;
     esac
     acceptance_path=$guest_home/.cargo/bin:$base_path
-    bootstrap_command="set -eu; export PATH='$base_path'; $dependency_preflight; cd '$remote_root/artifacts'; expected=\$(awk '{print \$1}' '$rustup_artifact.sha256'); test \"\$expected\" = '$rustup_digest'; if command -v sha256sum >/dev/null 2>&1; then actual=\$(sha256sum '$rustup_artifact' | awk '{print \$1}'); else actual=\$(shasum -a 256 '$rustup_artifact' | awk '{print \$1}'); fi; test \"\$actual\" = \"\$expected\"; chmod +x '$rustup_artifact'; bootstrap_log='$remote_root/rustup-bootstrap.log'; if ! './$rustup_artifact' -y --default-toolchain 1.95.0 --profile minimal --no-modify-path > \"\$bootstrap_log\" 2>&1; then sed 's#$guest_home#\$HOME#g' \"\$bootstrap_log\" | tail -n 40; exit 1; fi; rm -f \"\$bootstrap_log\"; export PATH='$acceptance_path'; test \"\$(rustc --version | awk '{print \$2}')\" = 1.95.0; test \"\$(cargo --version | awk '{print \$2}')\" = 1.95.0; $normalized_inventory; printf 'rustc=%s\\n' \"\$(rustc --version)\"; printf 'cargo=%s\\n' \"\$(cargo --version)\""
+    bootstrap_command="set -eu; export PATH='$base_path'; if ! { $dependency_preflight; }; then echo 'required guest dependency preflight failed' >&2; exit 1; fi; cd '$remote_root/artifacts'; expected=\$(awk '{print \$1}' '$rustup_artifact.sha256'); test \"\$expected\" = '$rustup_digest'; if command -v sha256sum >/dev/null 2>&1; then actual=\$(sha256sum '$rustup_artifact' | awk '{print \$1}'); else actual=\$(shasum -a 256 '$rustup_artifact' | awk '{print \$1}'); fi; test \"\$actual\" = \"\$expected\"; chmod +x '$rustup_artifact'; bootstrap_log='$remote_root/rustup-bootstrap.log'; if ! './$rustup_artifact' -y --default-toolchain 1.95.0 --profile minimal --no-modify-path > \"\$bootstrap_log\" 2>&1; then sed 's#$guest_home#\$HOME#g' \"\$bootstrap_log\" | tail -n 40; exit 1; fi; rm -f \"\$bootstrap_log\"; export PATH='$acceptance_path'; test \"\$(rustc --version | awk '{print \$2}')\" = 1.95.0; test \"\$(cargo --version | awk '{print \$2}')\" = 1.95.0; $normalized_inventory; printf 'rustc=%s\\n' \"\$(rustc --version)\"; printf 'cargo=%s\\n' \"\$(cargo --version)\""
     if test "$phase_status" -eq 0 &&
         ! ssh_guest "$guest_ip" "$bootstrap_command" \
             > "$platform_evidence/tool-inventory.txt" 2>&1; then

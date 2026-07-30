@@ -190,6 +190,15 @@ assert_output_has() {
     }
 }
 
+assert_output_line() {
+    haystack=$1
+    expected=$2
+    printf '%s\n' "$haystack" | grep -Fx -- "$expected" >/dev/null || {
+        echo "expected output to contain exact line: $expected" >&2
+        return 1
+    }
+}
+
 assert_service_state() {
     binary=$1
     installed=$2
@@ -331,10 +340,19 @@ step_version_health() {
     write_config "$empty_root"
     test "$("$shell_binary" version)" = "$version"
     fault_checkpoint middle
-    health_output=$("$shell_binary" health --skip-cargo \
-        --config "$config" --state-dir "$state_dir")
+    health_file=$work_root/health.out
+    capture_status "$health_file" "$shell_binary" health --skip-cargo \
+        --config "$config" --state-dir "$state_dir"
+    health_output=$(cat "$health_file")
+    printf '%s\n' "$health_output"
+    test "$captured_status" -eq 2
     assert_output_has "$health_output" "Cleanup authority"
     assert_output_has "$health_output" "Config source"
+    assert_output_has "$health_output" "Generation state: missing"
+    assert_output_has "$health_output" "Current generation: <none>"
+    assert_output_has "$health_output" "Outcome: incomplete (code=2)"
+    assert_output_line "$health_output" \
+        "Reasons: generation_missing, scan_incomplete"
     assert_service_state "$shell_binary" no no no
 }
 

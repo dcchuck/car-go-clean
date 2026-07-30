@@ -27,6 +27,13 @@ assert_contains() {
         fail "$file does not contain: $expected"
 }
 
+assert_line() {
+    file=$1
+    expected=$2
+    grep -Fx -- "$expected" "$file" >/dev/null ||
+        fail "$file does not contain exact line: $expected"
+}
+
 assert_not_contains() {
     file=$1
     unexpected=$2
@@ -140,12 +147,22 @@ set -eu
 } >> "$CALL_LOG"
 host=
 command=
+preferred_password=false
+public_key_disabled=false
 for argument do
     case "$argument" in
         admin@*) host=$argument ;;
+        PreferredAuthentications=password) preferred_password=true ;;
+        PubkeyAuthentication=no) public_key_disabled=true ;;
         *) command=$argument ;;
     esac
 done
+if test "${REQUIRE_PASSWORD_ONLY-}" = 1 &&
+    { test "$preferred_password" != true ||
+      test "$public_key_disabled" != true; }; then
+    echo "Too many authentication failures" >&2
+    exit 67
+fi
 case "$command" in
     'printf ready')
         if test -e "$TART_STATE/rebooting"; then
@@ -162,10 +179,44 @@ case "$command" in
         printf '/home/admin'
         ;;
     *'rustup-init-'*'--default-toolchain 1.95.0'*)
+        case "$host:${FAIL_CC_INVENTORY-}" in
+            admin@192.0.2.20:linux)
+                inventory_start="printf 'platform=linux\\n'"
+                inventory_end="; printf 'rustc=%s\\n'"
+                case "$command" in
+                    *"$inventory_start"*"$inventory_end"*)
+                        inventory=${command#*"$inventory_start"}
+                        inventory=$inventory_start$inventory
+                        inventory=${inventory%%"$inventory_end"*}
+                        inventory=$(printf '%s\n' "$inventory" |
+                            sed 's#cc --version#false#g')
+                        marker=$TART_STATE/cc-inventory-continued
+                        set +e
+                        sh -c "set -e; $inventory; : > '$marker'" \
+                            >/dev/null 2>&1
+                        inventory_status=$?
+                        set -e
+                        if test "$inventory_status" -ne 0; then
+                            echo "cc execution failed" >&2
+                            exit 30
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
         case "$host:${FAIL_GUEST_DEPENDENCY-}" in
-            admin@192.0.2.10:macos|admin@192.0.2.20:linux)
+            admin@192.0.2.10:macos)
                 echo "required guest dependency missing" >&2
                 exit 29
+                ;;
+            admin@192.0.2.20:linux)
+                remainder=${command#*; }
+                remainder=${remainder#*; }
+                preflight=${remainder%%; cd *}
+                preflight=$(printf '%s\n' "$preflight" |
+                    sed 's#command -v cc >/dev/null#false#')
+                marker=$TART_STATE/preflight-continued
+                sh -c "set -e; $preflight; : > '$marker'"
                 ;;
         esac
         case "$host" in
@@ -217,9 +268,21 @@ set -eu
     printf ' %s' "$@"
     printf '\n'
 } >> "$CALL_LOG"
+preferred_password=false
+public_key_disabled=false
 for argument do
+    case "$argument" in
+        PreferredAuthentications=password) preferred_password=true ;;
+        PubkeyAuthentication=no) public_key_disabled=true ;;
+    esac
     destination=$argument
 done
+if test "${REQUIRE_PASSWORD_ONLY-}" = 1 &&
+    { test "$preferred_password" != true ||
+      test "$public_key_disabled" != true; }; then
+    echo "Too many authentication failures" >&2
+    exit 67
+fi
 case "$*: ${FAIL_PRE_COPY_HOST-}" in
     *admin@192.0.2.10:*evidence*pre-reboot*:*macos) exit 31 ;;
     *admin@192.0.2.20:*evidence*pre-reboot*:*linux) exit 31 ;;
@@ -580,8 +643,26 @@ test "$run_status" -ne 0 || fail "rehearsal accepted a dirty exact-SHA checkout"
 assert_contains "$output_file" "release checkout is dirty"
 assert_not_contains "$call_log" "tart pull"
 
+# Password-only base images must not consume the guest's authentication budget
+# on host SSH identities before sshpass can present the documented password.
+: > "$call_log"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+password_only_evidence=$work_dir/password-only-evidence
+run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" REQUIRE_PASSWORD_ONLY=1 FAIL_ACCEPTANCE_HOST= \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$password_only_evidence"
+assert_status "$run_status" 0
+assert_contains "$call_log" "PreferredAuthentications=password"
+assert_contains "$call_log" "PubkeyAuthentication=no"
+
 : > "$call_log"
 rm -rf "$evidence"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
 FAIL_ACCEPTANCE_HOST=linux
 export FAIL_ACCEPTANCE_HOST
 run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
@@ -605,6 +686,14 @@ test -f "$evidence/macos/pre-reboot/pre-reboot-transcript.log"
 test -f "$evidence/macos/post-reboot/post-reboot-transcript.log"
 test -f "$evidence/linux/pre-reboot/pre-reboot-transcript.log"
 test -f "$evidence/linux/post-reboot/post-reboot-transcript.log"
+test -s "$evidence/macos/pre-reboot-boot-identity.txt" ||
+    fail "macOS pre-reboot boot identity was not preserved"
+test -s "$evidence/macos/post-reboot-boot-identity.txt" ||
+    fail "macOS post-reboot boot identity was not preserved"
+test -s "$evidence/linux/pre-reboot-boot-identity.txt" ||
+    fail "Linux pre-reboot boot identity was not preserved"
+test -s "$evidence/linux/post-reboot-boot-identity.txt" ||
+    fail "Linux post-reboot boot identity was not preserved"
 test "$(cat "$evidence/macos/pre-reboot-boot-identity.txt")" != \
     "$(cat "$evidence/macos/post-reboot-boot-identity.txt")"
 test "$(cat "$evidence/linux/pre-reboot-boot-identity.txt")" != \
@@ -630,7 +719,9 @@ test -n "$pre_copy_line" && test -n "$mac_reboot_line" &&
 # Missing immutable-base prerequisites stop acceptance before it can produce a
 # false guest PASS; no mutable package-manager bootstrap is attempted.
 rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+rm -f "$tart_state/cc-inventory-continued"
 : > "$call_log"
+rm -f "$tart_state/preflight-continued"
 run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
     TART_STATE="$tart_state" FAIL_ACCEPTANCE_HOST= \
     FAIL_GUEST_DEPENDENCY=linux \
@@ -641,13 +732,42 @@ run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
     "$root/scripts/release/tart-rehearsal.sh" \
     "$artifacts" "$aggregate" "$work_dir/dependency-failure-evidence"
 test "$run_status" -ne 0 || fail "missing guest dependency was hidden"
+test ! -e "$tart_state/preflight-continued" ||
+    fail "missing guest dependency preflight continued into bootstrap"
 assert_contains "$output_file" "deterministic toolchain bootstrap/preflight failed"
+assert_line \
+    "$work_dir/dependency-failure-evidence/linux/tool-inventory.txt" \
+    "required guest dependency preflight failed"
 if grep -E '^ssh .*admin@192\.0\.2\.20 .*acceptance\.sh.* pre-reboot$' \
     "$call_log" >/dev/null; then
     fail "Linux acceptance ran after dependency preflight failed"
 fi
 assert_not_contains "$call_log" "apt-get"
 assert_not_contains "$call_log" "brew install"
+
+# A compiler may be discoverable during preflight but fail when invoked.
+# The normalized inventory guard must still stop before guest acceptance.
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+: > "$call_log"
+run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" FAIL_ACCEPTANCE_HOST= \
+    FAIL_CC_INVENTORY=linux \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$work_dir/cc-inventory-failure-evidence"
+test ! -e "$tart_state/cc-inventory-continued" ||
+    fail "failed compiler inventory continued into acceptance bootstrap"
+test "$run_status" -ne 0 || fail "failed compiler inventory was hidden"
+assert_line \
+    "$work_dir/cc-inventory-failure-evidence/linux/tool-inventory.txt" \
+    "cc execution failed"
+if grep -E '^ssh .*admin@192\.0\.2\.20 .*acceptance\.sh.* pre-reboot$' \
+    "$call_log" >/dev/null; then
+    fail "Linux acceptance ran after compiler inventory failed"
+fi
 
 # A failed pre-reboot copy blocks that VM's reboot; a transient disconnect
 # without a changed boot identity is likewise insufficient.
@@ -777,7 +897,19 @@ case "$command" in
         printf '0.4.0\n'
         ;;
     health)
-        printf 'Health\n\nCleanup authority\n  Config source: fixture\n'
+        printf 'OK\n\nCleanup authority\n  Config source: fixture\n'
+        if test "${FAKE_HEALTH_MODE-}" != missing-generation; then
+            printf '  Generation state: missing\n'
+            printf '  Current generation: <none>\n'
+        fi
+        printf 'Outcome: incomplete (code=2)\n'
+        case "${FAKE_HEALTH_MODE-}" in
+            extra-reason)
+                printf 'Reasons: generation_missing, scan_incomplete, unexpected_reason\n'
+                ;;
+            *) printf 'Reasons: generation_missing, scan_incomplete\n' ;;
+        esac
+        exit 2
         ;;
     service)
         action=$1
@@ -1078,6 +1210,52 @@ for phase in pre-reboot post-reboot; do
         fail "guest acceptance $phase fixture failed with exit $run_status"
     fi
 done
+assert_line "$acceptance_evidence/pre-reboot-transcript.log" \
+    "Outcome: incomplete (code=2)"
+assert_line "$acceptance_evidence/pre-reboot-transcript.log" \
+    "Reasons: generation_missing, scan_incomplete"
+
+# A fresh health result is incomplete for one precise reason set. Accepting a
+# generic exit 2 without the missing-generation authority state would let the
+# rehearsal pass against an unrelated incomplete condition.
+missing_generation_evidence=$work_dir/missing-generation-evidence
+printf 'no no no\n' > "$fake_service_state"
+rm -f "$fake_cached_root" "$fake_review_path"
+run_capture env PATH="$fake_acceptance:/usr/bin:/bin" HOME="$fake_guest_home" \
+    CALL_LOG="$call_log" FAKE_CURRENT_CGC="$fake_current_cgc" \
+    FAKE_SERVICE_STATE="$fake_service_state" \
+    FAKE_REVIEW_PATH="$fake_review_path" FAKE_CACHED_ROOT="$fake_cached_root" \
+    FAKE_ERROR="$fake_error" \
+    FAKE_ACCEPTANCE_ARTIFACTS="$fake_artifacts" \
+    FAKE_HEALTH_MODE=missing-generation \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA=18e2b772698b5f9b67da64c4ad299beacfe219e9 \
+    "$root/scripts/release/acceptance.sh" \
+    "$fake_artifacts" "$missing_generation_evidence" pre-reboot
+test "$run_status" -ne 0 ||
+    fail "guest acceptance accepted health without missing-generation state"
+assert_contains "$missing_generation_evidence/milestones.tsv" \
+    "version-health	FAIL"
+
+extra_reason_evidence=$work_dir/extra-reason-evidence
+printf 'no no no\n' > "$fake_service_state"
+rm -f "$fake_cached_root" "$fake_review_path"
+run_capture env PATH="$fake_acceptance:/usr/bin:/bin" HOME="$fake_guest_home" \
+    CALL_LOG="$call_log" FAKE_CURRENT_CGC="$fake_current_cgc" \
+    FAKE_SERVICE_STATE="$fake_service_state" \
+    FAKE_REVIEW_PATH="$fake_review_path" FAKE_CACHED_ROOT="$fake_cached_root" \
+    FAKE_ERROR="$fake_error" \
+    FAKE_ACCEPTANCE_ARTIFACTS="$fake_artifacts" \
+    FAKE_HEALTH_MODE=extra-reason \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA=18e2b772698b5f9b67da64c4ad299beacfe219e9 \
+    "$root/scripts/release/acceptance.sh" \
+    "$fake_artifacts" "$extra_reason_evidence" pre-reboot
+test "$run_status" -ne 0 ||
+    fail "guest acceptance accepted an extra fresh-health reason"
+assert_contains "$extra_reason_evidence/milestones.tsv" \
+    "version-health	FAIL"
+
 for milestone in \
     shell-install formula-install version-health disposable-build dry-run review \
     no-scan narrowed-scope cargo-failure incomplete-scan complete-scan \

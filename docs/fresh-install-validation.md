@@ -192,7 +192,7 @@ references:
 
 ```sh
 export CAR_GO_CLEAN_TART_MACOS_IMAGE='ghcr.io/cirruslabs/macos-sequoia-base@sha256:<64-lowercase-hex>'
-export CAR_GO_CLEAN_TART_LINUX_IMAGE='ghcr.io/cirruslabs/ubuntu@sha256:<64-lowercase-hex>'
+export CAR_GO_CLEAN_TART_LINUX_IMAGE='ghcr.io/cirruslabs/ubuntu-runner-arm64@sha256:<64-lowercase-hex>'
 export CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0
 export CAR_GO_CLEAN_ACCEPTANCE_SHA="$(git rev-parse HEAD)"
 ```
@@ -211,7 +211,8 @@ Linux must provide Python 3, `cc`, and a working user systemd manager. The
 harness installs the exact Rust/Cargo 1.95.0 minimal profile inside each
 disposable clone and uses an explicit non-login PATH. It does not run
 `apt-get` or `brew install`; a missing base prerequisite fails before guest
-acceptance.
+acceptance. Cirrus's minimal `ubuntu` image does not provide `cc`; the
+`ubuntu-runner-arm64` example above does.
 
 Prepare one closed artifact directory. Excluding `SHA256SUMS`, it must contain
 exactly these 17 regular, non-symlink files at the top level:
