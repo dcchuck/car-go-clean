@@ -45,8 +45,10 @@ assert_not_contains() {
 assert_status() {
     actual=$1
     expected=$2
-    test "$actual" -eq "$expected" ||
-        fail "expected exit $expected, got $actual (output: $output_file)"
+    if test "$actual" -ne "$expected"; then
+        sed -n '1,160p' "$output_file" >&2
+        fail "expected exit $expected, got $actual"
+    fi
 }
 
 run_capture() {
@@ -89,11 +91,31 @@ for path in sorted(root.glob("*.vm")):
 print(json.dumps(items))
 PY
         ;;
+    get)
+        name=$2
+        test "$3" = --format
+        test "$4" = json
+        test -e "$TART_STATE/$name.vm"
+        state=$(awk -F '	' '{ print $2 }' "$TART_STATE/$name.vm")
+        running=false
+        test "$state" != running || running=true
+        printf '{"Running":%s,"State":"%s"}\n' "$running" "$state"
+        ;;
     pull)
         ;;
     clone)
         source_ref=$2
         name=$3
+        if test "${REJECT_CONCURRENT_CLONE-}" = 1; then
+            for vm_state in "$TART_STATE"/*.vm; do
+                test -e "$vm_state" || continue
+                state=$(awk -F '	' '{ print $2 }' "$vm_state")
+                if test "$state" = running; then
+                    echo "refusing clone while another VM is running" >&2
+                    exit 68
+                fi
+            done
+        fi
         test ! -e "$TART_STATE/$name.vm"
         printf '%s\tstopped\n' "$name" > "$TART_STATE/$name.vm"
         printf '%s\n' "$source_ref" > "$TART_STATE/$name.source"
@@ -101,6 +123,15 @@ PY
     run)
         name=$2
         printf '%s\trunning\n' "$name" > "$TART_STATE/$name.vm"
+        if test "${BLOCK_TART_RUN-}" = 1; then
+            printf '%s\n' "$$" > "$TART_STATE/$name.runner"
+            printf '%s\n' "$PPID" > "$TART_STATE/supervisor.pid"
+            : > "$TART_STATE/runner-started"
+            trap 'exit 0' HUP INT TERM
+            while :; do
+                sleep 1
+            done
+        fi
         ;;
     ip)
         case "$2" in
@@ -111,8 +142,31 @@ PY
         ;;
     stop)
         name=$2
+        if test -n "${HOLD_TART_STOP_MATCH-}"; then
+            case "$name" in
+            *"$HOLD_TART_STOP_MATCH"*)
+                : > "$TART_STATE/stop-started"
+                sleep 2
+                ;;
+            esac
+        fi
+        if test -n "${FAIL_TART_STOP_MATCH-}"; then
+            case "$name" in
+            *"$FAIL_TART_STOP_MATCH"*)
+                if test -n "${LIFECYCLE_EVIDENCE_ROOT-}"; then
+                    chmod 500 "$LIFECYCLE_EVIDENCE_ROOT/macos"
+                fi
+                echo "injected Tart stop failure for $name" >&2
+                exit 70
+                ;;
+            esac
+        fi
         if test -e "$TART_STATE/$name.vm"; then
             printf '%s\tstopped\n' "$name" > "$TART_STATE/$name.vm"
+        fi
+        if test -e "$TART_STATE/$name.runner"; then
+            runner_pid=$(cat "$TART_STATE/$name.runner")
+            kill -TERM "$runner_pid" 2>/dev/null || :
         fi
         ;;
     delete)
@@ -131,10 +185,8 @@ EOF
 
 cat > "$fake_bin/sshpass" <<'EOF'
 #!/bin/sh
-set -eu
-test "$1" = -p
-shift 2
-exec "$@"
+echo "sshpass must not be used" >&2
+exit 99
 EOF
 
 cat > "$fake_bin/ssh" <<'EOF'
@@ -149,6 +201,7 @@ host=
 command=
 preferred_password=false
 public_key_disabled=false
+askpass_ready=false
 for argument do
     case "$argument" in
         admin@*) host=$argument ;;
@@ -157,13 +210,79 @@ for argument do
         *) command=$argument ;;
     esac
 done
+if test "${SSH_ASKPASS_REQUIRE-}" = force &&
+    test -x "${SSH_ASKPASS-}" &&
+    test "${CAR_GO_CLEAN_TART_ASKPASS_PASSWORD+set}" = set; then
+    if askpass_value=$("$SSH_ASKPASS") &&
+        test "$askpass_value" = "$CAR_GO_CLEAN_TART_ASKPASS_PASSWORD"; then
+        askpass_ready=true
+    fi
+fi
 if test "${REQUIRE_PASSWORD_ONLY-}" = 1 &&
     { test "$preferred_password" != true ||
-      test "$public_key_disabled" != true; }; then
+      test "$public_key_disabled" != true ||
+      test "$askpass_ready" != true; }; then
     echo "Too many authentication failures" >&2
     exit 67
 fi
+phase=
 case "$command" in
+    *"phase='pre-reboot'"*) phase=pre-reboot ;;
+    *"phase='post-reboot'"*) phase=post-reboot ;;
+esac
+case "$command" in
+    *'tar -xf - -C '*)
+        case "$host" in
+            admin@192.0.2.10) upload_platform=macos ;;
+            admin@192.0.2.20) upload_platform=linux ;;
+            *) exit 65 ;;
+        esac
+        upload_archive=$TART_STATE/upload-$upload_platform.tar
+        upload_root=$TART_STATE/upload-$upload_platform
+        cat > "$upload_archive"
+        rm -rf "$upload_root"
+        mkdir -p "$upload_root"
+        /usr/bin/tar -C "$upload_root" -xf "$upload_archive"
+        set -- "$upload_root"/*
+        if test "$#" -ne 18; then
+            echo "uploaded artifact count was $#, expected 18" >&2
+            exit 66
+        fi
+        for upload_entry do
+            if test ! -f "$upload_entry" || test -L "$upload_entry"; then
+                echo "uploaded artifact is not a regular file: $upload_entry" >&2
+                exit 66
+            fi
+        done
+        if ! (CDPATH='' cd "$upload_root" &&
+            shasum -a 256 -c SHA256SUMS >/dev/null); then
+            echo "uploaded artifact hashes did not verify" >&2
+            exit 66
+        fi
+        : > "$TART_STATE/upload-verified-$upload_platform"
+        rm -f "$upload_archive"
+        ;;
+    *'tar -cf - .'*)
+        case "$host:$phase:${FAIL_PRE_COPY_HOST-}" in
+            admin@192.0.2.10:pre-reboot:macos) exit 31 ;;
+            admin@192.0.2.20:pre-reboot:linux) exit 31 ;;
+        esac
+        if test "${HOLD_EVIDENCE_DOWNLOAD-}" = 1; then
+            printf '%s\n' "$$" > "$TART_STATE/ssh-child.pid"
+            : > "$TART_STATE/evidence-download-started"
+            printf 'partial archive'
+            while :; do
+                sleep 1
+            done
+        fi
+        phase_fixture=$TART_STATE/phase-evidence-$$
+        rm -rf "$phase_fixture"
+        mkdir -p "$phase_fixture"
+        printf 'sanitized %s fixture evidence\n' "$phase" \
+            > "$phase_fixture/$phase-transcript.log"
+        /usr/bin/tar -C "$phase_fixture" -cf - .
+        rm -rf "$phase_fixture"
+        ;;
     'printf ready')
         if test -e "$TART_STATE/rebooting"; then
             rm -f "$TART_STATE/rebooting"
@@ -262,46 +381,8 @@ EOF
 
 cat > "$fake_bin/scp" <<'EOF'
 #!/bin/sh
-set -eu
-{
-    printf 'scp'
-    printf ' %s' "$@"
-    printf '\n'
-} >> "$CALL_LOG"
-preferred_password=false
-public_key_disabled=false
-for argument do
-    case "$argument" in
-        PreferredAuthentications=password) preferred_password=true ;;
-        PubkeyAuthentication=no) public_key_disabled=true ;;
-    esac
-    destination=$argument
-done
-if test "${REQUIRE_PASSWORD_ONLY-}" = 1 &&
-    { test "$preferred_password" != true ||
-      test "$public_key_disabled" != true; }; then
-    echo "Too many authentication failures" >&2
-    exit 67
-fi
-case "$*: ${FAIL_PRE_COPY_HOST-}" in
-    *admin@192.0.2.10:*evidence*pre-reboot*:*macos) exit 31 ;;
-    *admin@192.0.2.20:*evidence*pre-reboot*:*linux) exit 31 ;;
-esac
-case "$*" in
-    *admin@*:*evidence*/*)
-        mkdir -p "$destination"
-        case "$destination" in
-            */pre-reboot)
-                printf 'sanitized pre-reboot fixture evidence\n' \
-                    > "$destination/pre-reboot-transcript.log"
-                ;;
-            */post-reboot)
-                printf 'sanitized post-reboot fixture evidence\n' \
-                    > "$destination/post-reboot-transcript.log"
-                ;;
-        esac
-        ;;
-esac
+echo "scp must not be used" >&2
+exit 99
 EOF
 
 cat > "$fake_bin/git" <<'EOF'
@@ -644,12 +725,14 @@ assert_contains "$output_file" "release checkout is dirty"
 assert_not_contains "$call_log" "tart pull"
 
 # Password-only base images must not consume the guest's authentication budget
-# on host SSH identities before sshpass can present the documented password.
+# on host SSH identities before the supervised askpass helper responds.
 : > "$call_log"
 rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+rm -f "$tart_state"/upload-verified-*
 password_only_evidence=$work_dir/password-only-evidence
 run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
-    TART_STATE="$tart_state" REQUIRE_PASSWORD_ONLY=1 FAIL_ACCEPTANCE_HOST= \
+    TART_STATE="$tart_state" REQUIRE_PASSWORD_ONLY=1 \
+    REJECT_CONCURRENT_CLONE=1 FAIL_ACCEPTANCE_HOST= \
     CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
     CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
     CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
@@ -659,10 +742,191 @@ run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
 assert_status "$run_status" 0
 assert_contains "$call_log" "PreferredAuthentications=password"
 assert_contains "$call_log" "PubkeyAuthentication=no"
+assert_contains "$call_log" "-F /dev/null -T"
+assert_contains "$call_log" "ControlMaster=no"
+assert_contains "$call_log" "RequestTTY=no"
+assert_contains "$call_log" "BatchMode=no"
+assert_contains "$call_log" "PasswordAuthentication=yes"
+assert_contains "$call_log" "ForwardX11=no"
+assert_contains "$call_log" "ClearAllForwardings=yes"
+test -f "$tart_state/upload-verified-macos"
+test -f "$tart_state/upload-verified-linux"
+
+# A lifecycle failure is not an ordinary platform assertion failure: the next
+# clone must never start while the previous VM's running state is unknown.
+: > "$call_log"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" FAIL_TART_STOP_MATCH=macos \
+    REJECT_CONCURRENT_CLONE=1 FAIL_ACCEPTANCE_HOST= \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$work_dir/stop-failure-evidence"
+test "$run_status" -ne 0 || fail "Tart stop failure was hidden"
+assert_contains "$output_file" "could not stop preserved VM"
+assert_not_contains "$call_log" "tart clone $linux_ref"
+for vm_state in "$tart_state"/car-go-clean-v040-*.vm; do
+    test -e "$vm_state" || continue
+    vm_name=$(awk -F '	' '{ print $1 }' "$vm_state")
+    printf '%s\tstopped\n' "$vm_name" > "$vm_state"
+done
+
+# A signal delivered to the harness PID must stop the preserved VM and reap the
+# blocking Tart launcher before the supervisor returns.
+: > "$call_log"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting" \
+    "$tart_state/runner-started" "$tart_state/evidence-download-started" \
+    "$tart_state/ssh-child.pid" "$tart_state"/*.runner
+signal_evidence=$work_dir/signal-evidence
+signal_output=$work_dir/signal-output
+env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" BLOCK_TART_RUN=1 HOLD_EVIDENCE_DOWNLOAD=1 \
+    FAIL_ACCEPTANCE_HOST= \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$signal_evidence" \
+    > "$signal_output" 2>&1 &
+signal_harness_pid=$!
+signal_attempts=0
+while { test ! -e "$tart_state/runner-started" ||
+        test ! -e "$tart_state/evidence-download-started"; } &&
+    test "$signal_attempts" -lt 50; do
+    sleep 1
+    signal_attempts=$((signal_attempts + 1))
+done
+test -e "$tart_state/runner-started" &&
+    test -e "$tart_state/evidence-download-started" ||
+    fail "signal fixture did not reach the active VM boundary"
+signal_supervisor_pid=$(cat "$tart_state/supervisor.pid")
+test "$signal_supervisor_pid" -eq "$signal_harness_pid" ||
+    fail "Tart launcher is not owned by the harness supervisor"
+signal_runner_pid=$(cat "$tart_state"/car-go-clean-v040-macos-*.runner)
+signal_ssh_pid=$(cat "$tart_state/ssh-child.pid")
+kill -TERM "$signal_harness_pid"
+signal_attempts=0
+while kill -0 "$signal_harness_pid" 2>/dev/null &&
+    test "$signal_attempts" -lt 10; do
+    sleep 1
+    signal_attempts=$((signal_attempts + 1))
+done
+if kill -0 "$signal_harness_pid" 2>/dev/null; then
+    kill -KILL "$signal_harness_pid" 2>/dev/null || :
+    kill -KILL "$signal_runner_pid" 2>/dev/null || :
+    kill -KILL "$signal_ssh_pid" 2>/dev/null || :
+    set +e
+    wait "$signal_harness_pid"
+    set -e
+    fail "TERM did not complete within 10 seconds"
+fi
+set +e
+wait "$signal_harness_pid"
+signal_status=$?
+set -e
+test "$signal_status" -eq 143 ||
+    fail "TERM returned $signal_status instead of 143"
+sleep 1
+signal_cleanup_ok=true
+if kill -0 "$signal_runner_pid" 2>/dev/null; then
+    signal_cleanup_ok=false
+fi
+if kill -0 "$signal_ssh_pid" 2>/dev/null; then
+    signal_cleanup_ok=false
+fi
+for vm_state in "$tart_state"/car-go-clean-v040-macos-*.vm; do
+    test -e "$vm_state" || continue
+    state=$(awk -F '	' '{ print $2 }' "$vm_state")
+    test "$state" = stopped || signal_cleanup_ok=false
+done
+if test "$signal_cleanup_ok" != true; then
+    sleep 1
+    fail "TERM returned before the Tart launcher and VM were stopped"
+fi
+test ! -e "$signal_evidence/.ssh-askpass"
+test ! -e "$signal_evidence/.artifacts-transfer.tar"
+test ! -e "$signal_evidence/macos/pre-reboot/guest-evidence.tar"
+
+# A signal received while Tart stop is already in progress must not interrupt
+# cleanup or allow the next platform to start.
+: > "$call_log"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting" \
+    "$tart_state/runner-started" "$tart_state/stop-started" \
+    "$tart_state"/*.runner
+cleanup_signal_evidence=$work_dir/cleanup-signal-evidence
+cleanup_signal_output=$work_dir/cleanup-signal-output
+env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" BLOCK_TART_RUN=1 \
+    HOLD_TART_STOP_MATCH=macos FAIL_ACCEPTANCE_HOST= \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$cleanup_signal_evidence" \
+    > "$cleanup_signal_output" 2>&1 &
+cleanup_signal_pid=$!
+cleanup_signal_attempts=0
+while test ! -e "$tart_state/stop-started" &&
+    test "$cleanup_signal_attempts" -lt 50; do
+    sleep 1
+    cleanup_signal_attempts=$((cleanup_signal_attempts + 1))
+done
+test -e "$tart_state/stop-started" ||
+    fail "cleanup signal fixture did not enter Tart stop"
+cleanup_runner_pid=$(cat "$tart_state"/car-go-clean-v040-macos-*.runner)
+kill -TERM "$cleanup_signal_pid"
+set +e
+wait "$cleanup_signal_pid"
+cleanup_signal_status=$?
+set -e
+test "$cleanup_signal_status" -eq 143 ||
+    fail "TERM during cleanup returned $cleanup_signal_status instead of 143"
+if kill -0 "$cleanup_runner_pid" 2>/dev/null; then
+    kill -KILL "$cleanup_runner_pid" 2>/dev/null || :
+    fail "TERM during cleanup left the Tart launcher running"
+fi
+for vm_state in "$tart_state"/car-go-clean-v040-macos-*.vm; do
+    test -e "$vm_state" || continue
+    state=$(awk -F '	' '{ print $2 }' "$vm_state")
+    test "$state" = stopped ||
+        fail "TERM during cleanup left the macOS VM running"
+done
+assert_not_contains "$call_log" "tart clone $linux_ref"
+
+# Failure to persist the lifecycle marker cannot downgrade cleanup uncertainty
+# into an ordinary platform failure or allow the next clone to start.
+: > "$call_log"
+rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+marker_failure_evidence=$work_dir/marker-failure-evidence
+run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
+    TART_STATE="$tart_state" FAIL_TART_STOP_MATCH=macos \
+    LIFECYCLE_EVIDENCE_ROOT="$marker_failure_evidence" \
+    REJECT_CONCURRENT_CLONE=1 FAIL_ACCEPTANCE_HOST= \
+    CAR_GO_CLEAN_TART_MACOS_IMAGE="$mac_ref" \
+    CAR_GO_CLEAN_TART_LINUX_IMAGE="$linux_ref" \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA="$FAKE_EXACT_SHA" \
+    "$root/scripts/release/tart-rehearsal.sh" \
+    "$artifacts" "$aggregate" "$marker_failure_evidence"
+chmod 700 "$marker_failure_evidence/macos" 2>/dev/null || :
+test "$run_status" -eq 97 ||
+    fail "marker-write failure returned $run_status instead of lifecycle exit 97"
+assert_not_contains "$call_log" "tart clone $linux_ref"
+for vm_state in "$tart_state"/car-go-clean-v040-*.vm; do
+    test -e "$vm_state" || continue
+    vm_name=$(awk -F '	' '{ print $1 }' "$vm_state")
+    printf '%s\tstopped\n' "$vm_name" > "$vm_state"
+done
 
 : > "$call_log"
 rm -rf "$evidence"
 rm -f "$tart_state"/rebooted-* "$tart_state/rebooting"
+rm -f "$tart_state"/upload-verified-*
 FAIL_ACCEPTANCE_HOST=linux
 export FAIL_ACCEPTANCE_HOST
 run_capture env PATH="$fake_bin:/usr/bin:/bin" CALL_LOG="$call_log" \
@@ -681,7 +945,10 @@ assert_contains "$call_log" "acceptance.sh"
 assert_contains "$call_log" "pre-reboot"
 assert_contains "$call_log" "sudo reboot"
 assert_contains "$call_log" "post-reboot"
-assert_contains "$call_log" "scp"
+assert_contains "$call_log" "tar -cf - ."
+assert_not_contains "$call_log" "scp"
+test -f "$tart_state/upload-verified-macos"
+test -f "$tart_state/upload-verified-linux"
 test -f "$evidence/macos/pre-reboot/pre-reboot-transcript.log"
 test -f "$evidence/macos/post-reboot/post-reboot-transcript.log"
 test -f "$evidence/linux/pre-reboot/pre-reboot-transcript.log"
@@ -708,7 +975,7 @@ assert_not_contains "$evidence/macos/tool-inventory.txt" "/home/admin"
 assert_not_contains "$evidence/linux/tool-inventory.txt" "/home/admin"
 assert_contains "$call_log" "--default-toolchain 1.95.0 --profile minimal --no-modify-path"
 assert_contains "$call_log" "PATH='/home/admin/.cargo/bin:"
-pre_copy_line=$(grep -n 'scp .*macos/pre-reboot' "$call_log" |
+pre_copy_line=$(grep -nF "admin@192.0.2.10 phase='pre-reboot';" "$call_log" |
     head -n 1 | cut -d : -f 1)
 mac_reboot_line=$(grep -n 'ssh .*admin@192.0.2.10 sudo reboot' "$call_log" |
     head -n 1 | cut -d : -f 1)

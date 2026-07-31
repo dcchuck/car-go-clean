@@ -71,10 +71,9 @@ test "${#exact_sha}" -eq 40 ||
     die "CAR_GO_CLEAN_ACCEPTANCE_SHA must be an exact 40-character Git commit"
 
 command -v tart >/dev/null 2>&1 || die "tart is not available"
-command -v sshpass >/dev/null 2>&1 || die "sshpass is required for the documented admin/admin Tart images"
 command -v ssh >/dev/null 2>&1 || die "ssh is not available"
-command -v scp >/dev/null 2>&1 || die "scp is not available"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v tar >/dev/null 2>&1 || die "tar is required"
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
@@ -334,18 +333,277 @@ chmod 600 "$source_map"
 
 ssh_password=${CAR_GO_CLEAN_TART_SSH_PASSWORD:-admin}
 ssh_user=${CAR_GO_CLEAN_TART_SSH_USER:-admin}
-ssh_options="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+ssh_options="-F /dev/null -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o RequestTTY=no -o BatchMode=no -o PreferredAuthentications=password -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no -o PubkeyAuthentication=no -o ForwardX11=no -o ForwardAgent=no -o ClearAllForwardings=yes -o NumberOfPasswordPrompts=1"
+askpass_script=$evidence_dir/.ssh-askpass
+transfer_archive=$evidence_dir/.artifacts-transfer.tar
+active_phase_archive=
+
+active_command_pid=
+active_command_launching=false
+active_command_previous_pid=
+active_vm_name=
+active_vm_evidence=
+active_vm_run_pid=
+active_vm_run_launching=false
+active_vm_run_previous_pid=
+cleanup_in_progress=false
+signal_handling=false
+pending_signal_status=0
+lifecycle_failure=0
+session_exec_code='import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])'
+
+# Keep $! initialized under `set -u`, then distinguish a pre-launch signal
+# from one delivered after a new asynchronous process actually exists.
+: &
+last_launched_pid=$!
+wait "$last_launched_pid"
+
+run_interruptible() {
+    active_command_pid=
+    active_command_previous_pid=$last_launched_pid
+    active_command_launching=true
+    python3 -c "$session_exec_code" "$@" &
+    active_command_pid=$!
+    last_launched_pid=$active_command_pid
+    active_command_launching=false
+    if wait "$active_command_pid"; then
+        interruptible_status=0
+    else
+        interruptible_status=$?
+    fi
+    active_command_pid=
+    return "$interruptible_status"
+}
+
+run_interruptible_input() {
+    command_input=$1
+    shift
+    active_command_pid=
+    active_command_previous_pid=$last_launched_pid
+    active_command_launching=true
+    python3 -c "$session_exec_code" "$@" < "$command_input" &
+    active_command_pid=$!
+    last_launched_pid=$active_command_pid
+    active_command_launching=false
+    if wait "$active_command_pid"; then
+        interruptible_status=0
+    else
+        interruptible_status=$?
+    fi
+    active_command_pid=
+    return "$interruptible_status"
+}
 
 ssh_guest() {
     guest_host=$1
     shift
     # shellcheck disable=SC2086 # The fixed option string must become separate ssh arguments.
-    sshpass -p "$ssh_password" ssh $ssh_options "$ssh_user@$guest_host" "$@"
+    if CAR_GO_CLEAN_TART_ASKPASS_PASSWORD=$ssh_password \
+        SSH_ASKPASS=$askpass_script SSH_ASKPASS_REQUIRE=force \
+        DISPLAY=car-go-clean-tart:0 \
+        run_interruptible ssh $ssh_options "$ssh_user@$guest_host" "$@"; then
+        ssh_status=0
+    else
+        ssh_status=$?
+    fi
+    unset CAR_GO_CLEAN_TART_ASKPASS_PASSWORD SSH_ASKPASS \
+        SSH_ASKPASS_REQUIRE DISPLAY
+    return "$ssh_status"
 }
 
-scp_guest() {
-    # shellcheck disable=SC2086 # The fixed option string must become separate scp arguments.
-    sshpass -p "$ssh_password" scp $ssh_options "$@"
+ssh_guest_input() {
+    guest_host=$1
+    command_input=$2
+    shift 2
+    # shellcheck disable=SC2086 # The fixed option string must become separate ssh arguments.
+    if CAR_GO_CLEAN_TART_ASKPASS_PASSWORD=$ssh_password \
+        SSH_ASKPASS=$askpass_script SSH_ASKPASS_REQUIRE=force \
+        DISPLAY=car-go-clean-tart:0 \
+        run_interruptible_input "$command_input" \
+            ssh $ssh_options "$ssh_user@$guest_host" "$@"; then
+        ssh_status=0
+    else
+        ssh_status=$?
+    fi
+    unset CAR_GO_CLEAN_TART_ASKPASS_PASSWORD SSH_ASKPASS \
+        SSH_ASKPASS_REQUIRE DISPLAY
+    return "$ssh_status"
+}
+
+terminate_tracked_group() {
+    tree_pid=$1
+    tree_signal=$2
+    if kill -0 "-$tree_pid" 2>/dev/null; then
+        kill -"$tree_signal" "-$tree_pid" 2>/dev/null || :
+    elif kill -0 "$tree_pid" 2>/dev/null; then
+        # The launcher may race from pre-setsid into its new group after this
+        # probe, so direct-PID termination is followed by unconditional PGID
+        # termination and verification below.
+        kill -"$tree_signal" "$tree_pid" 2>/dev/null || :
+    fi
+    kill -KILL "-$tree_pid" 2>/dev/null || :
+    kill -KILL "$tree_pid" 2>/dev/null || :
+    wait "$tree_pid" 2>/dev/null || :
+
+    tree_attempts=0
+    while kill -0 "-$tree_pid" 2>/dev/null &&
+        test "$tree_attempts" -lt 5; do
+        kill -KILL "-$tree_pid" 2>/dev/null || :
+        sleep 1
+        tree_attempts=$((tree_attempts + 1))
+    done
+    ! kill -0 "-$tree_pid" 2>/dev/null
+}
+
+terminate_active_command() {
+    command_signal=$1
+    command_pid=$active_command_pid
+    if test -z "$command_pid" &&
+        test "$active_command_launching" = true; then
+        launch_candidate=$!
+        if test "$launch_candidate" != "$active_command_previous_pid"; then
+            command_pid=$launch_candidate
+        fi
+    fi
+    test -n "$command_pid" || return 0
+    if ! terminate_tracked_group "$command_pid" "$command_signal"; then
+        echo "could not terminate active command process group $command_pid" >&2
+        lifecycle_failure=1
+    fi
+    active_command_pid=
+    active_command_launching=false
+}
+
+reap_active_vm_runner() {
+    runner_pid=$active_vm_run_pid
+    if test -z "$runner_pid" &&
+        test "$active_vm_run_launching" = true; then
+        runner_candidate=$!
+        if test "$runner_candidate" != "$active_vm_run_previous_pid"; then
+            runner_pid=$runner_candidate
+        fi
+    fi
+    test -n "$runner_pid" || return 0
+    if ! terminate_tracked_group "$runner_pid" TERM; then
+        echo "could not terminate Tart runner process group $runner_pid" >&2
+        lifecycle_failure=1
+    fi
+    active_vm_run_pid=
+    active_vm_run_launching=false
+}
+
+cleanup_active_vm() {
+    test -n "$active_vm_name" || return 0
+    cleanup_in_progress=true
+    cleanup_name=$active_vm_name
+    cleanup_evidence=$active_vm_evidence
+    cleanup_status=0
+
+    if ! tart stop "$cleanup_name" \
+        > "$cleanup_evidence/vm-stop.log" 2>&1; then
+        echo "could not stop preserved VM $cleanup_name" >&2
+        cleanup_status=1
+    fi
+    reap_active_vm_runner
+    if ! tart get "$cleanup_name" --format json \
+        > "$cleanup_evidence/vm-state-after-stop.json" 2>&1 ||
+        ! python3 -c '
+import json
+import sys
+
+state = json.load(sys.stdin)
+if state.get("Running") is not False or state.get("State") != "stopped":
+    raise SystemExit(1)
+' < "$cleanup_evidence/vm-state-after-stop.json"; then
+        echo "preserved VM $cleanup_name is not verifiably stopped" >&2
+        cleanup_status=1
+    fi
+
+    if test "$cleanup_status" -ne 0; then
+        lifecycle_failure=1
+        if ! printf 'lifecycle cleanup failed for %s\n' "$cleanup_name" \
+            > "$cleanup_evidence/lifecycle-failure.txt"; then
+            echo "could not persist lifecycle failure marker for $cleanup_name" >&2
+        fi
+    fi
+
+    active_vm_name=
+    active_vm_evidence=
+    active_vm_run_pid=
+    active_vm_run_launching=false
+    cleanup_in_progress=false
+}
+
+handle_signal() {
+    signal=$1
+    signal_status=$2
+    if test "$pending_signal_status" -eq 0; then
+        pending_signal_status=$signal_status
+    fi
+    if test "$signal_handling" = true ||
+        test "$cleanup_in_progress" = true; then
+        return 0
+    fi
+
+    signal_handling=true
+    terminate_active_command "$signal"
+    cleanup_active_vm
+    signal_handling=false
+    if test "$lifecycle_failure" -ne 0; then
+        exit 97
+    fi
+    exit "$pending_signal_status"
+}
+
+finish_on_exit() {
+    original_status=$?
+    trap - 0
+    terminate_active_command TERM
+    cleanup_active_vm
+    if ! rm -f "$askpass_script" "$transfer_archive" \
+        ${active_phase_archive:+"$active_phase_archive"}; then
+        echo "could not remove temporary SSH transport files" >&2
+        test "$original_status" -ne 0 || original_status=1
+    fi
+    if test "$lifecycle_failure" -ne 0; then
+        exit 97
+    fi
+    if test "$pending_signal_status" -ne 0; then
+        exit "$pending_signal_status"
+    fi
+    exit "$original_status"
+}
+
+trap finish_on_exit 0
+trap 'handle_signal HUP 129' HUP
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+
+{
+    printf '%s\n' '#!/bin/sh'
+    # shellcheck disable=SC2016 # The generated helper expands this at runtime.
+    printf '%s\n' 'printf "%s\n" "$CAR_GO_CLEAN_TART_ASKPASS_PASSWORD"'
+} > "$askpass_script"
+chmod 700 "$askpass_script"
+
+read_single_line() {
+    line_file=$1
+    output_line=
+    exec 3< "$line_file" || return 1
+    if IFS= read -r output_line <&3; then
+        :
+    elif test -n "$output_line"; then
+        :
+    else
+        exec 3<&-
+        return 1
+    fi
+    extra_line=
+    if IFS= read -r extra_line <&3 || test -n "$extra_line"; then
+        exec 3<&-
+        return 1
+    fi
+    exec 3<&-
 }
 
 vm_fault_checkpoint() {
@@ -359,16 +617,26 @@ vm_fault_checkpoint() {
 
 wait_for_ssh() {
     vm_name=$1
+    ip_output=$active_vm_evidence/tart-ip.txt
+    resolved_guest_ip=
     attempts=0
     while test "$attempts" -lt 60; do
-        guest_ip=$(tart ip "$vm_name" --wait 5 2>/dev/null || :)
-        if test -n "$guest_ip" &&
-            ssh_guest "$guest_ip" "printf ready" >/dev/null 2>&1; then
-            printf '%s\n' "$guest_ip"
+        : > "$ip_output"
+        if run_interruptible tart ip "$vm_name" --wait 5 \
+            > "$ip_output" 2>/dev/null &&
+            read_single_line "$ip_output"; then
+            guest_ip_candidate=$output_line
+        else
+            guest_ip_candidate=
+        fi
+        if test -n "$guest_ip_candidate" &&
+            ssh_guest "$guest_ip_candidate" "printf ready" \
+                >/dev/null 2>&1; then
+            resolved_guest_ip=$guest_ip_candidate
             return 0
         fi
         attempts=$((attempts + 1))
-        sleep 2
+        run_interruptible sleep 2 || return $?
     done
     return 1
 }
@@ -393,31 +661,49 @@ wait_for_reboot() {
 guest_boot_identity() {
     platform=$1
     guest_ip=$2
+    identity_output=$active_vm_evidence/boot-identity.txt
     case "$platform" in
         macos)
-            identity=$(ssh_guest "$guest_ip" \
-                "/usr/sbin/sysctl -n kern.boottime") || return 1
+            ssh_guest "$guest_ip" "/usr/sbin/sysctl -n kern.boottime" \
+                > "$identity_output" || return 1
             ;;
         linux)
-            identity=$(ssh_guest "$guest_ip" \
-                "cat /proc/sys/kernel/random/boot_id") || return 1
+            ssh_guest "$guest_ip" "cat /proc/sys/kernel/random/boot_id" \
+                > "$identity_output" || return 1
             ;;
         *) return 1 ;;
     esac
-    case "$identity" in
+    read_single_line "$identity_output" || return 1
+    resolved_boot_identity=$output_line
+    case "$resolved_boot_identity" in
         ''|*'	'*|*'
 '*) return 1 ;;
     esac
-    printf '%s\n' "$identity"
 }
 
 copy_phase_evidence() {
     guest_ip=$1
     remote_root=$2
     destination=$3
+    phase_name=${destination##*/}
+    phase_archive=$destination/guest-evidence.tar
+    active_phase_archive=$phase_archive
     mkdir "$destination"
     chmod 700 "$destination"
-    scp_guest -r "$ssh_user@$guest_ip:$remote_root/evidence/." "$destination"
+    if ! ssh_guest "$guest_ip" \
+        "phase='$phase_name'; cd '$remote_root/evidence' && tar -cf - ." \
+        > "$phase_archive"; then
+        rm -f "$phase_archive"
+        active_phase_archive=
+        return 1
+    fi
+    if ! run_interruptible tar -C "$destination" -xf "$phase_archive"; then
+        rm -f "$phase_archive"
+        active_phase_archive=
+        return 1
+    fi
+    rm -f "$phase_archive"
+    active_phase_archive=
 }
 
 manifest_hash() {
@@ -428,10 +714,29 @@ manifest_hash() {
     fi
 }
 
+finish_vm_run() {
+    completed_status=$1
+    cleanup_active_vm
+    if test "$lifecycle_failure" -ne 0; then
+        run_vm_result=97
+    elif test "$pending_signal_status" -ne 0; then
+        exit "$pending_signal_status"
+    else
+        run_vm_result=$completed_status
+    fi
+}
+
 run_vm() {
     platform=$1
     image=$2
     digest=$3
+    run_vm_result=1
+    guest_ip=
+    new_guest_ip=
+    pre_boot_identity=
+    post_boot_identity=
+    resolved_guest_ip=
+    resolved_boot_identity=
     case "$platform" in
         macos)
             rustup_target=aarch64-apple-darwin
@@ -465,33 +770,87 @@ run_vm() {
         printf 'vm_name=%s\n' "$vm_name"
     } > "$platform_evidence/host-metadata.txt"
 
-    vm_fault_checkpoint "$platform" early
-    tart pull "$image"
-    tart clone "$image" "$vm_name"
-    printf '%s\t%s\t%s\n' "$vm_name" "$image" "$digest" >> "$source_map"
-    tart run "$vm_name" --no-graphics \
-        > "$platform_evidence/tart-run.log" 2>&1 &
+    if vm_fault_checkpoint "$platform" early; then
+        :
+    else
+        run_vm_result=$?
+        return 0
+    fi
+    if run_interruptible tart pull "$image"; then
+        :
+    else
+        run_vm_result=$?
+        return 0
+    fi
 
-    guest_ip=$(wait_for_ssh "$vm_name") || {
+    # Register the intended VM before clone so an interrupted or ambiguous
+    # clone is treated as lifecycle uncertainty rather than silently orphaned.
+    active_vm_name=$vm_name
+    active_vm_evidence=$platform_evidence
+    if run_interruptible tart clone "$image" "$vm_name"; then
+        :
+    else
+        clone_status=$?
+        finish_vm_run "$clone_status"
+        return 0
+    fi
+    printf '%s\t%s\t%s\n' "$vm_name" "$image" "$digest" >> "$source_map"
+
+    active_vm_run_previous_pid=$last_launched_pid
+    active_vm_run_launching=true
+    python3 -c "$session_exec_code" tart run "$vm_name" --no-graphics \
+        > "$platform_evidence/tart-run.log" 2>&1 &
+    active_vm_run_pid=$!
+    last_launched_pid=$active_vm_run_pid
+    active_vm_run_launching=false
+
+    if wait_for_ssh "$vm_name"; then
+        guest_ip=$resolved_guest_ip
+    else
         echo "VM $vm_name did not become reachable" >&2
-        return 1
-    }
+        finish_vm_run 1
+        return 0
+    fi
+
+    guest_home_output=$platform_evidence/guest-home.txt
     # shellcheck disable=SC2016 # HOME must expand in the guest, not on the host.
-    guest_home=$(ssh_guest "$guest_ip" 'printf %s "$HOME"') || {
+    if ! ssh_guest "$guest_ip" 'printf %s "$HOME"' \
+        > "$guest_home_output"; then
         echo "could not resolve guest HOME for $vm_name" >&2
-        return 1
-    }
+        finish_vm_run 1
+        return 0
+    fi
+    if ! read_single_line "$guest_home_output"; then
+        echo "guest HOME is not a single line for $vm_name" >&2
+        finish_vm_run 1
+        return 0
+    fi
+    guest_home=$output_line
     case "$guest_home" in
         /*[!A-Za-z0-9_./-]*|*/)
             echo "guest HOME contains unsafe remote-shell characters for $vm_name" >&2
-            return 1
+            finish_vm_run 1
+            return 0
             ;;
         /*) ;;
-        *) echo "guest HOME is not absolute for $vm_name" >&2; return 1 ;;
+        *)
+            echo "guest HOME is not absolute for $vm_name" >&2
+            finish_vm_run 1
+            return 0
+            ;;
     esac
     remote_root=$guest_home/car-go-clean-v040-acceptance
-    ssh_guest "$guest_ip" "mkdir -p '$remote_root/evidence'"
-    scp_guest -r "$artifact_dir" "$ssh_user@$guest_ip:$remote_root/artifacts"
+    if ! ssh_guest "$guest_ip" "mkdir -p '$remote_root/evidence'"; then
+        echo "could not create guest evidence root for $vm_name" >&2
+        finish_vm_run 1
+        return 0
+    fi
+    if ! ssh_guest_input "$guest_ip" "$transfer_archive" \
+        "mkdir -p '$remote_root/artifacts' && tar -xf - -C '$remote_root/artifacts'"; then
+        echo "could not copy rehearsal artifacts to $vm_name" >&2
+        finish_vm_run 1
+        return 0
+    fi
 
     verify_command="cd '$remote_root/artifacts' && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi"
     phase_status=0
@@ -535,37 +894,52 @@ run_vm() {
         phase_status=1
     fi
 
-    vm_fault_checkpoint "$platform" middle
+    if vm_fault_checkpoint "$platform" middle; then
+        :
+    else
+        phase_status=$?
+        finish_vm_run "$phase_status"
+        return 0
+    fi
 
     if test "$phase_status" -eq 0; then
-        pre_boot_identity=$(guest_boot_identity "$platform" "$guest_ip") || {
+        if guest_boot_identity "$platform" "$guest_ip"; then
+            pre_boot_identity=$resolved_boot_identity
+        else
             echo "could not capture pre-reboot boot identity for $vm_name" >&2
             phase_status=1
-        }
+        fi
     fi
 
     if test "$phase_status" -eq 0; then
         printf '%s\n' "$pre_boot_identity" \
             > "$platform_evidence/pre-reboot-boot-identity.txt"
-        set +e
-        ssh_guest "$guest_ip" "sudo reboot" \
-            > "$platform_evidence/reboot-ssh.log" 2>&1
-        reboot_status=$?
-        set -e
+        if ssh_guest "$guest_ip" "sudo reboot" \
+            > "$platform_evidence/reboot-ssh.log" 2>&1; then
+            reboot_status=0
+        else
+            reboot_status=$?
+        fi
         case "$reboot_status" in
             0|255) ;;
             *) phase_status=1 ;;
         esac
         if test "$phase_status" -eq 0; then
-            new_guest_ip=$(wait_for_reboot "$vm_name" "$guest_ip") || phase_status=1
+            if wait_for_reboot "$vm_name" "$guest_ip"; then
+                new_guest_ip=$resolved_guest_ip
+            else
+                phase_status=1
+            fi
         fi
     fi
 
     if test "$phase_status" -eq 0; then
-        post_boot_identity=$(guest_boot_identity "$platform" "$new_guest_ip") || {
+        if guest_boot_identity "$platform" "$new_guest_ip"; then
+            post_boot_identity=$resolved_boot_identity
+        else
             echo "could not capture post-reboot boot identity for $vm_name" >&2
             phase_status=1
-        }
+        fi
         if test "$phase_status" -eq 0 &&
             test "$post_boot_identity" = "$pre_boot_identity"; then
             echo "boot identity did not change for $vm_name" >&2
@@ -592,28 +966,37 @@ run_vm() {
         echo "could not copy post-reboot acceptance evidence from $vm_name" >&2
         phase_status=1
     fi
-    vm_fault_checkpoint "$platform" late
-    return "$phase_status"
+    if vm_fault_checkpoint "$platform" late; then
+        :
+    else
+        phase_status=$?
+    fi
+    finish_vm_run "$phase_status"
+    return 0
 }
 
+run_interruptible tar -C "$artifact_dir" -cf "$transfer_archive" . ||
+    die "could not create the closed guest artifact transfer"
+
 overall_status=0
-set +e
-(
-    set -e
-    run_vm macos "$macos_image" "$macos_digest"
-)
-macos_status=$?
-set -e
+run_vm macos "$macos_image" "$macos_digest"
+macos_status=$run_vm_result
+if test "$macos_status" -eq 97 ||
+    test -f "$evidence_dir/macos/lifecycle-failure.txt"; then
+    echo "tart rehearsal: macOS VM lifecycle cleanup failed; refusing to start another VM" >&2
+    exit 97
+fi
 if test "$macos_status" -ne 0; then
     overall_status=1
 fi
-set +e
-(
-    set -e
-    run_vm linux "$linux_image" "$linux_digest"
-)
-linux_status=$?
-set -e
+
+run_vm linux "$linux_image" "$linux_digest"
+linux_status=$run_vm_result
+if test "$linux_status" -eq 97 ||
+    test -f "$evidence_dir/linux/lifecycle-failure.txt"; then
+    echo "tart rehearsal: Linux VM lifecycle cleanup failed" >&2
+    exit 97
+fi
 if test "$linux_status" -ne 0; then
     overall_status=1
 fi
