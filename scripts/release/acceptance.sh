@@ -238,6 +238,7 @@ state_home=$work_root/xdg-state
 config=$config_dir/car-go-clean/config.toml
 state_dir=$state_home/car-go-clean-acceptance
 project_root=$work_root/projects
+original_home=$HOME
 original_path=$PATH
 
 export XDG_CONFIG_HOME="$config_dir"
@@ -555,7 +556,7 @@ if test "\${1-}" = clean; then
     exit 42
 fi
 : > "$delegate_marker"
-exec "$real_cargo" "\$@"
+HOME="$original_home" exec "$real_cargo" "\$@"
 EOF
     chmod +x "$fail_bin/cargo"
     env HOME="$failure_home" PATH="$fail_bin:$original_path" \
@@ -777,7 +778,7 @@ EOF
             test ! -d "$case_dir/project/sample/target"
             case "$old_state" in
                 active) assert_service_state "$case_dir/bin/car-go-clean" yes yes yes ;;
-                stopped) assert_service_state "$case_dir/bin/car-go-clean" yes yes no ;;
+                stopped) assert_service_state "$case_dir/bin/car-go-clean" yes no no ;;
                 absent) assert_service_state "$case_dir/bin/car-go-clean" no no no ;;
             esac
             "$case_dir/bin/car-go-clean" service uninstall >/dev/null 2>&1 || :

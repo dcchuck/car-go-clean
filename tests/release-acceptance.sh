@@ -896,6 +896,12 @@ EOF
 cat > "$fake_acceptance/cargo" <<'EOF'
 #!/bin/sh
 set -eu
+if test -n "${FAKE_CARGO_EXPECT_HOME-}" &&
+    test "$HOME" != "$FAKE_CARGO_EXPECT_HOME"
+then
+    echo "fake cargo received unexpected HOME: $HOME" >&2
+    exit 86
+fi
 printf 'cargo %s\n' "$*" >> "$CALL_LOG"
 case "$1" in
     new)
@@ -1147,6 +1153,11 @@ else
     original=$(cat "$session")
     if test "$original" = yes; then
         printf 'yes yes yes\n' > "$FAKE_SERVICE_STATE"
+    else
+        read -r installed enabled running < "$FAKE_SERVICE_STATE"
+        if test "$installed" = yes; then
+            printf 'yes no no\n' > "$FAKE_SERVICE_STATE"
+        fi
     fi
     case_dir=${CAR_GO_CLEAN_UPGRADE_STATE_DIR%/upgrade-state}
     rm -rf "$case_dir/project/sample/target"
@@ -1301,6 +1312,7 @@ for phase in pre-reboot post-reboot; do
         FAKE_REVIEW_PATH="$fake_review_path" FAKE_CACHED_ROOT="$fake_cached_root" \
         FAKE_ERROR="$fake_error" \
         FAKE_ACCEPTANCE_ARTIFACTS="$fake_artifacts" \
+        FAKE_CARGO_EXPECT_HOME="$fake_guest_home" \
         CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
         CAR_GO_CLEAN_ACCEPTANCE_SHA=18e2b772698b5f9b67da64c4ad299beacfe219e9 \
         "$root/scripts/release/acceptance.sh" \

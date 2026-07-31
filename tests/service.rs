@@ -296,6 +296,76 @@ fn mac_status_models_persistent_enablement_and_process_state_separately() {
 }
 
 #[test]
+fn mac_status_accepts_native_enabled_and_disabled_launchd_tokens() {
+    for (token, expected_enabled) in [("enabled", true), ("disabled", false)] {
+        let work = tempfile::tempdir().unwrap();
+        let plist = work
+            .path()
+            .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, "legacy definition").unwrap();
+        let mut manager = ServiceManager::new(
+            ServicePlatform::MacOs,
+            work.path().to_path_buf(),
+            work.path().join("bin/car-go-clean"),
+            FakeRunner::with_outputs([
+                CommandOutput::new(
+                    true,
+                    format!(
+                        "disabled services = {{\n  \"com.dcchuck.car-go-clean\" => {token}\n}}\n"
+                    ),
+                    String::new(),
+                ),
+                CommandOutput::new(
+                    false,
+                    String::new(),
+                    concat!(
+                        "Bad request.\n",
+                        "Could not find service \"com.dcchuck.car-go-clean\" ",
+                        "in domain for user gui: 501\n"
+                    )
+                    .to_string(),
+                ),
+            ]),
+        );
+
+        assert_eq!(manager.status().unwrap().enabled, expected_enabled);
+    }
+}
+
+#[test]
+fn mac_status_rejects_malformed_exact_label_entries_without_an_arrow() {
+    for line in [
+        "\"com.dcchuck.car-go-clean\" = disabled",
+        "\"com.dcchuck.car-go-clean\" disabled",
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let plist = work
+            .path()
+            .join("Library/LaunchAgents/com.dcchuck.car-go-clean.plist");
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, "legacy definition").unwrap();
+        let mut manager = ServiceManager::new(
+            ServicePlatform::MacOs,
+            work.path().to_path_buf(),
+            work.path().join("bin/car-go-clean"),
+            FakeRunner::with_outputs([CommandOutput::new(
+                true,
+                format!("disabled services = {{\n  {line}\n}}\n"),
+                String::new(),
+            )]),
+        );
+
+        assert!(manager
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("malformed launchctl print-disabled output"));
+        assert_eq!(manager.into_runner().calls.len(), 1);
+    }
+}
+
+#[test]
 fn mac_status_ignores_neighboring_disabled_labels() {
     let work = tempfile::tempdir().unwrap();
     let plist = work

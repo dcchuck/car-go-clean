@@ -1202,13 +1202,16 @@ fn parse_launchd_enabled(output: &str) -> Result<bool> {
     for line in trimmed.lines() {
         let line = line.trim();
         let Some((key, value)) = line.split_once("=>") else {
-            if line == exact_key {
+            if line.starts_with(&exact_key) {
                 bail!("malformed launchctl print-disabled output");
             }
             continue;
         };
-        if key.trim() == exact_key {
+        let key = key.trim();
+        if key == exact_key {
             matching.push(value.trim().trim_end_matches(';'));
+        } else if key.starts_with(&exact_key) {
+            bail!("malformed launchctl print-disabled output");
         }
     }
     if matching.is_empty() {
@@ -1218,8 +1221,8 @@ fn parse_launchd_enabled(output: &str) -> Result<bool> {
         bail!("malformed launchctl print-disabled output");
     }
     match matching[0] {
-        "true" => Ok(false),
-        "false" => Ok(true),
+        "true" | "disabled" => Ok(false),
+        "false" | "enabled" => Ok(true),
         _ => bail!("malformed launchctl print-disabled output"),
     }
 }
@@ -1264,6 +1267,7 @@ fn is_missing_launchd_service(output: &CommandOutput) -> bool {
     [
         "no such process",
         "could not find specified service",
+        "could not find service",
         "service not found",
         "not loaded",
     ]

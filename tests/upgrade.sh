@@ -276,11 +276,25 @@ case "$1" in
         ;;
     print-disabled)
         test "$#" -eq 2
-        if [ -e "$SERVICE_ENABLED" ]; then
-            printf 'disabled services = {\n    "com.dcchuck.car-go-clean" => false\n}\n'
-        else
-            printf 'disabled services = {\n    "com.dcchuck.car-go-clean" => true\n}\n'
+        if [ -n "${LAUNCHD_ENABLEMENT_OUTPUT-}" ]; then
+            printf '%s\n' "$LAUNCHD_ENABLEMENT_OUTPUT"
+            exit 0
         fi
+        if [ -e "$SERVICE_ENABLED" ]; then
+            if [ "${LAUNCHD_NATIVE_ENABLEMENT-0}" = 1 ]; then
+                value=enabled
+            else
+                value=false
+            fi
+        else
+            if [ "${LAUNCHD_NATIVE_ENABLEMENT-0}" = 1 ]; then
+                value=disabled
+            else
+                value=true
+            fi
+        fi
+        printf 'disabled services = {\n    "com.dcchuck.car-go-clean" => %s\n}\n' \
+            "$value"
         ;;
     *)
         exit 64
@@ -931,6 +945,8 @@ EOF
     RESTORE_SIGNAL=0
     RESTORE_SIGNAL_MARKER=$restore_signal_marker
     MANAGER_ACTIVITY_QUERY_ERROR=0
+    LAUNCHD_NATIVE_ENABLEMENT=0
+    LAUNCHD_ENABLEMENT_OUTPUT=
     MANAGER_ACTIVITY_OUTPUT=
     MANAGER_ACTIVITY_STATUS=
     DEFINITION_AUTH_RACE=0
@@ -962,6 +978,8 @@ EOF
     export ROLLBACK_EXPECTED_VERSION
     export RESTORE_SIGNAL RESTORE_SIGNAL_MARKER
     export MANAGER_ACTIVITY_QUERY_ERROR
+    export LAUNCHD_NATIVE_ENABLEMENT
+    export LAUNCHD_ENABLEMENT_OUTPUT
     export MANAGER_ACTIVITY_OUTPUT MANAGER_ACTIVITY_STATUS
     export DEFINITION_AUTH_RACE DEFINITION_AUTH_RACE_MARKER
     export DEFINITION_PREFLIGHT_SWAP DEFINITION_PREFLIGHT_SWAP_MARKER
@@ -2516,6 +2534,93 @@ test "$run_status" -ne 0
 assert_output_has "expected car-go-clean 0.4.0"
 assert_calls_lack "run --review"
 test -f "$state_dir/upgrade-session"
+
+new_case restore-native-launchd-enablement Darwin 0.2.0 running homebrew
+LAUNCHD_NATIVE_ENABLEMENT=1
+export LAUNCHD_NATIVE_ENABLEMENT
+run_upgrade --version 0.4.0 --method homebrew
+assert_status 0
+: > "$call_log"
+run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+assert_status 0
+assert_review_call_count 1
+test "$(cat "$service_state")" = running
+test -e "$service_enabled"
+test ! -e "$state_dir/upgrade-session"
+test ! -e "$service_definition_backup"
+assert_calls_have "launchctl enable"
+
+for malformed_enablement in \
+    enabled-invalid \
+    disabled_unknown \
+    trueish \
+    falsehood
+do
+    new_case "malformed-launchd-$malformed_enablement" Darwin 0.2.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    # shellcheck disable=SC2089 # Opaque fake launchctl output, never evaluated.
+    LAUNCHD_ENABLEMENT_OUTPUT="disabled services = {
+    \"com.dcchuck.car-go-clean\" => $malformed_enablement
+}"
+    # shellcheck disable=SC2090 # Opaque fake launchctl output, never evaluated.
+    export LAUNCHD_ENABLEMENT_OUTPUT
+    : > "$call_log"
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+    test "$run_status" -ne 0
+    assert_output_has "malformed launchctl print-disabled output"
+    test -f "$state_dir/upgrade-session"
+    test "$(session_value phase)" = executed
+done
+
+for malformed_enablement in \
+    missing-arrow \
+    duplicate-conflict \
+    missing-open \
+    missing-close \
+    lone-entry
+do
+    new_case "malformed-launchd-$malformed_enablement" Darwin 0.2.0 running homebrew
+    run_upgrade --version 0.4.0 --method homebrew
+    assert_status 0
+    case "$malformed_enablement" in
+        missing-arrow)
+            # shellcheck disable=SC2089 # Opaque fake launchctl output.
+            LAUNCHD_ENABLEMENT_OUTPUT='disabled services = {
+    "com.dcchuck.car-go-clean" disabled
+}'
+            ;;
+        duplicate-conflict)
+            # shellcheck disable=SC2089 # Opaque fake launchctl output.
+            LAUNCHD_ENABLEMENT_OUTPUT='disabled services = {
+    "com.dcchuck.car-go-clean" => enabled
+    "com.dcchuck.car-go-clean" => disabled
+}'
+            ;;
+        missing-open)
+            # shellcheck disable=SC2089 # Opaque fake launchctl output.
+            LAUNCHD_ENABLEMENT_OUTPUT='"com.dcchuck.car-go-clean" => enabled
+}'
+            ;;
+        missing-close)
+            # shellcheck disable=SC2089 # Opaque fake launchctl output.
+            LAUNCHD_ENABLEMENT_OUTPUT='disabled services = {
+    "com.dcchuck.car-go-clean" => enabled'
+            ;;
+        lone-entry)
+            # shellcheck disable=SC2089 # Opaque fake launchctl output.
+            LAUNCHD_ENABLEMENT_OUTPUT='"com.dcchuck.car-go-clean" => enabled'
+            ;;
+    esac
+    # shellcheck disable=SC2090 # Opaque fake launchctl output, never evaluated.
+    export LAUNCHD_ENABLEMENT_OUTPUT
+    : > "$call_log"
+    run_upgrade --version 0.4.0 --method homebrew --execute-review 42
+    test "$run_status" -ne 0
+    assert_output_has "malformed launchctl print-disabled output"
+    test -f "$state_dir/upgrade-session"
+    test "$(session_value phase)" = executed
+done
 
 new_case restore-failure Darwin 0.2.0 running homebrew
 run_upgrade --version 0.4.0 --method homebrew

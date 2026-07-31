@@ -632,14 +632,72 @@ service_enabled_state() {
             uid=$(id -u) || return 1
             disabled_services=$(launchctl print-disabled "gui/$uid" 2>/dev/null) ||
                 return 1
-            case "$disabled_services" in
-                *'"com.dcchuck.car-go-clean" => true'*)
-                    printf 'disabled\n'
-                    ;;
-                *)
-                    printf 'enabled\n'
-                    ;;
-            esac
+            if ! enabled_state=$(printf '%s\n' "$disabled_services" | awk '
+                function trim(value) {
+                    sub(/^[ \t\r\n]+/, "", value)
+                    sub(/[ \t\r\n]+$/, "", value)
+                    return value
+                }
+                BEGIN {
+                    key = "\"com.dcchuck.car-go-clean\""
+                }
+                {
+                    line = trim($0)
+                    if (line == "") {
+                        next
+                    }
+                    if (!opened) {
+                        opened = 1
+                        if (index(line, "{") != length(line) ||
+                            index(line, "}") != 0) {
+                            invalid = 1
+                        }
+                        next
+                    }
+                    if (closed) {
+                        invalid = 1
+                        next
+                    }
+                    if (line == "}") {
+                        closed = 1
+                        next
+                    }
+                    if (index(line, "{") != 0 || index(line, "}") != 0) {
+                        invalid = 1
+                        next
+                    }
+                    if (index(line, key) != 1) {
+                        next
+                    }
+                    value = trim(substr(line, length(key) + 1))
+                    if (substr(value, 1, 2) != "=>") {
+                        invalid = 1
+                        next
+                    }
+                    value = trim(substr(value, 3))
+                    sub(/;$/, "", value)
+                    value = trim(value)
+                    count++
+                    if (value != "true" && value != "false" &&
+                        value != "enabled" && value != "disabled") {
+                        invalid = 1
+                    }
+                }
+                END {
+                    if (invalid || !opened || !closed || count > 1) {
+                        exit 1
+                    }
+                    if (count == 0 || value == "false" || value == "enabled") {
+                        print "enabled"
+                    } else {
+                        print "disabled"
+                    }
+                }
+            '); then
+                echo "car-go-clean upgrade: malformed launchctl print-disabled output" >&2
+                return 1
+            fi
+            printf '%s\n' "$enabled_state"
             ;;
         Linux)
             if enabled_output=$(systemctl --user is-enabled car-go-clean.service 2>/dev/null); then
