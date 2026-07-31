@@ -2858,9 +2858,31 @@ fn shell_release_assets_are_staged_hashed_attested_and_uploaded_as_one_inventory
         .unwrap();
     }
 
-    let stage_output = Command::new("sh")
+    // Exercise the macOS checksum-tool surface explicitly: the release step
+    // must work when `shasum` is available and GNU `sha256sum` is not.
+    let shasum_only_bin = work.path().join("shasum-only-bin");
+    fs::create_dir_all(&shasum_only_bin).unwrap();
+    let cp = shasum_only_bin.join("cp");
+    fs::write(&cp, "#!/bin/sh\nexec /bin/cp \"$@\"\n").unwrap();
+    fs::set_permissions(&cp, fs::Permissions::from_mode(0o755)).unwrap();
+    let shasum = shasum_only_bin.join("shasum");
+    fs::write(
+        &shasum,
+        "#!/bin/sh\n\
+         test \"$1\" = -a\n\
+         test \"$2\" = 256\n\
+         shift 2\n\
+         for file in \"$@\"; do\n\
+           printf '%064d  %s\\n' 0 \"$file\"\n\
+         done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shasum, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stage_output = Command::new("/bin/sh")
         .args(["-eu", "-c", run_command(stage).unwrap()])
         .current_dir(work.path())
+        .env("PATH", shasum_only_bin)
         .output()
         .unwrap();
     assert!(
