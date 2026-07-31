@@ -189,6 +189,26 @@ echo "sshpass must not be used" >&2
 exit 99
 EOF
 
+cat > "$fake_bin/tar" <<'EOF'
+#!/bin/sh
+set -eu
+no_xattrs=false
+for argument do
+    test "$argument" != --no-xattrs || no_xattrs=true
+done
+case "$*" in
+    *" -cf "*" .")
+        if test "${COPYFILE_DISABLE-}" != 1 ||
+            test "$no_xattrs" != true; then
+            echo "host artifact transfer did not disable macOS metadata" >&2
+            exit 68
+        fi
+        ;;
+    *) ;;
+esac
+exec /usr/bin/tar "$@"
+EOF
+
 cat > "$fake_bin/ssh" <<'EOF'
 #!/bin/sh
 set -eu
@@ -426,8 +446,9 @@ printf '%s\n' "${2-}" >> "${DF_LOG:-/dev/null}"
 exec /bin/df "$@"
 EOF
 
-chmod +x "$fake_bin/tart" "$fake_bin/sshpass" "$fake_bin/ssh" "$fake_bin/scp" \
-    "$fake_bin/git" "$fake_bin/cargo" "$fake_bin/jq" "$fake_bin/df"
+chmod +x "$fake_bin/tart" "$fake_bin/sshpass" "$fake_bin/tar" \
+    "$fake_bin/ssh" "$fake_bin/scp" "$fake_bin/git" "$fake_bin/cargo" \
+    "$fake_bin/jq" "$fake_bin/df"
 
 export CALL_LOG="$call_log"
 export TART_STATE="$tart_state"

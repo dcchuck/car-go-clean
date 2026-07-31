@@ -975,7 +975,8 @@ run_vm() {
     return 0
 }
 
-run_interruptible tar -C "$artifact_dir" -cf "$transfer_archive" . ||
+run_interruptible env COPYFILE_DISABLE=1 \
+    tar --no-xattrs -C "$artifact_dir" -cf "$transfer_archive" . ||
     die "could not create the closed guest artifact transfer"
 
 overall_status=0
