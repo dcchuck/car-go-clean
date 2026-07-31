@@ -2342,11 +2342,12 @@ jq -n \
     ]' > "$work/draft-global-assets.json"
 jq -n \
     --arg tag v0.4.0 \
+    --argjson names "$draft_expected_json" \
     --slurpfile global_names "$work/draft-global-assets.json" \
     '{
         dist_version: "0.32.0",
         announcement_tag: $tag,
-        artifacts: ($global_names[0] |
+        artifacts: ($names |
             map({key: ., value: {name: .}}) | from_entries),
         upload_files: ($global_names[0] | map("/target/distrib/" + .))
     }' > "$draft_global_manifest"

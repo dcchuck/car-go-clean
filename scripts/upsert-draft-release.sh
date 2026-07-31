@@ -135,10 +135,10 @@ jq -er '.upload_files[]' "$global_manifest" |
         basename "$upload"
     done |
     LC_ALL=C sort > "$work_dir/global-upload-assets"
-if ! cmp -s "$global_expected_file" "$work_dir/global-manifest-assets" ||
+if ! cmp -s "$expected_file" "$work_dir/global-manifest-assets" ||
     ! cmp -s "$global_expected_file" "$work_dir/global-upload-assets"
 then
-    echo "cargo-dist global manifest does not name the reviewed global artifacts" >&2
+    echo "cargo-dist global manifest does not match the reviewed artifact inventory and upload set" >&2
     exit 1
 fi
 
