@@ -154,6 +154,12 @@ jobs:
           HOME="$ISOLATED_ROOT/home" \
             XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
             XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
+            "$binary" scan \
+              --config "$ISOLATED_ROOT/config.toml" \
+              --state-dir "$ISOLATED_ROOT/state"
+          HOME="$ISOLATED_ROOT/home" \
+            XDG_CONFIG_HOME="$ISOLATED_ROOT/home/.config" \
+            XDG_STATE_HOME="$ISOLATED_ROOT/home/.local/state" \
             "$binary" health --skip-cargo \
               --config "$ISOLATED_ROOT/config.toml" \
               --state-dir "$ISOLATED_ROOT/state"

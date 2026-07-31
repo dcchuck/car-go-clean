@@ -2299,6 +2299,25 @@ fn authenticated_draft_smoke_establishes_generation_before_health() {
 }
 
 #[test]
+fn hosted_public_smoke_establishes_generation_before_health() {
+    let hosted = workflow(".github/workflows/hosted-release-smoke.yml");
+    let smoke_steps = workflow_steps(&hosted, "smoke");
+    let verify_paths = named_step(smoke_steps, "Verify public install paths");
+    let run = run_command(verify_paths).unwrap();
+
+    let scan = run
+        .find("\"$binary\" scan")
+        .expect("hosted public smoke must create a discovery generation");
+    let health = run
+        .find("\"$binary\" health --skip-cargo")
+        .expect("hosted public smoke must verify health");
+    assert!(
+        scan < health,
+        "hosted public smoke must scan before checking health"
+    );
+}
+
+#[test]
 fn release_documentation_names_safe_targeted_retry_modes() {
     let docs = repo_file("docs/releasing.md");
     for fragment in [
