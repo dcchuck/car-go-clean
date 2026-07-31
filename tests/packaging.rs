@@ -2280,6 +2280,25 @@ fn authenticated_draft_verification_requires_all_fifteen_assets() {
 }
 
 #[test]
+fn authenticated_draft_smoke_establishes_generation_before_health() {
+    let verify = workflow(".github/workflows/release-verify.yml");
+    let smoke_steps = workflow_steps(&verify, "smoke");
+    let verify_paths = named_step(smoke_steps, "Verify authenticated draft install paths");
+    let run = run_command(verify_paths).unwrap();
+
+    let scan = run
+        .find("\"$binary\" scan")
+        .expect("authenticated draft smoke must create a discovery generation");
+    let health = run
+        .find("\"$binary\" health --skip-cargo")
+        .expect("authenticated draft smoke must verify health");
+    assert!(
+        scan < health,
+        "authenticated draft smoke must scan before checking health"
+    );
+}
+
+#[test]
 fn release_documentation_names_safe_targeted_retry_modes() {
     let docs = repo_file("docs/releasing.md");
     for fragment in [
