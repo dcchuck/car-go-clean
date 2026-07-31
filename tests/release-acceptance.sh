@@ -838,9 +838,44 @@ printf 'no no no\n' > "$fake_service_state"
 cat > "$fake_acceptance/uname" <<'EOF'
 #!/bin/sh
 case "${1-}" in
-    -s) printf 'Linux\n' ;;
-    -m) printf 'aarch64\n' ;;
-    *) printf 'Linux\n' ;;
+    -s) printf '%s\n' "${FAKE_UNAME_S:-Linux}" ;;
+    -m) printf '%s\n' "${FAKE_UNAME_M:-aarch64}" ;;
+    *) printf '%s\n' "${FAKE_UNAME_S:-Linux}" ;;
+esac
+EOF
+
+cat > "$fake_acceptance/brew" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'brew %s\n' "$*" >> "$CALL_LOG"
+case "$*" in
+    "untap car-go-clean/acceptance")
+        rm -rf "$FAKE_BREW_TAP_ROOT"
+        ;;
+    "tap-new --no-git car-go-clean/acceptance")
+        mkdir -p "$FAKE_BREW_TAP_ROOT/Formula"
+        ;;
+    "--repository car-go-clean/acceptance")
+        printf '%s\n' "$FAKE_BREW_TAP_ROOT"
+        ;;
+    "install --formula car-go-clean/acceptance/car-go-clean")
+        test -f "$FAKE_BREW_TAP_ROOT/Formula/car-go-clean.rb"
+        mkdir -p "$FAKE_BREW_PREFIX/bin"
+        cp "$FAKE_CURRENT_CGC" "$FAKE_BREW_PREFIX/bin/car-go-clean"
+        chmod +x "$FAKE_BREW_PREFIX/bin/car-go-clean"
+        ;;
+    "--prefix car-go-clean")
+        printf '%s\n' "$FAKE_BREW_PREFIX"
+        ;;
+    "test car-go-clean/acceptance/car-go-clean")
+        test -x "$FAKE_BREW_PREFIX/bin/car-go-clean"
+        test "${FAKE_BREW_FAIL_TEST-}" != 1 || exit 73
+        ;;
+    "uninstall --force car-go-clean")
+        rm -f "$FAKE_BREW_PREFIX/bin/car-go-clean"
+        test "${FAKE_BREW_FAIL_UNINSTALL-}" != 1 || exit 74
+        ;;
+    *) exit 64 ;;
 esac
 EOF
 
@@ -1004,9 +1039,11 @@ case "$command" in
             project=$(printf '%s\n' "$manifests" | head -n 1)
             project=${project%/Cargo.toml}
             printf '%s\n' "$project" > "$FAKE_REVIEW_PATH"
+            printf 'Cleanable target preview:\n'
             printf '%s\n' "$manifests" | while IFS= read -r manifest; do
                 if test -n "$manifest"; then
-                    printf 'Cleanable: %s\n' "${manifest%/Cargo.toml}"
+                    project=${manifest%/Cargo.toml}
+                    printf '  1024\t%s/target\t%s\n' "$project" "$project"
                 fi
             done
             printf 'Review ID: 42\nCandidate bytes: 1024\n'
@@ -1154,7 +1191,8 @@ class CarGoClean < Formula
   end
 end
 EOF
-chmod +x "$fake_acceptance/uname" "$fake_acceptance/ruby" \
+chmod +x "$fake_acceptance/uname" "$fake_acceptance/brew" \
+    "$fake_acceptance/ruby" \
     "$fake_acceptance/cargo" "$fake_current_cgc" \
     "$fake_acceptance/systemctl" "$fake_acceptance/sleep" \
     "$fake_artifacts/car-go-clean-installer.sh" \
@@ -1183,6 +1221,75 @@ for artifact in "$fake_artifacts"/*; do
     test "$name" = SHA256SUMS && continue
     hash=$(shasum -a 256 "$artifact" | awk '{ print $1 }')
     printf '%s  %s\n' "$hash" "$name" >> "$fake_artifacts/SHA256SUMS"
+done
+
+mac_formula_evidence=$work_dir/mac-formula-evidence
+fake_brew_tap_root=$work_dir/fake-brew-tap
+fake_brew_prefix=$work_dir/fake-brew-prefix
+: > "$call_log"
+run_capture env PATH="$fake_acceptance:/usr/bin:/bin" HOME="$fake_guest_home" \
+    CALL_LOG="$call_log" FAKE_CURRENT_CGC="$fake_current_cgc" \
+    FAKE_SERVICE_STATE="$fake_service_state" \
+    FAKE_REVIEW_PATH="$fake_review_path" FAKE_CACHED_ROOT="$fake_cached_root" \
+    FAKE_ERROR="$fake_error" \
+    FAKE_ACCEPTANCE_ARTIFACTS="$fake_artifacts" \
+    FAKE_UNAME_S=Darwin FAKE_UNAME_M=arm64 \
+    FAKE_BREW_TAP_ROOT="$fake_brew_tap_root" \
+    FAKE_BREW_PREFIX="$fake_brew_prefix" \
+    CAR_GO_CLEAN_ACCEPTANCE_FAULT=formula-install:late \
+    CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+    CAR_GO_CLEAN_ACCEPTANCE_SHA=18e2b772698b5f9b67da64c4ad299beacfe219e9 \
+    "$root/scripts/release/acceptance.sh" \
+    "$fake_artifacts" "$mac_formula_evidence" pre-reboot
+test "$run_status" -ne 0 ||
+    fail "macOS formula fixture did not stop at its injected checkpoint"
+assert_contains "$call_log" "brew tap-new --no-git car-go-clean/acceptance"
+assert_contains "$call_log" \
+    "brew install --formula car-go-clean/acceptance/car-go-clean"
+assert_contains "$call_log" "brew test car-go-clean/acceptance/car-go-clean"
+assert_contains "$call_log" "brew uninstall --force car-go-clean"
+assert_contains "$call_log" "brew untap car-go-clean/acceptance"
+test ! -e "$fake_brew_tap_root" ||
+    fail "macOS formula acceptance left its local tap behind"
+
+for formula_failure in test uninstall; do
+    case "$formula_failure" in
+        test)
+            failure_variable=FAKE_BREW_FAIL_TEST
+            expected_formula_status=73
+            ;;
+        uninstall)
+            failure_variable=FAKE_BREW_FAIL_UNINSTALL
+            expected_formula_status=74
+            ;;
+    esac
+    failure_evidence=$work_dir/mac-formula-$formula_failure-failure-evidence
+    rm -rf "$fake_brew_tap_root" "$fake_brew_prefix"
+    : > "$call_log"
+    run_capture env PATH="$fake_acceptance:/usr/bin:/bin" \
+        HOME="$fake_guest_home" CALL_LOG="$call_log" \
+        FAKE_CURRENT_CGC="$fake_current_cgc" \
+        FAKE_SERVICE_STATE="$fake_service_state" \
+        FAKE_REVIEW_PATH="$fake_review_path" \
+        FAKE_CACHED_ROOT="$fake_cached_root" FAKE_ERROR="$fake_error" \
+        FAKE_ACCEPTANCE_ARTIFACTS="$fake_artifacts" \
+        FAKE_UNAME_S=Darwin FAKE_UNAME_M=arm64 \
+        FAKE_BREW_TAP_ROOT="$fake_brew_tap_root" \
+        FAKE_BREW_PREFIX="$fake_brew_prefix" \
+        "$failure_variable=1" \
+        CAR_GO_CLEAN_ACCEPTANCE_VERSION=0.4.0 \
+        CAR_GO_CLEAN_ACCEPTANCE_SHA=18e2b772698b5f9b67da64c4ad299beacfe219e9 \
+        "$root/scripts/release/acceptance.sh" \
+        "$fake_artifacts" "$failure_evidence" pre-reboot
+    test "$run_status" -ne 0 ||
+        fail "macOS formula $formula_failure failure was hidden"
+    assert_contains "$failure_evidence/milestones.tsv" \
+        "formula-install	FAIL	exit=$expected_formula_status"
+    assert_not_contains "$failure_evidence/milestones.tsv" "version-health"
+    assert_contains "$call_log" "brew uninstall --force car-go-clean"
+    assert_contains "$call_log" "brew untap car-go-clean/acceptance"
+    test ! -e "$fake_brew_tap_root" ||
+        fail "macOS formula $formula_failure failure left its local tap behind"
 done
 
 acceptance_evidence=$work_dir/acceptance-evidence
@@ -1214,6 +1321,11 @@ assert_line "$acceptance_evidence/pre-reboot-transcript.log" \
     "Outcome: incomplete (code=2)"
 assert_line "$acceptance_evidence/pre-reboot-transcript.log" \
     "Reasons: generation_missing, scan_incomplete"
+assert_contains "$acceptance_evidence/pre-reboot-transcript.log" \
+    "\$WORK/no-scan/project/target"
+assert_contains "$acceptance_evidence/pre-reboot-transcript.log" \
+    "\$WORK/narrow/in-scope/project/target"
+assert_not_contains "$acceptance_evidence/pre-reboot-transcript.log" "$work_dir"
 
 # A fresh health result is incomplete for one precise reason set. Accepting a
 # generic exit 2 without the missing-generation authority state would let the

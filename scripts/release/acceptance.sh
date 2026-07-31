@@ -320,12 +320,35 @@ PY
                 echo "Homebrew is required for the macOS formula acceptance path" >&2
                 return 1
             }
-            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
-                brew install --formula "$local_formula"
-            formula_binary=$(brew --prefix car-go-clean)/bin/car-go-clean
-            test "$("$formula_binary" version)" = "$version"
-            HOMEBREW_NO_AUTO_UPDATE=1 brew test car-go-clean
-            brew uninstall --force car-go-clean
+            tap_name=car-go-clean/acceptance
+            HOMEBREW_NO_AUTO_UPDATE=1 brew untap "$tap_name" \
+                >/dev/null 2>&1 || :
+            set +e
+            (
+                set -e
+                HOMEBREW_NO_AUTO_UPDATE=1 \
+                    brew tap-new --no-git "$tap_name"
+                tap_root=$(brew --repository "$tap_name")
+                test -d "$tap_root/Formula"
+                cp "$local_formula" "$tap_root/Formula/car-go-clean.rb"
+                HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+                    brew install --formula "$tap_name/car-go-clean"
+                formula_binary=$(brew --prefix car-go-clean)/bin/car-go-clean
+                test "$("$formula_binary" version)" = "$version"
+                HOMEBREW_NO_AUTO_UPDATE=1 \
+                    brew test "$tap_name/car-go-clean"
+            )
+            formula_status=$?
+            uninstall_status=0
+            HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --force car-go-clean \
+                || uninstall_status=$?
+            untap_status=0
+            HOMEBREW_NO_AUTO_UPDATE=1 brew untap "$tap_name" \
+                || untap_status=$?
+            set -e
+            test "$formula_status" -eq 0 || return "$formula_status"
+            test "$uninstall_status" -eq 0 || return "$uninstall_status"
+            return "$untap_status"
             ;;
         Linux)
             echo "Linux guest: Homebrew formula execution is not applicable; hosted smoke evidence is aggregate-bound."
@@ -433,9 +456,11 @@ step_no_scan() {
     sleep 1
     write_config "$no_scan_root"
     seeded=$work_root/no-scan-seeded.out
-    "$shell_binary" run --dry-run --all \
-        --config "$config" --state-dir "$state_dir" > "$seeded"
-    grep -F -- "Cleanable: $no_scan_root/project" "$seeded" >/dev/null
+    capture_status "$seeded" "$shell_binary" run --dry-run --all \
+        --config "$config" --state-dir "$state_dir"
+    cat "$seeded"
+    test "$captured_status" -eq 0
+    grep -F -- "$no_scan_root/project/target" "$seeded" >/dev/null
     seeded_bytes=$(sed -n 's/^Candidate bytes: \([0-9][0-9]*\)$/\1/p' "$seeded")
     test -n "$seeded_bytes" && test "$seeded_bytes" -gt 0
     fault_checkpoint middle
@@ -445,8 +470,9 @@ step_no_scan() {
     output=$work_root/no-scan.out
     capture_status "$output" "$shell_binary" run --dry-run --no-scan --all \
         --config "$config" --state-dir "$state_dir"
+    cat "$output"
     test "$captured_status" -eq 0
-    grep -F -- "Cleanable: $no_scan_root/project" "$output" >/dev/null
+    grep -F -- "$no_scan_root/project/target" "$output" >/dev/null
     candidate_bytes=$(sed -n 's/^Candidate bytes: \([0-9][0-9]*\)$/\1/p' "$output")
     test -n "$candidate_bytes" && test "$candidate_bytes" -gt 0
     review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$output")
@@ -470,18 +496,21 @@ step_narrowed_scope() {
     # formerly cached outside project rather than treating cache history as
     # cleanup authority.
     write_config "$work_root/narrow"
-    "$shell_binary" run --dry-run --all \
-        --config "$config" --state-dir "$state_dir" \
-        > "$work_root/narrow-broad-preview.out"
-    grep -F -- "$scope/project" "$work_root/narrow-broad-preview.out" >/dev/null
+    broad=$work_root/narrow-broad-preview.out
+    capture_status "$broad" "$shell_binary" run --dry-run --all \
+        --config "$config" --state-dir "$state_dir"
+    cat "$broad"
+    test "$captured_status" -eq 0
+    grep -F -- "$scope/project" "$broad" >/dev/null
     grep -F -- "$outside/sentinel-project" \
-        "$work_root/narrow-broad-preview.out" >/dev/null
+        "$broad" >/dev/null
 
     write_config "$scope"
     fault_checkpoint middle
     output=$work_root/narrow-preview.out
     capture_status "$output" "$shell_binary" run --dry-run --no-scan --all \
         --config "$config" --state-dir "$state_dir"
+    cat "$output"
     test "$captured_status" -eq 2
     grep -F -- \
         "No review ID was created because no valid matching discovery generation exists." \
@@ -493,11 +522,13 @@ step_narrowed_scope() {
     printf 'skipped:out_of_scope cached target=%s (policy generation rejected)\n' \
         "$outside/sentinel-project"
     narrowed_scan=$work_root/narrow-authorized-preview.out
-    "$shell_binary" run --dry-run --all \
-        --config "$config" --state-dir "$state_dir" > "$narrowed_scan"
+    capture_status "$narrowed_scan" "$shell_binary" run --dry-run --all \
+        --config "$config" --state-dir "$state_dir"
+    cat "$narrowed_scan"
+    test "$captured_status" -eq 0
     review=$(sed -n 's/^Review ID: \([0-9][0-9]*\)$/\1/p' "$narrowed_scan")
     test -n "$review"
-    grep -F -- "Cleanable: $scope/project" "$narrowed_scan" >/dev/null
+    grep -F -- "$scope/project/target" "$narrowed_scan" >/dev/null
     if grep -F -- "$outside/sentinel-project" "$narrowed_scan" >/dev/null; then
         echo "normal narrowed scan reauthorized the outside cached target" >&2
         return 1
