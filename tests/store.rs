@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use car_go_clean::cache::Cache;
 use car_go_clean::cleaner::CleanAttemptOutcome;
 use car_go_clean::identity::{BootSessionId, FilesystemIdentity, MountIdentity, ReviewedIdentity};
 use car_go_clean::safety::{CleanDecision, ProjectClass, ProjectReview, ReviewSummary, SkipReason};
@@ -498,6 +499,44 @@ fn linked_worktree_failure_blocks_cached_children_until_success() {
 
     store.replace_linked_worktrees(&primary, &[linked]).unwrap();
     assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+}
+
+#[test]
+fn excluded_missing_failed_worktree_does_not_globally_block_cached_projects() {
+    let store = test_store(&tempfile::tempdir().unwrap().path().join("state.db"));
+    let root = tempfile::tempdir().unwrap();
+    let excluded = root.path().join("excluded");
+    let primary = excluded.join("missing-primary");
+    let linked = excluded.join("missing-linked");
+    let unrelated = root.path().join("unrelated-project");
+    for path in [&primary, &linked, &unrelated] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let excluded = excluded.canonicalize().unwrap();
+    let primary = primary.canonicalize().unwrap();
+    let linked = linked.canonicalize().unwrap();
+    let unrelated = unrelated.canonicalize().unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+    store.upsert_project(&unrelated, now).unwrap();
+    store
+        .replace_linked_worktrees(&primary, std::slice::from_ref(&linked))
+        .unwrap();
+    store
+        .mark_worktree_discovery_failed(&primary, now, "git failed")
+        .unwrap();
+    fs::remove_dir_all(&excluded).unwrap();
+
+    Cache::new(&store)
+        .reconcile_for_review(|path| path.starts_with(&excluded))
+        .unwrap();
+    assert!(store.blocked_worktree_discovery_paths().unwrap().is_empty());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&primary)
+        .unwrap());
+    assert!(!store
+        .is_active_worktree_discovery_identity(&linked)
+        .unwrap());
 }
 
 #[test]

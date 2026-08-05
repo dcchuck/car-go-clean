@@ -1189,6 +1189,75 @@ impl Store {
         Ok(())
     }
 
+    pub fn reconcile_excluded_worktree_discovery_state<F>(&self, mut is_excluded: F) -> Result<()>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        let linked = {
+            let mut stmt = self.conn.prepare(
+                "SELECT primary_path, linked_path, canonical_primary_path
+                 FROM linked_worktrees",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            collect_rows(rows)?
+        };
+        let failures = {
+            let mut stmt = self.conn.prepare(
+                "SELECT primary_path, canonical_primary_path
+                 FROM worktree_discovery_failures",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+
+        let remove_linked = linked
+            .into_iter()
+            .filter(|(primary, linked, canonical_primary)| {
+                is_excluded(Path::new(primary))
+                    || is_excluded(Path::new(linked))
+                    || canonical_primary
+                        .as_deref()
+                        .is_some_and(|path| is_excluded(Path::new(path)))
+            })
+            .collect::<Vec<_>>();
+        let remove_failures = failures
+            .into_iter()
+            .filter(|(primary, canonical_primary)| {
+                is_excluded(Path::new(primary))
+                    || canonical_primary
+                        .as_deref()
+                        .is_some_and(|path| is_excluded(Path::new(path)))
+            })
+            .collect::<Vec<_>>();
+        if remove_linked.is_empty() && remove_failures.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (primary, linked, _) in remove_linked {
+            tx.execute(
+                "DELETE FROM linked_worktrees WHERE primary_path=?1 AND linked_path=?2",
+                params![primary, linked],
+            )?;
+        }
+        for (primary, _) in remove_failures {
+            tx.execute(
+                "DELETE FROM worktree_discovery_failures WHERE primary_path=?1",
+                [&primary],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_project_path(&self, old_path: &Path, new_path: &Path) -> Result<()> {
         let old_path = path_to_string(old_path)?;
         let new_path = path_to_string(new_path)?;

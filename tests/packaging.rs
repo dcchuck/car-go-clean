@@ -1012,7 +1012,7 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
     let manifest = repo_file("Cargo.toml");
     let dist = repo_file("dist-workspace.toml");
     for value in [
-        "version = \"0.4.0\"",
+        "version = \"0.4.1\"",
         "repository = \"https://github.com/dcchuck/car-go-clean\"",
         "homepage = \"https://github.com/dcchuck/car-go-clean\"",
     ] {
@@ -2402,7 +2402,7 @@ fn release_workflow_is_tag_only_and_uses_dist() {
 #[test]
 fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     let output = Command::new("dist")
-        .args(["plan", "--tag=v0.4.0", "--output-format=json"])
+        .args(["plan", "--tag=v0.4.1", "--output-format=json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo-dist must be installed for release contract tests");
@@ -2413,7 +2413,7 @@ fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plan["dist_version"], "0.32.0");
-    assert_eq!(plan["announcement_tag"], "v0.4.0");
+    assert_eq!(plan["announcement_tag"], "v0.4.1");
     let actual = plan["artifacts"]
         .as_object()
         .unwrap()
@@ -2442,7 +2442,7 @@ fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
 #[test]
 fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert!(root.join("docs/releases/v0.4.0.md").is_file());
+    assert!(root.join("docs/releases/v0.4.1.md").is_file());
     assert!(root.join("scripts/compose-release-notes.sh").is_file());
 
     let release = workflow(".github/workflows/release.yml");
@@ -2500,7 +2500,7 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
         .args(["-eu", "-c", runnable])
         .current_dir(root)
         .env("ANNOUNCEMENT_BODY", "generated workflow body")
-        .env("TAG", "v0.4.0")
+        .env("TAG", "v0.4.1")
         .env("RUNNER_TEMP", runner_temp.path())
         .output()
         .unwrap();
@@ -2511,7 +2511,7 @@ fn release_workflow_composes_reviewed_notes_before_creating_the_draft() {
     );
 
     let notes = fs::read_to_string(runner_temp.path().join("notes.txt")).unwrap();
-    assert_eq!(notes.lines().next(), Some("# car-go-clean v0.4.0"));
+    assert_eq!(notes.lines().next(), Some("# car-go-clean v0.4.1"));
     assert!(notes.lines().any(|line| line == "generated workflow body"));
 }
 

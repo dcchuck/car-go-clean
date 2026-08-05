@@ -51,11 +51,11 @@ Intel (`x86_64-apple-darwin`), plus Linux ARM64
 downloads the matching release archive and its `.sha256` file, verifies the
 SHA-256 checksum before replacing the binary, and does not require `sudo`.
 
-By default it installs to `$HOME/.local/bin`. After a release such as `v0.4.0`
+By default it installs to `$HOME/.local/bin`. After a release such as `v0.4.1`
 has been published, a fresh installation can pin it:
 
 ```sh
-VERSION=0.4.0
+VERSION=0.4.1
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh \
   | sh -s -- --version "$VERSION" --install-dir "$HOME/.local/bin"

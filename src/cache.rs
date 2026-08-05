@@ -40,7 +40,8 @@ impl<'a> Cache<'a> {
     where
         F: FnMut(&Path) -> bool,
     {
-        let _ = is_excluded;
+        self.store
+            .reconcile_excluded_worktree_discovery_state(is_excluded)?;
         self.store.normalize_resolvable_project_aliases()?;
         Ok(Vec::new())
     }

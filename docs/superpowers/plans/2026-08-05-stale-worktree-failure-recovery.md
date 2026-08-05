@@ -4,32 +4,34 @@
 globally blocking all cached Cargo projects; release the repair as `0.4.1` and
 recover disk space through the normal safe review-and-clean flow.
 
-**Architecture:** Reconcile only failure records whose canonical primary path
-is absent before calculating block paths. Delete their dependent linked
-worktree rows atomically. Preserve global fail-closed behavior for unresolved
-identities and current failed worktrees.
+**Architecture:** Reconcile only excluded worktree-failure and linked-worktree
+provenance before a review. Preserve ordinary project history and global
+fail-closed behavior for unresolved identities, missing primaries with live
+linked worktrees, and current failed worktrees.
 
 ## Task 1: Capture the failure mode with a regression test
 
 **Files:** `tests/store.rs`
 
-1. Add a test with a canonical primary and linked path, record a discovery
-   failure, then remove the primary tree.
+1. Add a test with a canonical primary and linked path under an excluded root,
+   record a discovery failure, then remove that root.
 2. Add an unrelated cached project to make any global fallback observable.
-3. Assert the block calculation removes the stale failure/provenance and does
-   not return the unrelated project.
+3. Reconcile the cached review state and assert the block calculation removes
+   the excluded stale failure/provenance without returning the unrelated
+   project.
 4. Run the focused test and confirm it fails against the current code because
    the missing path triggers the global fail-closed fallback.
 
-## Task 2: Reconcile stale trusted failure records
+## Task 2: Reconcile excluded stale worktree provenance
 
 **Files:** `src/store.rs`, `tests/store.rs`
 
-1. Add a transactional store helper that identifies canonical failure paths
-   missing from disk.
-2. Delete only each stale failure and its linked-worktree provenance.
-3. Call it before calculating the trusted and untrusted discovery block state.
-4. Keep the present behavior for live paths and `NULL` canonical identities.
+1. Add a transactional store helper that examines only worktree failures and
+   linked worktrees against the current exclusion predicate.
+2. Delete only excluded failure records and their linked-worktree provenance.
+3. Call it from review-state reconciliation without deleting cached projects.
+4. Keep the present behavior for live paths, missing primaries with live
+   links, and `NULL` canonical identities.
 5. Run the focused regression and all store tests.
 
 ## Task 3: Publish and validate the patch

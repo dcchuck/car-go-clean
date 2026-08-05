@@ -7,10 +7,10 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 printf 'generated install body\n' > "$work/generated.md"
 "$repo_root/scripts/compose-release-notes.sh" \
-  v0.4.0 "$work/generated.md" "$work/output.md"
+  v0.4.1 "$work/generated.md" "$work/output.md"
 
 {
-  cat "$repo_root/docs/releases/v0.4.0.md"
+  cat "$repo_root/docs/releases/v0.4.1.md"
   printf '\n\n---\n\ngenerated install body\n'
 } > "$work/expected.md"
 cmp "$work/expected.md" "$work/output.md"

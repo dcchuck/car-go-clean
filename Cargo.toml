@@ -1,6 +1,6 @@
 [package]
 name = "car-go-clean"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.95"
 description = "Periodically run cargo clean on Rust projects and track reclaimed disk space."
