@@ -6,158 +6,46 @@
 `car-go-clean` is a Rust CLI/daemon that finds Rust projects on disk, runs
 `cargo clean`, and tracks how much space was reclaimed.
 
-## Install
+## Quick Start
 
-Before installing anything, determine whether car-go-clean already exists:
-
-```sh
-if command -v car-go-clean >/dev/null 2>&1
-then
-  car-go-clean version
-  car-go-clean service status
-else
-  echo "car-go-clean is not installed"
-fi
-```
-
-If that reports v0.2.0 or v0.3.0, stop here and use the state-preserving
-two-phase [v0.4 upgrade helper](docs/releases/v0.4.0.md#v02v03-upgrade-helper).
-Do not run `brew upgrade`, `brew install`, or the ordinary shell installer
-first; replacing the binary would bypass the helper's old-service detection
-and recovery.
-
-For a fresh macOS or Linux installation only, use Homebrew:
+Install with Homebrew:
 
 ```sh
 brew install dcchuck/tap/car-go-clean
-car-go-clean version
 ```
 
-Or use the checksum-verifying shell installer. It writes to
-`$HOME/.local/bin` by default but does not edit your shell's `PATH`, so make
-that directory discoverable before using bare `car-go-clean` commands:
+Or use the checksum-verifying installer:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 hash -r 2>/dev/null || true
-car-go-clean version
 ```
 
-The installer supports macOS on Apple Silicon (`aarch64-apple-darwin`) and
-Intel (`x86_64-apple-darwin`), plus Linux ARM64
-(`aarch64-unknown-linux-musl`) and x86_64 (`x86_64-unknown-linux-musl`). It
-downloads the matching release archive and its `.sha256` file, verifies the
-SHA-256 checksum before replacing the binary, and does not require `sudo`.
+The installer supports macOS and Linux on Apple Silicon/ARM64 and x86_64. It
+downloads the matching release archive, verifies its SHA-256 checksum, and
+does not require `sudo`.
 
-By default it installs to `$HOME/.local/bin`. After a release such as `v0.4.1`
-has been published, a fresh installation can pin it:
-
-```sh
-VERSION=0.4.1
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/dcchuck/car-go-clean/releases/latest/download/car-go-clean-installer.sh \
-  | sh -s -- --version "$VERSION" --install-dir "$HOME/.local/bin"
-export PATH="$HOME/.local/bin:$PATH"
-hash -r 2>/dev/null || true
-car-go-clean version
-```
-
-Both fresh-install paths install only the binary and do not start the daemon.
-If another existing version was detected, read the target release's upgrade
-instructions before replacing it. Activate daemon management explicitly only
-after installation.
-
-## Quick Start
-
-For the complete mental model—from discovery authority and service behavior
-through upgrades and release gates—read the
-[Owner’s v0.4 product tour](docs/v0.4-owner-tour.md).
-
-Check the binary and service state before creating a review:
+Check the install, then create and review a cleanup plan:
 
 ```sh
 car-go-clean version
-car-go-clean service status
-car-go-clean health
-```
-
-If status reports `Running: yes`, decide whether to pause the daemon before
-continuing. `service stop` is a persistent disable across login and reboot, so
-run it only after intentionally approving that service-state change. Remember
-that the service was running so you can restore it after the reviewed flow:
-
-```sh
-car-go-clean service stop
-```
-
-If status reports stopped or not installed, do not change service state. Once
-no daemon is running, create the review:
-
-```sh
 car-go-clean run --dry-run --all
-```
 
-The dry run scans automatically, applies every safety gate, invokes no Cargo
-command, and prints a numeric `Review ID`. It also records the exact policy
-hash, discovery generation, target list, and filesystem identities that you
-reviewed. Execute that exact plan by replacing `REVIEW_ID` with the printed
-number:
-
-```sh
+# After reviewing the preview:
 car-go-clean run --review REVIEW_ID
 car-go-clean stats
 ```
 
-If you stopped an originally running service, restore it after the reviewed
-run (or after deciding not to execute the review):
+The dry run scans automatically, invokes no Cargo command, and prints the
+numeric `REVIEW_ID`. Replace `REVIEW_ID` with that number. Reviews expire
+after 30 minutes; immediately before cleanup, car-go-clean revalidates each
+target and can remove newly unsafe targets, but never add one you did not
+review.
 
-```sh
-car-go-clean service start
-```
-
-Review plans expire after 30 minutes, and only the newest 20 are retained. A
-plan is rejected if its policy or discovery generation changed. Immediately
-before Cargo runs, car-go-clean revalidates every persisted target. That check
-may remove a target that became unsafe; it can never add a target that was not
-in the review. `--all` only expands dry-run display—it cannot be used for a
-destructive run.
-
-Bare `car-go-clean run` remains available, but it is dynamic and destructive:
-it scans and accepts the fresh target set in one operation. Use it only when
-you intentionally accept that behavior. The reviewed two-command flow above
-is the recommended manual path.
-
-`service stop` is persistent across login and reboot. `service start`
-re-enables and starts the installed definition.
-
-For advanced cached-only inspection, `car-go-clean run --dry-run --no-scan`
-skips discovery. It does not make historical cache rows authoritative and
-never bypasses policy, generation, scope, exclusion, identity, activity,
-quiet-period, or managed-storage checks.
-
-One-shot commands exit `0` for complete coverage, `2` for valid results with
-incomplete discovery coverage, and `1` for failures. A broad macOS home scan
-can legitimately return `2` when privacy-protected directories cannot be
-read. That preview may still contain a valid review ID; inspect its incomplete
-origins before deciding whether its bounded target set is acceptable. Exit
-`1` always outranks `2`.
-
-Inspect the cleanup authority in human-readable or machine-readable form:
-
-```sh
-car-go-clean health --json || test $? -eq 2
-car-go-clean status --json || test $? -eq 2
-```
-
-Exit `2` still writes a valid report. With `--json`, every command ends with a
-format-v1 JSON envelope. A cleanup execution uses NDJSON: each actual target
-is emitted as a `target` event before the terminal envelope. The envelope
-contains `outcome.code`, `outcome.kind`, explicit reasons, policy and
-generation context, scan errors, and command data. Service-state probe or
-environment-divergence warnings are reported, but do not change the cleanup
-authority outcome.
+Installation does not start the daemon. See [Background Service
+(Optional)](#background-service-optional) if you want scheduled cleanup.
 
 ## Agent Quick Start
 
@@ -180,30 +68,9 @@ Copy this prompt into your coding agent:
 > Before any install or replacement, inspect this machine's operating system,
 > architecture, available package manager, Cargo availability, and whether
 > `car-go-clean` already exists. If it does, run its `version` and
-> `service status` commands before choosing an installation path. Also inspect
-> configuration, how often Rust projects are built, and whether the user wants
-> one-shot cleanup or an always-on per-user daemon.
->
-> If the existing binary is v0.2.0 or v0.3.0, stop the ordinary install path
-> and follow the repository's v0.4 state-preserving upgrade-helper
-> instructions. Do not run a plain `brew upgrade`, `brew install`, or ordinary
-> shell installer first. Choose the helper method that owns the existing
-> visible command, not a desired migration method; the helper will verify
-> Homebrew formula ownership or a safe shell-owned binary before any service
-> stop. Before invoking helper phase one, use the legacy `service status`
-> result: if it is running, explain that phase one persistently stops and
-> disables it, replaces the binary, and creates the helper preview that opens
-> the bounded review window. Ask approval to enter that window and to restore
-> the originally running service after reviewed execution or cancellation.
-> Invoke helper phase one only after that approval. If the legacy service is
-> already stopped or absent, make no service-state change outside the helper.
-> Treat the helper's preview as the review window described below; inspect it
-> and ask separately before invoking helper phase two with its exact review ID.
-> Do not create a second bare-command preview during this helper flow.
-> Cross-method migration requires a separate explicit uninstall and fresh
-> install. For any other existing version, read the target release's upgrade
-> instructions before replacement. Only when no binary is installed should you
-> use the README's fresh-install Homebrew or verified shell-installer command.
+> `service status` commands and read the target release's upgrade notes before
+> replacing it. Also inspect configuration, how often Rust projects are built,
+> and whether the user wants one-shot cleanup or an always-on per-user daemon.
 >
 > If the shell installer is selected, it does not edit `PATH`. After it
 > succeeds, run:
@@ -219,8 +86,8 @@ Copy this prompt into your coding agent:
 > binary. Recommend one-shot or daemon operation based on the user's Rust
 > usage and explain the choice.
 >
-> After completing the correct fresh-install or upgrade flow, verify the
-> installed version and inspect service state before any preview:
+> After installation or upgrade, verify the installed version and inspect
+> service state before any preview:
 >
 > ```sh
 > car-go-clean version
@@ -228,14 +95,12 @@ Copy this prompt into your coding agent:
 > car-go-clean health
 > ```
 >
-> Outside the legacy upgrade-helper flow, if the daemon is running, do not
-> preview yet. Explain that `service stop`
-> persistently disables it across login and reboot, then ask approval for this
-> bounded review window: stop it, create and inspect a preview, leave it stopped
-> while asking separately for reviewed execution approval, and restore the
-> originally running service after execution or cancellation. Only after that
-> approval run `car-go-clean service stop`. If the service is already stopped
-> or absent, make no service change. Once no daemon is running, run:
+> If the daemon is running, do not preview yet. Explain that `service stop`
+> persistently disables it across login and reboot, then ask approval to stop
+> it, create and inspect a preview, leave it stopped while separately asking
+> to execute the review, and restore the originally running service after
+> execution or cancellation. If the service is already stopped or absent, make
+> no service change. Once no daemon is running, run:
 >
 > ```sh
 > car-go-clean run --dry-run --all
@@ -250,12 +115,9 @@ Copy this prompt into your coding agent:
 > can remove newly unsafe targets but never add new ones.
 >
 > Inspection, installation or upgrade, health checks, and a preview are
-> authorized by this prompt, except that an active legacy service still
-> requires the approval above before helper phase one persistently stops it.
-> Ask before:
+> authorized by this prompt. Ask before:
 >
-> - Executing the exact preview with either helper phase two or
->   `car-go-clean run --review REVIEW_ID`, as appropriate to the flow.
+> - Executing `car-go-clean run --review REVIEW_ID`.
 > - Installing or enabling the background service.
 > - Changing configuration or exclusions.
 > - Using `--force`, `--include-active`, or `--include-managed-cache`.
