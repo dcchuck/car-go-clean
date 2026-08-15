@@ -530,6 +530,9 @@ fn default_excludes_for(
     environment: &dyn Environment,
 ) -> Vec<String> {
     let mut excludes = vec![".git".to_string(), "node_modules".to_string()];
+    if platform == HostPlatform::MacOs {
+        excludes.push("Photos Library.photoslibrary".to_string());
+    }
     excludes.extend(
         protected_roots_for(platform, home, environment)
             .into_iter()
@@ -569,6 +572,7 @@ mod default_exclude_tests {
             strings(&[
                 ".git",
                 "node_modules",
+                "Photos Library.photoslibrary",
                 "/Users/tester/.cargo",
                 "/Users/tester/.rustup",
                 "/Users/tester/.cache",
@@ -619,7 +623,7 @@ mod default_exclude_tests {
     fn missing_or_relative_home_never_creates_unanchored_manager_patterns() {
         assert_eq!(
             default_excludes_for(Path::new(""), HostPlatform::MacOs, &EmptyEnvironment),
-            strings(&[".git", "node_modules"])
+            strings(&[".git", "node_modules", "Photos Library.photoslibrary"])
         );
         assert_eq!(
             default_excludes_for(
