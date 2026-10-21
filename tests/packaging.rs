@@ -753,8 +753,9 @@ case "$1" in
     ;;
   clean)
     shift
-    test "$#" -eq 2
+    test "$#" -eq 4
     test "$1" = --target-dir
+    test "$3" = --config
     rm -rf "$2"
     ;;
   *) printf 'unexpected cargo command: %s\n' "$*" >&2; exit 64 ;;
@@ -866,7 +867,11 @@ esac
             .count(),
         3
     );
-    let clean_command = format!("clean --target-dir {}", canonical_target.display());
+    let clean_command = format!(
+        "clean --target-dir {} --config build.build-dir={}",
+        canonical_target.display(),
+        toml::Value::String(canonical_target.to_string_lossy().into_owned())
+    );
     assert_eq!(
         cargo_invocations
             .iter()
@@ -1012,7 +1017,7 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
     let manifest = repo_file("Cargo.toml");
     let dist = repo_file("dist-workspace.toml");
     for value in [
-        "version = \"0.4.2\"",
+        "version = \"0.4.3\"",
         "repository = \"https://github.com/dcchuck/car-go-clean\"",
         "homepage = \"https://github.com/dcchuck/car-go-clean\"",
     ] {
@@ -2402,7 +2407,7 @@ fn release_workflow_is_tag_only_and_uses_dist() {
 #[test]
 fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     let output = Command::new("dist")
-        .args(["plan", "--tag=v0.4.2", "--output-format=json"])
+        .args(["plan", "--tag=v0.4.3", "--output-format=json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo-dist must be installed for release contract tests");
@@ -2413,7 +2418,7 @@ fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plan["dist_version"], "0.32.0");
-    assert_eq!(plan["announcement_tag"], "v0.4.2");
+    assert_eq!(plan["announcement_tag"], "v0.4.3");
     let actual = plan["artifacts"]
         .as_object()
         .unwrap()

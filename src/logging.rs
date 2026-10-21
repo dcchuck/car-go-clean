@@ -64,6 +64,10 @@ impl Logger {
         self.write("INFO", message.as_ref(), fields);
     }
 
+    pub fn warn_fields(&self, message: impl AsRef<str>, fields: Map<String, Value>) {
+        self.write("WARN", message.as_ref(), fields);
+    }
+
     pub fn error(&self, message: impl AsRef<str>) {
         self.write("ERROR", message.as_ref(), Map::new());
     }

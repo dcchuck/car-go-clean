@@ -819,7 +819,14 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             "coverage_incomplete".to_string(),
             Value::from(result.coverage_incomplete),
         );
-        logger.info_fields("clean cycle complete", fields);
+        if result.errors > 0 || result.coverage_incomplete {
+            logger.warn_fields(
+                "clean cycle finished with failures or incomplete coverage",
+                fields,
+            );
+        } else {
+            logger.info_fields("clean cycle complete", fields);
+        }
     }
 
     pub fn run_forever(&self) -> Result<()> {

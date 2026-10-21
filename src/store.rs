@@ -52,6 +52,20 @@ pub struct CleanEvent {
     pub measurement_failed: bool,
 }
 
+/// Recorded failures not followed by a successful, measured attempt for the same path.
+/// These are historical observations, not claims about current disk contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CleanupFailure {
+    pub path: String,
+    pub last_attempt_at: i64,
+    pub consecutive_failures: i64,
+    pub bytes_remaining_at_attempt: i64,
+    pub exit_code: Option<i32>,
+    pub stderr_excerpt: String,
+    pub reason: String,
+    pub remediation: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorRecord {
     pub id: i64,
@@ -1948,6 +1962,43 @@ impl Store {
                 stderr_excerpt: row.get(8)?,
                 outcome,
                 measurement_failed: row.get(10)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    pub fn unresolved_cleanup_failures(&self) -> Result<Vec<CleanupFailure>> {
+        let mut stmt = self.conn.prepare(
+            "WITH last_success AS (
+                SELECT path, MAX(id) AS id FROM clean_events
+                WHERE attempt_outcome = 'success' AND measurement_failed = 0 GROUP BY path
+            ), failures AS (
+                SELECT e.* FROM clean_events e LEFT JOIN last_success s ON s.path = e.path
+                WHERE e.id > COALESCE(s.id, 0)
+            ), latest AS (
+                SELECT path, MAX(id) AS id, COUNT(*) AS attempts FROM failures GROUP BY path
+            )
+            SELECT e.path, e.ts, l.attempts, e.bytes_after, e.exit_code,
+                   e.stderr_excerpt, e.attempt_outcome, e.measurement_failed
+            FROM latest l JOIN clean_events e ON e.id = l.id
+            ORDER BY e.bytes_after DESC, e.path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let stderr: String = row.get(5)?;
+            let outcome: String = row.get(6)?;
+            let measurement_failed: bool = row.get(7)?;
+            let (reason, remediation) = if stderr.contains("CACHEDIR.TAG") && outcome == "cargo_nonzero" {
+                ("cargo_cache_tag", "Inspect target ownership, symlinks, Cargo configuration and artifact provenance. Do not create a marker or remove --target-dir to force deletion. After confirming this is an exclusive Cargo output, use the owning project's normal build workflow to recreate its cache metadata, then review again.")
+            } else if measurement_failed {
+                ("measurement_failed", "Inspect target permissions and concurrent filesystem changes; recovered bytes are unverified.")
+            } else {
+                ("cargo_failed", "Inspect the recorded Cargo stderr and the project's selected toolchain. Retry only after resolving the cause and obtaining a fresh review.")
+            };
+            Ok(CleanupFailure {
+                path: row.get(0)?, last_attempt_at: row.get(1)?,
+                consecutive_failures: row.get(2)?, bytes_remaining_at_attempt: row.get(3)?,
+                exit_code: row.get(4)?, stderr_excerpt: stderr,
+                reason: reason.to_string(), remediation: remediation.to_string(),
             })
         })?;
         collect_rows(rows)
