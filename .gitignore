@@ -13,3 +13,6 @@
 # Local state during dev
 *.db
 *.log
+
+# Private local investigation artifacts
+/.local-audit/

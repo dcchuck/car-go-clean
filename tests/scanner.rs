@@ -66,6 +66,9 @@ fn scan_finds_cargo_toml_and_stops_descending() {
     );
     write_file(&root.path().join("ignored/node_modules/Cargo.toml"), "");
 
+    // Even an independent nested target does not expand discovery in v0.4.
+    write_file(&root.path().join("proj-a/sub/target/output"), "artifact");
+
     let scanner = Scanner::new(ScannerOptions {
         roots: vec![root.path().to_path_buf()],
         project_dirs: vec![],

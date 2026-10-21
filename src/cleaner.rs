@@ -122,13 +122,34 @@ impl<R: CommandRunner> Cleaner<R> {
             return Ok(result);
         }
 
+        // A truly empty directory has nothing to reclaim. Do not call Cargo merely
+        // to provoke a missing-tag error, and do not remove or tag the directory.
+        // Zero-byte files and symlinks still count as entries.
+        if fs::read_dir(&target_dir)?.next().transpose()?.is_none() {
+            result.skipped = true;
+            return Ok(result);
+        }
         result.bytes_before = dir_size(&target_dir)?;
         result.bytes_after = result.bytes_before;
         let start = Instant::now();
+        let target_text = target_dir.to_str().context("target path is not UTF-8")?;
+        // Cargo expands templates in build-dir even when the supplied path is
+        // absolute. Refuse ambiguous paths instead of authorizing another tree.
+        anyhow::ensure!(
+            !target_text.contains(['{', '}']),
+            "target path contains Cargo build-dir template delimiters; refusing cleanup"
+        );
         let mut cmd = Command::new(&self.cargo_bin);
         cmd.arg("clean")
             .arg("--target-dir")
             .arg(&target_dir)
+            // Newer Cargo can clean a separately configured build-dir as well.
+            // Bind it to the same reviewed directory, overriding config and env.
+            .arg("--config")
+            .arg(format!(
+                "build.build-dir={}",
+                toml::Value::String(target_text.to_string())
+            ))
             .env_remove("CARGO_TARGET_DIR")
             .current_dir(project_dir);
         report_attempt(project_dir, &target_dir);
@@ -175,6 +196,40 @@ impl<R: CommandRunner> Cleaner<R> {
 impl Default for Cleaner<RealRunner> {
     fn default() -> Self {
         Self::new("cargo", RealRunner, Duration::from_secs(10 * 60))
+    }
+}
+
+/// Advisory only: Cargo remains responsible for validating deletion. Never repairs tags.
+pub fn cache_tag_status(target: &Path) -> &'static str {
+    use std::io::Read;
+    let tag = target.join("CACHEDIR.TAG");
+    let metadata = match fs::symlink_metadata(&tag) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "unreadable",
+    };
+    if !metadata.file_type().is_file() {
+        return "not_regular_file";
+    }
+    let signature = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let mut bytes = [0; 43];
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    match options.open(tag).and_then(|mut file| {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("marker is not a regular file"));
+        }
+        file.read_exact(&mut bytes)
+    }) {
+        Ok(()) if &bytes == signature => "valid",
+        Ok(()) => "invalid_signature",
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => "invalid_signature",
+        Err(_) => "unreadable",
     }
 }
 
@@ -266,6 +321,68 @@ fn stderr_excerpt(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct MustNotRun;
+    impl CommandRunner for MustNotRun {
+        fn run(&self, _: &Path, _: &mut Command) -> Result<CleanOutcome> {
+            panic!("empty target must not invoke Cargo")
+        }
+    }
+
+    #[test]
+    fn empty_target_is_left_untouched_without_cargo_or_marker_repair() {
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let result = Cleaner::new("cargo", MustNotRun, Duration::from_secs(60))
+            .clean(project.path())
+            .unwrap();
+        assert!(result.skipped);
+        assert_eq!(result.outcome, None);
+        assert!(target.is_dir());
+        assert!(!target.join("CACHEDIR.TAG").exists());
+    }
+
+    #[test]
+    fn build_dir_template_path_is_rejected_before_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("{workspace-root}");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("target/artifact"), "preserve").unwrap();
+        let error = Cleaner::new("cargo", MustNotRun, Duration::from_secs(60))
+            .clean(&project)
+            .unwrap_err();
+        assert!(error.to_string().contains("template delimiters"));
+        assert!(project.join("target/artifact").exists());
+    }
+
+    #[test]
+    fn tag_diagnostics_never_repair_missing_or_invalid_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let tag = dir.path().join("CACHEDIR.TAG");
+        assert_eq!(cache_tag_status(dir.path()), "missing");
+        assert!(!tag.exists());
+        fs::write(&tag, "wrong").unwrap();
+        assert_eq!(cache_tag_status(dir.path()), "invalid_signature");
+        assert_eq!(fs::read_to_string(&tag).unwrap(), "wrong");
+        fs::write(&tag, "Signature: 8a477f597d28d172789f06886806bc55\ncomment").unwrap();
+        assert_eq!(cache_tag_status(dir.path()), "valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tag_diagnostics_reject_symlink_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("real"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("CACHEDIR.TAG"))
+            .unwrap();
+        assert_eq!(cache_tag_status(dir.path()), "not_regular_file");
+    }
 
     #[test]
     fn stderr_excerpt_starts_on_a_utf8_boundary() {

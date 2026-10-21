@@ -5380,3 +5380,50 @@ fn scheduler_scan_retry_deadline_round_trips_and_clears() {
     store.clear_scan_retry_at().unwrap();
     assert_eq!(store.scan_retry_at().unwrap(), None);
 }
+
+#[test]
+fn unresolved_failures_survive_time_and_reset_only_after_measured_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = test_store(&dir.path().join("state.db"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let run_id = store.start_run(now).unwrap();
+    let mut event = CleanEvent {
+        id: 0,
+        run_id,
+        ts: now,
+        path: "/project".into(),
+        bytes_before: 4096,
+        bytes_after: 4096,
+        duration_ms: 1,
+        exit_code: Some(101),
+        stderr_excerpt: "missing or invalid CACHEDIR.TAG".into(),
+        outcome: CleanAttemptOutcome::CargoNonzero,
+        measurement_failed: false,
+    };
+    store.record_clean_event(&event).unwrap();
+    store.record_clean_event(&event).unwrap();
+    let failures = store.unresolved_cleanup_failures().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].consecutive_failures, 2);
+    assert_eq!(failures[0].reason, "cargo_cache_tag");
+    assert_eq!(failures[0].bytes_remaining_at_attempt, 4096);
+    event.outcome = CleanAttemptOutcome::Success;
+    event.exit_code = Some(0);
+    event.stderr_excerpt.clear();
+    event.measurement_failed = true;
+    store.record_clean_event(&event).unwrap();
+    assert_eq!(
+        store.unresolved_cleanup_failures().unwrap()[0].consecutive_failures,
+        3
+    );
+    event.measurement_failed = false;
+    store.record_clean_event(&event).unwrap();
+    assert!(store.unresolved_cleanup_failures().unwrap().is_empty());
+    event.outcome = CleanAttemptOutcome::CargoNonzero;
+    event.exit_code = Some(101);
+    store.record_clean_event(&event).unwrap();
+    assert_eq!(
+        store.unresolved_cleanup_failures().unwrap()[0].consecutive_failures,
+        1
+    );
+}

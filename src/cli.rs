@@ -1040,7 +1040,9 @@ fn health(
     if json {
         print_json(&report)?;
     } else {
-        println!("OK");
+        if status.outcome() == CommandOutcome::Complete {
+            println!("OK");
+        }
         if cfg.warnings().contains(&ConfigWarning::LegacyExcludes) {
             println!("WARN: legacy `excludes` is deprecated; run `car-go-clean config migrate`");
         }
@@ -1148,6 +1150,7 @@ fn status(
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct CleanupAuthorityDiagnostics {
+    unresolved_cleanup_failures: Vec<crate::store::CleanupFailure>,
     config_source: PathBuf,
     canonical_scope_roots: CanonicalScopeRootsDiagnostics,
     policy_hash: String,
@@ -1321,6 +1324,7 @@ fn cleanup_authority_diagnostics(
     let (service, service_environment_divergence) = service_diagnostics();
 
     Ok(CleanupAuthorityDiagnostics {
+        unresolved_cleanup_failures: store.unresolved_cleanup_failures()?,
         config_source: policy_diagnostics.config_source.to_path_buf(),
         canonical_scope_roots: CanonicalScopeRootsDiagnostics {
             scan_dirs: policy_diagnostics.canonical_scan_roots.to_vec(),
@@ -1457,6 +1461,20 @@ fn service_diagnostics() -> (ServiceStateDiagnostics, Option<bool>) {
 
 fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics) {
     print_section("Cleanup authority");
+    print_row(
+        "Unresolved cleanup failures",
+        diagnostics.unresolved_cleanup_failures.len().to_string(),
+    );
+    for failure in &diagnostics.unresolved_cleanup_failures {
+        println!(
+            "    {}: {} ({} consecutive attempts; {} remaining at last attempt)",
+            failure.path,
+            failure.reason,
+            failure.consecutive_failures,
+            format_bytes_i64(failure.bytes_remaining_at_attempt)
+        );
+        println!("      {}", failure.remediation);
+    }
     print_row(
         "Config source",
         diagnostics.config_source.display().to_string(),
@@ -1633,7 +1651,25 @@ fn projects(
     #[derive(Serialize)]
     struct ProjectsData<'a> {
         reviews: &'a [ProjectReview],
+        cache_tag_warnings: Vec<CacheTagWarning<'a>>,
     }
+    #[derive(Serialize)]
+    struct CacheTagWarning<'a> {
+        target: &'a Path,
+        status: &'static str,
+        remediation: &'static str,
+    }
+    // Inspect only authorized workspace candidates. This advisory never grants
+    // authority or overrides active-process, quiet-period, or identity checks.
+    let cache_tag_warnings = reviews.iter()
+        .filter(|review| review.class == ProjectClass::Workspace && review.decision == CleanDecision::Cleanable && review.target_bytes > 0)
+        .filter_map(|review| {
+            let status = crate::cleaner::cache_tag_status(&review.target_path);
+            (status != "valid").then_some(CacheTagWarning {
+                target: &review.target_path, status,
+                remediation: "Recent Cargo may refuse cleanup. Verify ownership and provenance; do not manufacture a marker. See docs/cleanup-diagnostics.md.",
+            })
+        }).collect();
     let report = CommandReport::new(
         "projects",
         &status,
@@ -1641,7 +1677,10 @@ fn projects(
         generation,
         None,
         scan_errors,
-        ProjectsData { reviews: &reviews },
+        ProjectsData {
+            reviews: &reviews,
+            cache_tag_warnings,
+        },
     );
 
     if json {
@@ -1649,6 +1688,18 @@ fn projects(
         return Ok(status.outcome());
     }
 
+    for warning in report.data.cache_tag_warnings.iter().take(if all {
+        usize::MAX
+    } else {
+        DEFAULT_PREVIEW_LIMIT
+    }) {
+        println!(
+            "WARN: {} CACHEDIR.TAG={} — {}",
+            warning.target.display(),
+            warning.status,
+            warning.remediation
+        );
+    }
     if all {
         for review in &reviews {
             println!(
@@ -1663,6 +1714,22 @@ fn projects(
         print_review_summary("Projects", &reviews);
         print_skip_breakdown(&review_summary(&reviews));
         print_cleanable_target_preview(&reviews, DEFAULT_PREVIEW_LIMIT, false);
+        let mut skipped: Vec<_> = reviews
+            .iter()
+            .filter(|r| r.target_bytes > 0 && matches!(r.decision, CleanDecision::Skipped(_)))
+            .collect();
+        skipped.sort_by_key(|r| std::cmp::Reverse(r.target_bytes));
+        if !skipped.is_empty() {
+            print_section("Largest skipped targets");
+            for review in skipped.into_iter().take(DEFAULT_PREVIEW_LIMIT) {
+                println!(
+                    "  {}  {}  {}",
+                    format_bytes_i64(review.target_bytes.min(i64::MAX as u64) as i64),
+                    decision_label(&review.decision),
+                    review.target_path.display()
+                );
+            }
+        }
     }
     print_text_outcome(&report);
     Ok(status.outcome())

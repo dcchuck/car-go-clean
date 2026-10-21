@@ -5058,3 +5058,61 @@ fn cli_successful_discovery_resolves_only_its_effective_scan_error() {
     store.migrate().unwrap();
     assert_eq!(store.errors_since(SystemTime::UNIX_EPOCH).unwrap().len(), 2);
 }
+
+#[test]
+fn health_and_status_report_persistent_failures_without_changing_exit_codes() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .assert()
+        .success();
+    let store = Store::open(state.join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let run_id = store.start_run(ts).unwrap();
+    store
+        .record_clean_event(&car_go_clean::store::CleanEvent {
+            id: 0,
+            run_id,
+            ts,
+            path: root.to_string_lossy().into_owned(),
+            bytes_before: 100,
+            bytes_after: 100,
+            duration_ms: 1,
+            exit_code: Some(101),
+            stderr_excerpt: "missing or invalid CACHEDIR.TAG".into(),
+            outcome: car_go_clean::cleaner::CleanAttemptOutcome::CargoNonzero,
+            measurement_failed: false,
+        })
+        .unwrap();
+    for subcommand in ["health", "status"] {
+        let mut command = Command::cargo_bin("car-go-clean").unwrap();
+        command
+            .arg(subcommand)
+            .args(["--json", "--config"])
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state);
+        if subcommand == "health" {
+            command.arg("--skip-cargo");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let report = terminal_report(&output.stdout, subcommand);
+        assert_eq!(report["data"]["generation_state"], "current");
+        assert_eq!(report["outcome"]["reasons"], serde_json::json!([]));
+        assert_eq!(
+            report["data"]["unresolved_cleanup_failures"][0]["reason"],
+            "cargo_cache_tag"
+        );
+    }
+}
