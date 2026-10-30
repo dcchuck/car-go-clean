@@ -26,3 +26,7 @@ publish-jobs = ["./publish-shell-installer", "./publish-homebrew-formula"]
 github-custom-job-permissions = { "publish-shell-installer" = { contents = "write", attestations = "write", id-token = "write" }, "publish-homebrew-formula" = { contents = "read" } }
 # release.yml contains required repository-owned draft verification gates.
 allow-dirty = ["ci"]
+
+# Pin the supported Apple Silicon image used by release rehearsal and smoke tests.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"

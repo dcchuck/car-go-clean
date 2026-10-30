@@ -1038,6 +1038,11 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
     ] {
         assert!(dist.contains(value), "missing {value}");
     }
+    let config: toml::Value = toml::from_str(&dist).unwrap();
+    assert_eq!(
+        config["dist"]["github-custom-runners"]["aarch64-apple-darwin"].as_str(),
+        Some("macos-15")
+    );
     assert!(!dist.contains("post-announce-jobs"));
 }
 
@@ -1167,7 +1172,7 @@ fn rehearse_release_dispatch_is_exact_sha_bound_and_uses_only_pinned_actions() {
 fn rehearse_release_builds_and_smokes_the_four_native_install_paths() {
     let rehearsal = workflow(".github/workflows/rehearse-release.yml");
     let expected = BTreeSet::from([
-        ("aarch64-apple-darwin", "macos-14", "arm64"),
+        ("aarch64-apple-darwin", "macos-15", "arm64"),
         ("x86_64-apple-darwin", "macos-15-intel", "x86_64"),
         ("aarch64-unknown-linux-musl", "ubuntu-24.04-arm", "aarch64"),
         ("x86_64-unknown-linux-musl", "ubuntu-24.04", "x86_64"),
@@ -1906,7 +1911,7 @@ fn hosted_release_smoke_uses_public_versioned_assets_and_read_only_permissions()
     assert_eq!(
         actual,
         BTreeSet::from([
-            ("aarch64-apple-darwin", "macos-14", "arm64"),
+            ("aarch64-apple-darwin", "macos-15", "arm64"),
             ("x86_64-apple-darwin", "macos-15-intel", "x86_64"),
             ("aarch64-unknown-linux-musl", "ubuntu-24.04-arm", "aarch64"),
             ("x86_64-unknown-linux-musl", "ubuntu-24.04", "x86_64"),
