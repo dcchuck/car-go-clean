@@ -259,7 +259,7 @@ do not make a scan incomplete.
 | `car-go-clean run --review ID` | Execute only the persisted, still-safe targets in one review. |
 | `car-go-clean run` | Dynamically scan and clean a fresh target set; destructive and intentionally unreviewed. |
 | `car-go-clean health` | Validate config, Cargo availability, and state DB access; add `--json` for authority diagnostics. |
-| `car-go-clean status` | Show authority, cache, review, scheduler, and recovery state; add `--json` for the shared diagnostic shape. |
+| `car-go-clean status` | Show a concise service, discovery, last-run, history, and schedule summary; add `--verbose` for full diagnostics or `--json` for the unchanged diagnostic shape. |
 | `car-go-clean projects` | Refresh and summarize cached project cleanability decisions. |
 | `car-go-clean stats` | Show recovered bytes and top projects. |
 | `car-go-clean logs` | Tail logs or show recent stored errors. |

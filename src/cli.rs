@@ -202,6 +202,9 @@ enum Commands {
         state_dir: Option<PathBuf>,
         #[arg(long)]
         refresh: bool,
+        /// Show full diagnostic details (JSON always includes all details).
+        #[arg(long)]
+        verbose: bool,
         #[arg(long)]
         json: bool,
     },
@@ -847,8 +850,9 @@ fn execute(cli: Cli) -> Result<CommandOutcome> {
             config,
             state_dir,
             refresh,
+            verbose,
             json,
-        } => status(config, state_dir, refresh, json),
+        } => status(config, state_dir, refresh, verbose, json),
         Commands::Projects {
             config,
             state_dir,
@@ -1059,6 +1063,7 @@ fn status(
     config_path: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     refresh: bool,
+    verbose: bool,
     json: bool,
 ) -> Result<CommandOutcome> {
     let (cfg, config_source) = load_config_with_source(config_path)?;
@@ -1108,6 +1113,14 @@ fn status(
     }
 
     print_heading("Status");
+    if !verbose {
+        print_status_summary(&report.data, &store, &cfg, cached_projects)?;
+        print_text_outcome(&report);
+        println!(
+            "Details: car-go-clean status --verbose (use the same --config/--state-dir options)"
+        );
+        return Ok(status.outcome());
+    }
     print_cleanup_authority_diagnostics(&report.data);
     print_section("Cache");
     print_row("Cached projects", format_count(cached_projects));
@@ -1146,6 +1159,79 @@ fn status(
     print_scheduler_status(&store, &cfg)?;
     print_text_outcome(&report);
     Ok(status.outcome())
+}
+
+fn print_status_summary(
+    diagnostics: &CleanupAuthorityDiagnostics,
+    store: &Store,
+    cfg: &Config,
+    cached_projects: usize,
+) -> Result<()> {
+    print_row(
+        "Service",
+        format!(
+            "installed={} enabled={} running={}",
+            yes_no_unknown(diagnostics.service.installed),
+            yes_no_unknown(diagnostics.service.enabled),
+            yes_no_unknown(diagnostics.service.running),
+        ),
+    );
+    print_row("Discovery", diagnostics.generation_state);
+    print_row("Cached projects", format_count(cached_projects));
+    match store.last_run() {
+        Ok(run) => print_row(
+            "Last run",
+            format!(
+                "id={} cleaned={} recovered={} errors={}{}",
+                run.id,
+                format_count_i64(run.projects_cleaned),
+                format_bytes_i64(run.bytes_recovered),
+                format_count_i64(run.errors_count),
+                if run.finished_at.is_none() {
+                    " (unfinished)"
+                } else {
+                    ""
+                },
+            ),
+        ),
+        Err(_) => print_row("Last run", "<none>"),
+    }
+    print_row(
+        "Failure history",
+        format!(
+            "{} unresolved paths; historical records, not verified current failures",
+            format_count(diagnostics.unresolved_cleanup_failures.len()),
+        ),
+    );
+    match store.last_review_status()? {
+        Some(review) => print_row(
+            "Last review",
+            format!(
+                "{}; cleanable={} skipped={} (recorded snapshot)",
+                review_source_label(&review.source),
+                format_count(review.summary.cleanable_projects),
+                format_count(review.summary.skipped_projects),
+            ),
+        ),
+        None => print_row("Last review", "<none>"),
+    }
+    if !diagnostics.incomplete_origins.is_empty() {
+        print_row(
+            "Incomplete origins",
+            format_count(diagnostics.incomplete_origins.len()),
+        );
+    }
+    if diagnostics.service_environment_divergence == Some(true) {
+        print_row(
+            "Warning",
+            "service environment differs from current configuration; inspect --verbose",
+        );
+    }
+    if let Some(warning) = &diagnostics.service.warning {
+        print_row("Service warning", warning.kind);
+    }
+    print_scheduler_status(store, cfg)?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
