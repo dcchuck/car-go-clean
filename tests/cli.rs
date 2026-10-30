@@ -872,12 +872,19 @@ fn health_and_status_keep_cleanup_outcome_when_service_probe_fails() {
         if subcommand == "health" {
             text_command.arg("--skip-cargo");
         }
-        text_command
+        let assertion = text_command
             .assert()
             .code(2)
-            .stdout(contains("Service installed: <unknown>"))
-            .stdout(contains("Service warning: service_probe_failed"))
-            .stdout(contains("service probe denied"));
+            .stdout(contains("Service warning: service_probe_failed"));
+        if subcommand == "status" {
+            assertion.stdout(contains(
+                "Service: installed=<unknown> enabled=<unknown> running=<unknown>",
+            ));
+        } else {
+            assertion
+                .stdout(contains("Service installed: <unknown>"))
+                .stdout(contains("service probe denied"));
+        }
     }
 
     Command::cargo_bin("car-go-clean")
@@ -1064,6 +1071,12 @@ fn service_diagnostics_expose_installed_roots_with_service_definition_provenance
             .env("PATH", &path);
         if subcommand == "health" {
             command.arg("--skip-cargo");
+        }
+        if subcommand == "status" {
+            command.assert().code(2).stdout(contains(
+                "service environment differs from current configuration; inspect --verbose",
+            ));
+            command.arg("--verbose");
         }
         command
             .assert()
@@ -1902,14 +1915,19 @@ fn health_and_status_without_generation_are_incomplete_in_text_and_json() {
         if subcommand == "health" {
             text_command.arg("--skip-cargo");
         }
-        text_command
+        let assertion = text_command
             .assert()
             .code(2)
             .stdout(contains("Outcome: incomplete (code=2)"))
-            .stdout(contains("Reasons: generation_missing, scan_incomplete"))
-            .stdout(contains("Service installed: no"))
-            .stdout(contains("Service enabled: no"))
-            .stdout(contains("Service running: no"));
+            .stdout(contains("Reasons: generation_missing, scan_incomplete"));
+        if subcommand == "status" {
+            assertion.stdout(contains("Service: installed=no enabled=no running=no"));
+        } else {
+            assertion
+                .stdout(contains("Service installed: no"))
+                .stdout(contains("Service enabled: no"))
+                .stdout(contains("Service running: no"));
+        }
     }
 }
 
@@ -2066,6 +2084,8 @@ fn health_and_status_text_share_authority_diagnostics() {
             .env("HOME", &home);
         if subcommand == "health" {
             command.arg("--skip-cargo");
+        } else {
+            command.arg("--verbose");
         }
         command
             .assert()
@@ -2167,7 +2187,7 @@ fn status_text_and_json_present_the_same_authority_facts() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
-        .args(["status", "--config"])
+        .args(["status", "--verbose", "--config"])
         .arg(&config)
         .args(["--state-dir"])
         .arg(&state)
@@ -2268,7 +2288,7 @@ fn scan_run_stats_work_with_fake_cargo() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
-        .arg("status")
+        .args(["status", "--verbose"])
         .args(["--config"])
         .arg(&config)
         .args(["--state-dir"])
@@ -3417,7 +3437,7 @@ fn status_prints_safe_cleaning_summary() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
-        .arg("status")
+        .args(["status", "--verbose"])
         .args(["--config"])
         .arg(&config)
         .args(["--state-dir"])
@@ -3577,7 +3597,7 @@ fn dry_run_syncs_stale_cached_projects_before_status_snapshot() {
 
     Command::cargo_bin("car-go-clean")
         .unwrap()
-        .arg("status")
+        .args(["status", "--verbose"])
         .args(["--config"])
         .arg(&config)
         .args(["--state-dir"])
@@ -5115,4 +5135,138 @@ fn health_and_status_report_persistent_failures_without_changing_exit_codes() {
             "cargo_cache_tag"
         );
     }
+}
+
+#[test]
+fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let config = work.path().join("config.toml");
+    fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
+    let state = work.path().join("state");
+    let home = work.path().join("home");
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["scan", "--config"])
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .env("HOME", &home)
+        .assert()
+        .success();
+    let store = Store::open(state.join("state.db")).unwrap();
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let old = store.start_run(ts).unwrap();
+    for index in 0..19 {
+        store
+            .record_clean_event(&car_go_clean::store::CleanEvent {
+                id: 0,
+                run_id: old,
+                ts,
+                path: root
+                    .join(format!("historic-project-{index}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes_before: 100,
+                bytes_after: 100,
+                duration_ms: 1,
+                exit_code: Some(101),
+                stderr_excerpt: "missing or invalid CACHEDIR.TAG".into(),
+                outcome: car_go_clean::cleaner::CleanAttemptOutcome::CargoNonzero,
+                measurement_failed: false,
+            })
+            .unwrap();
+    }
+    store.finish_run(old, ts, 0, 0, 19).unwrap();
+    let last = store.start_run(ts + Duration::from_secs(1)).unwrap();
+    store
+        .finish_run(last, ts + Duration::from_secs(2), 3, 1024, 5)
+        .unwrap();
+    let invoke = |flags: &[&str]| {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("status")
+            .args(flags)
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .env("HOME", &home)
+            .output()
+            .unwrap()
+    };
+    let concise = invoke(&[]);
+    assert_eq!(concise.status.code(), Some(0));
+    let text = String::from_utf8(concise.stdout).unwrap();
+    assert!(text.contains("cleaned=3 recovered=1.0 KiB errors=5"));
+    assert!(text.contains(
+        "Failure history: 19 unresolved paths; historical records, not verified current failures"
+    ));
+    assert!(text.contains("status --verbose"));
+    assert!(!text.contains("historic-project-"));
+    assert!(!text.contains("Protected roots:"));
+    assert!(!text.contains("Policy hash:"));
+    assert!(
+        text.lines().count() <= 20,
+        "summary should remain bounded: {text}"
+    );
+    let verbose = invoke(&["--verbose"]);
+    assert_eq!(verbose.status.code(), Some(0));
+    let text = String::from_utf8(verbose.stdout).unwrap();
+    assert!(text.contains("Unresolved cleanup failures: 19"));
+    assert!(text.contains("historic-project-18"));
+    assert!(text.contains("Do not create a marker"));
+    assert!(text.contains("Protected roots:"));
+    assert!(text.contains("Policy hash:"));
+    let json = invoke(&["--json"]);
+    let verbose_json = invoke(&["--json", "--verbose"]);
+    assert_eq!(json.status.code(), Some(0));
+    assert_eq!(verbose_json.status.code(), json.status.code());
+    assert_eq!(verbose_json.stdout, json.stdout);
+    let report = terminal_report(&json.stdout, "status");
+    assert_eq!(
+        report["data"]["unresolved_cleanup_failures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        19
+    );
+    assert_eq!(store.unresolved_cleanup_failures().unwrap().len(), 19);
+}
+
+#[test]
+fn verbose_preserves_incomplete_status_and_invalid_config_json() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home) = seed_incomplete_diagnostic_state(&work);
+    let invoke = |flags: &[&str]| {
+        Command::cargo_bin("car-go-clean")
+            .unwrap()
+            .arg("status")
+            .args(flags)
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .env("HOME", &home)
+            .output()
+            .unwrap()
+    };
+    let concise = invoke(&[]);
+    assert_eq!(concise.status.code(), Some(2));
+    let text = String::from_utf8(concise.stdout).unwrap();
+    assert!(text.contains("Incomplete origins:"));
+    assert!(text.contains("Reasons: origin_incomplete, scan_incomplete"));
+    assert_eq!(invoke(&["--verbose"]).status.code(), Some(2));
+    let json = invoke(&["--json"]);
+    let verbose_json = invoke(&["--json", "--verbose"]);
+    assert_eq!(json.status.code(), Some(2));
+    assert_eq!(verbose_json.status.code(), Some(2));
+    assert_eq!(json.stdout, verbose_json.stdout);
+    fs::write(&config, "scan_dirs = [").unwrap();
+    let json = invoke(&["--json"]);
+    let verbose_json = invoke(&["--json", "--verbose"]);
+    assert_eq!(json.status.code(), Some(1));
+    assert_eq!(verbose_json.status.code(), Some(1));
+    assert_eq!(json.stdout, verbose_json.stdout);
 }

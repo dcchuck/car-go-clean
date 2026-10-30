@@ -1017,7 +1017,7 @@ fn cargo_dist_metadata_declares_the_public_release_contract() {
     let manifest = repo_file("Cargo.toml");
     let dist = repo_file("dist-workspace.toml");
     for value in [
-        "version = \"0.4.3\"",
+        "version = \"0.4.4\"",
         "repository = \"https://github.com/dcchuck/car-go-clean\"",
         "homepage = \"https://github.com/dcchuck/car-go-clean\"",
     ] {
@@ -2407,7 +2407,7 @@ fn release_workflow_is_tag_only_and_uses_dist() {
 #[test]
 fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     let output = Command::new("dist")
-        .args(["plan", "--tag=v0.4.3", "--output-format=json"])
+        .args(["plan", "--tag=v0.4.4", "--output-format=json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo-dist must be installed for release contract tests");
@@ -2418,7 +2418,7 @@ fn cargo_dist_plan_matches_the_reviewed_release_inventory() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plan["dist_version"], "0.32.0");
-    assert_eq!(plan["announcement_tag"], "v0.4.3");
+    assert_eq!(plan["announcement_tag"], "v0.4.4");
     let actual = plan["artifacts"]
         .as_object()
         .unwrap()

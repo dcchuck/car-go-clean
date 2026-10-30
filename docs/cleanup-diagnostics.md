@@ -1,5 +1,22 @@
 # Diagnosing retained build artifacts
 
+`status` gives a concise summary. Use `status --verbose` for failure paths,
+remediation, protected roots, policy details, and full review information.
+`status --json` always retains all diagnostics, regardless of `--verbose`.
+For example:
+
+```sh
+car-go-clean status
+car-go-clean status --verbose
+car-go-clean status --json | jq '.data.unresolved_cleanup_failures'
+car-go-clean logs --errors-only
+```
+
+The last run's error count is separate from unresolved historical paths.
+`logs --errors-only` shows recorded errors from the last seven days; unresolved
+history can be older. Neither is a live filesystem inspection. Use the same
+`--config`/`--state-dir` options for status detail views of a nondefault installation.
+
 `projects --all --json` explains discovery and current eligibility for cached
 projects. `scan` refreshes discovery; `run --dry-run --all` makes a fresh review
 without deleting outputs. Both write local state. `health` and `status` show
