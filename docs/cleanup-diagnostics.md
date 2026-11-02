@@ -87,3 +87,22 @@ Never infer permission from a volume name or use broad volume/system pruning.
 
 References: [Cargo validation change](https://github.com/rust-lang/cargo/pull/16712),
 [Cargo clean implementation](https://doc.rust-lang.org/beta/nightly-rustc/src/cargo/ops/cargo_clean.rs.html).
+
+## Failure lifecycle (0.4.5)
+
+The historical list means “no later successful measured cleanup,” not “currently
+failing.” Status now checks each path read-only and reports:
+
+- **Needs attention:** the target contains entries. Read the recorded error in
+  `car-go-clean status --verbose`; this is not cleanup authorization.
+- **Historical target gone/empty:** there is currently nothing to clean. The
+  record remains in history and will become actionable if files reappear.
+- **Unverified:** scope, protection, symlink, permissions, or concurrent changes
+  prevent a reliable observation. It is not silently dismissed.
+
+Repeated cache-marker errors receive a bounded seven-day automatic retry delay.
+Verbose status shows the deadline. Repairing cache metadata through the owning
+project's normal build workflow can end the delay; never fabricate a marker to
+force deletion. A fresh preview and reviewed execution can retry earlier, while
+retaining all active-process, quiet-period, identity and protected-storage checks.
+No database editing or manual deletion of failure records is needed.

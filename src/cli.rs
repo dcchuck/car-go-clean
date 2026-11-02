@@ -1197,12 +1197,41 @@ fn print_status_summary(
         Err(_) => print_row("Last run", "<none>"),
     }
     print_row(
-        "Failure history",
+        "Cleanup failures",
         format!(
-            "{} unresolved paths; historical records, not verified current failures",
-            format_count(diagnostics.unresolved_cleanup_failures.len()),
+            "{} need attention; {} unverified; {} historical targets gone/empty",
+            diagnostics
+                .cleanup_failure_observations
+                .iter()
+                .filter(|o| o.state == crate::failures::FailureState::NeedsAttention)
+                .count(),
+            diagnostics
+                .cleanup_failure_observations
+                .iter()
+                .filter(|o| o.state == crate::failures::FailureState::Unverified)
+                .count(),
+            diagnostics
+                .cleanup_failure_observations
+                .iter()
+                .filter(|o| matches!(
+                    o.state,
+                    crate::failures::FailureState::TargetMissing
+                        | crate::failures::FailureState::TargetEmpty
+                ))
+                .count(),
         ),
     );
+    let deferred = diagnostics
+        .cleanup_failure_observations
+        .iter()
+        .filter(|o| o.retry_after.is_some())
+        .count();
+    if deferred > 0 {
+        print_row(
+            "Automatic retries",
+            format!("{deferred} deferred; see status --verbose for retry times"),
+        );
+    }
     match store.last_review_status()? {
         Some(review) => print_row(
             "Last review",
@@ -1237,6 +1266,7 @@ fn print_status_summary(
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct CleanupAuthorityDiagnostics {
     unresolved_cleanup_failures: Vec<crate::store::CleanupFailure>,
+    cleanup_failure_observations: Vec<crate::failures::FailureObservation>,
     config_source: PathBuf,
     canonical_scope_roots: CanonicalScopeRootsDiagnostics,
     policy_hash: String,
@@ -1409,8 +1439,15 @@ fn cleanup_authority_diagnostics(
     let scan_error_paths = store.scan_error_paths_since(scan_error_since)?;
     let (service, service_environment_divergence) = service_diagnostics();
 
+    let unresolved_cleanup_failures = store.unresolved_cleanup_failures()?;
+    let observed_at = SystemTime::now();
+    let cleanup_failure_observations = unresolved_cleanup_failures
+        .iter()
+        .map(|failure| crate::failures::observe(failure, policy, observed_at))
+        .collect();
     Ok(CleanupAuthorityDiagnostics {
-        unresolved_cleanup_failures: store.unresolved_cleanup_failures()?,
+        cleanup_failure_observations,
+        unresolved_cleanup_failures,
         config_source: policy_diagnostics.config_source.to_path_buf(),
         canonical_scope_roots: CanonicalScopeRootsDiagnostics {
             scan_dirs: policy_diagnostics.canonical_scan_roots.to_vec(),
@@ -1548,7 +1585,7 @@ fn service_diagnostics() -> (ServiceStateDiagnostics, Option<bool>) {
 fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics) {
     print_section("Cleanup authority");
     print_row(
-        "Unresolved cleanup failures",
+        "Historical cleanup failures (without later measured success)",
         diagnostics.unresolved_cleanup_failures.len().to_string(),
     );
     for failure in &diagnostics.unresolved_cleanup_failures {
@@ -1559,7 +1596,23 @@ fn print_cleanup_authority_diagnostics(diagnostics: &CleanupAuthorityDiagnostics
             failure.consecutive_failures,
             format_bytes_i64(failure.bytes_remaining_at_attempt)
         );
-        println!("      {}", failure.remediation);
+        if let Some(observation) = diagnostics
+            .cleanup_failure_observations
+            .iter()
+            .find(|o| o.path == failure.path)
+        {
+            println!("      Current observation: {}", observation.reason);
+            if let Some(deadline) = observation.retry_after {
+                println!("      Automatic retry deferred until {}; valid cache metadata ends the delay. A fresh reviewed run may retry sooner.", humantime::format_rfc3339_seconds(SystemTime::UNIX_EPOCH + Duration::from_secs(deadline)));
+            }
+            if matches!(
+                observation.state,
+                crate::failures::FailureState::NeedsAttention
+                    | crate::failures::FailureState::Unverified
+            ) {
+                println!("      {}", failure.remediation);
+            }
+        }
     }
     print_row(
         "Config source",
