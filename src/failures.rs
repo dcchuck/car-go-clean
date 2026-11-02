@@ -373,8 +373,12 @@ mod policy_tests {
         .unwrap();
         for path in [
             root.join("excluded/project"),
-            root.join("Library/project"),
-            root.join("OrbStack/project"),
+            root.join(".cargo/project"),
+            root.join(if cfg!(target_os = "macos") {
+                "OrbStack/project"
+            } else {
+                ".local/share/containers/project"
+            }),
             PathBuf::from("/outside/project"),
         ] {
             let f = CleanupFailure {
