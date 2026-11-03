@@ -1114,7 +1114,7 @@ fn status(
 
     print_heading("Status");
     if !verbose {
-        print_status_summary(&report.data, &store, &cfg, cached_projects)?;
+        print_status_summary(&report.data, &store, &cfg, cached_projects, total)?;
         print_text_outcome(&report);
         println!(
             "Details: car-go-clean status --verbose (use the same --config/--state-dir options)"
@@ -1166,6 +1166,7 @@ fn print_status_summary(
     store: &Store,
     cfg: &Config,
     cached_projects: usize,
+    total_recovered: i64,
 ) -> Result<()> {
     print_row(
         "Service",
@@ -1178,6 +1179,10 @@ fn print_status_summary(
     );
     print_row("Discovery", diagnostics.generation_state);
     print_row("Cached projects", format_count(cached_projects));
+    print_row(
+        "Total bytes recovered (all time)",
+        format_bytes_i64(total_recovered),
+    );
     match store.last_run() {
         Ok(run) => print_row(
             "Last run",

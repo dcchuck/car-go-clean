@@ -5178,7 +5178,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
                     .join(format!("historic-project-{index}"))
                     .to_string_lossy()
                     .into_owned(),
-                bytes_before: 100,
+                bytes_before: 1000,
                 bytes_after: 100,
                 duration_ms: 1,
                 exit_code: Some(101),
@@ -5188,7 +5188,27 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
             })
             .unwrap();
     }
-    store.finish_run(old, ts, 0, 0, 19).unwrap();
+    store
+        .record_clean_event(&car_go_clean::store::CleanEvent {
+            id: 0,
+            run_id: old,
+            ts,
+            path: root
+                .join("successfully-cleaned")
+                .to_string_lossy()
+                .into_owned(),
+            bytes_before: 3 * 1024_i64.pow(4),
+            bytes_after: 0,
+            duration_ms: 1,
+            exit_code: Some(0),
+            stderr_excerpt: String::new(),
+            outcome: car_go_clean::cleaner::CleanAttemptOutcome::Success,
+            measurement_failed: false,
+        })
+        .unwrap();
+    store
+        .finish_run(old, ts, 1, 3 * 1024_i64.pow(4), 19)
+        .unwrap();
     let last = store.start_run(ts + Duration::from_secs(1)).unwrap();
     store
         .finish_run(last, ts + Duration::from_secs(2), 3, 1024, 5)
@@ -5210,6 +5230,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     assert_eq!(concise.status.code(), Some(0));
     let text = String::from_utf8(concise.stdout).unwrap();
     assert!(text.contains("cleaned=3 recovered=1.0 KiB errors=5"));
+    assert!(text.contains("Total bytes recovered (all time): 3.0 TiB"));
     assert!(text.contains(
         "Cleanup failures: 5 need attention; 0 unverified; 14 historical targets gone/empty"
     ));
@@ -5224,6 +5245,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     let verbose = invoke(&["--verbose"]);
     assert_eq!(verbose.status.code(), Some(0));
     let text = String::from_utf8(verbose.stdout).unwrap();
+    assert!(text.contains("Total bytes recovered (all time): 3.0 TiB"));
     assert!(text.contains("Historical cleanup failures (without later measured success): 19"));
     assert!(text.contains("historic-project-18"));
     assert!(text.contains("target observed absent"));
@@ -5262,7 +5284,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
             .clean_events_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .len(),
-        19
+        20
     );
 }
 
