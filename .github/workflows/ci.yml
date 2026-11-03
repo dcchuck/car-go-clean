@@ -53,4 +53,4 @@ jobs:
         with:
           toolchain: "1.95.0"
       - name: Check failure observations on the release runner
-        run: cargo test --locked --lib failures::
+        run: "cargo test --locked --lib failures::"
