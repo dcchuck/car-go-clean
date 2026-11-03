@@ -64,6 +64,8 @@ pub struct CleanupFailure {
     pub stderr_excerpt: String,
     pub reason: String,
     pub remediation: String,
+    #[serde(skip)]
+    pub(crate) previous_cache_tag_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1979,7 +1981,13 @@ impl Store {
                 SELECT path, MAX(id) AS id, COUNT(*) AS attempts FROM failures GROUP BY path
             )
             SELECT e.path, e.ts, l.attempts, e.bytes_after, e.exit_code,
-                   e.stderr_excerpt, e.attempt_outcome, e.measurement_failed
+                   e.stderr_excerpt, e.attempt_outcome, e.measurement_failed,
+                   EXISTS (
+                       SELECT 1 FROM clean_events p
+                       WHERE p.id = (SELECT MAX(id) FROM clean_events WHERE path = e.path AND id < e.id)
+                         AND p.attempt_outcome = 'cargo_nonzero'
+                         AND instr(p.stderr_excerpt, 'CACHEDIR.TAG') > 0
+                   )
             FROM latest l JOIN clean_events e ON e.id = l.id
             ORDER BY e.bytes_after DESC, e.path",
         )?;
@@ -1999,6 +2007,7 @@ impl Store {
                 consecutive_failures: row.get(2)?, bytes_remaining_at_attempt: row.get(3)?,
                 exit_code: row.get(4)?, stderr_excerpt: stderr,
                 reason: reason.to_string(), remediation: remediation.to_string(),
+                previous_cache_tag_failure: row.get(8)?,
             })
         })?;
         collect_rows(rows)

@@ -5427,3 +5427,45 @@ fn unresolved_failures_survive_time_and_reset_only_after_measured_success() {
         1
     );
 }
+
+#[test]
+fn cache_marker_backoff_requires_two_adjacent_marker_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap().join("project");
+    std::fs::create_dir_all(project.join("target")).unwrap();
+    std::fs::write(project.join("target/artifact"), b"x").unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::now() + Duration::from_secs(5);
+    let run = store.start_run(now).unwrap();
+    for (stderr, deferred) in [
+        ("other Cargo failure", false),
+        ("missing CACHEDIR.TAG", false),
+        ("missing CACHEDIR.TAG", true),
+    ] {
+        store
+            .record_clean_event(&car_go_clean::store::CleanEvent {
+                id: 0,
+                run_id: run,
+                ts: now,
+                path: project.to_string_lossy().into_owned(),
+                bytes_before: 1,
+                bytes_after: 1,
+                duration_ms: 1,
+                exit_code: Some(101),
+                stderr_excerpt: stderr.into(),
+                outcome: car_go_clean::cleaner::CleanAttemptOutcome::CargoNonzero,
+                measurement_failed: false,
+            })
+            .unwrap();
+        let failures = store.unresolved_cleanup_failures().unwrap();
+        assert_eq!(
+            car_go_clean::failures::retry_after(&failures[0], now).is_some(),
+            deferred
+        );
+        assert!(serde_json::to_value(&failures[0])
+            .unwrap()
+            .get("previous_cache_tag_failure")
+            .is_none());
+    }
+}

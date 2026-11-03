@@ -7570,3 +7570,124 @@ fn daemon_logs_failed_cycle_as_warning() {
     assert_eq!(event["bytes_recovered"], 0);
     assert_eq!(event["errors"], 1);
 }
+
+#[test]
+fn repeated_marker_failures_back_off_but_reviewed_retries_still_validate_safety() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let project = root_path.join("proj");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/artifact"), b"retained");
+    let db = tempfile::tempdir().unwrap();
+    let store = Store::open(db.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let now = SystemTime::now() + Duration::from_secs(5);
+    let runner = FakeRunner {
+        exit_code: 101,
+        stderr: "missing CACHEDIR.TAG".into(),
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root_path],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    .with_clock(Arc::new(FixedClock { now }));
+    daemon.scan_cycle().unwrap();
+    let safety = SafetyOptions {
+        target_quiet_period: Duration::ZERO,
+        include_managed_cache: false,
+        include_active: false,
+        force: false,
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            daemon
+                .run_cycle_with_safety(safety, &NoopProcessInspector)
+                .unwrap()
+                .cargo_failures,
+            1
+        );
+    }
+    let deferred = daemon
+        .run_cycle_with_safety(safety, &NoopProcessInspector)
+        .unwrap();
+    assert_eq!(
+        (deferred.cleaned, deferred.skipped, deferred.errors),
+        (0, 1, 0)
+    );
+    assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(project.join("target/artifact").exists());
+    let review = review_project_with_identity_provider(
+        &project,
+        &[],
+        &[],
+        &[],
+        now,
+        &safety,
+        &SystemIdentityProvider,
+    )
+    .unwrap();
+    assert_eq!(review.decision, CleanDecision::Cleanable);
+    let retried = daemon
+        .execute_reviews_with_safety(
+            vec![review.clone()],
+            false,
+            safety,
+            &NoopProcessInspector,
+            RunSource::Reviewed,
+        )
+        .unwrap();
+    assert_eq!(retried.cargo_failures, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    // An explicit retry never overrides newly active-build protection.
+    let active = ArgumentsProcessInspector {
+        arguments: vec![project.join("target/artifact")],
+        cwd: Some(project.clone()),
+    };
+    let blocked = daemon
+        .execute_reviews_with_safety(vec![review], false, safety, &active, RunSource::Reviewed)
+        .unwrap();
+    assert_eq!(blocked.skipped, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    write_file(
+        &project.join("target/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    );
+    assert_eq!(
+        daemon
+            .run_cycle_with_safety(safety, &NoopProcessInspector)
+            .unwrap()
+            .cargo_failures,
+        1
+    );
+    assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    fs::remove_file(project.join("target/CACHEDIR.TAG")).unwrap();
+    let daemon = daemon.with_clock(Arc::new(FixedClock {
+        now: now + car_go_clean::failures::RETRY_DELAY,
+    }));
+    assert_eq!(
+        daemon
+            .run_cycle_with_safety(safety, &NoopProcessInspector)
+            .unwrap()
+            .cargo_failures,
+        1
+    );
+    assert_eq!(runner.calls.lock().unwrap().len(), 5);
+}

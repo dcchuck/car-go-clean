@@ -5142,6 +5142,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     let work = tempfile::tempdir().unwrap();
     let root = work.path().join("root");
     fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
     let config = work.path().join("config.toml");
     fs::write(&config, format!("scan_dirs = [\"{}\"]\n", root.display())).unwrap();
     let state = work.path().join("state");
@@ -5159,6 +5160,15 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
     let old = store.start_run(ts).unwrap();
     for index in 0..19 {
+        let target = root
+            .join(format!("historic-project-{index}"))
+            .join("target");
+        if !(9..14).contains(&index) {
+            fs::create_dir_all(&target).unwrap();
+        }
+        if index >= 14 {
+            fs::write(target.join("artifact"), b"leftover").unwrap();
+        }
         store
             .record_clean_event(&car_go_clean::store::CleanEvent {
                 id: 0,
@@ -5168,7 +5178,7 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
                     .join(format!("historic-project-{index}"))
                     .to_string_lossy()
                     .into_owned(),
-                bytes_before: 100,
+                bytes_before: 1000,
                 bytes_after: 100,
                 duration_ms: 1,
                 exit_code: Some(101),
@@ -5178,7 +5188,27 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
             })
             .unwrap();
     }
-    store.finish_run(old, ts, 0, 0, 19).unwrap();
+    store
+        .record_clean_event(&car_go_clean::store::CleanEvent {
+            id: 0,
+            run_id: old,
+            ts,
+            path: root
+                .join("successfully-cleaned")
+                .to_string_lossy()
+                .into_owned(),
+            bytes_before: 3 * 1024_i64.pow(4),
+            bytes_after: 0,
+            duration_ms: 1,
+            exit_code: Some(0),
+            stderr_excerpt: String::new(),
+            outcome: car_go_clean::cleaner::CleanAttemptOutcome::Success,
+            measurement_failed: false,
+        })
+        .unwrap();
+    store
+        .finish_run(old, ts, 1, 3 * 1024_i64.pow(4), 19)
+        .unwrap();
     let last = store.start_run(ts + Duration::from_secs(1)).unwrap();
     store
         .finish_run(last, ts + Duration::from_secs(2), 3, 1024, 5)
@@ -5200,8 +5230,9 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     assert_eq!(concise.status.code(), Some(0));
     let text = String::from_utf8(concise.stdout).unwrap();
     assert!(text.contains("cleaned=3 recovered=1.0 KiB errors=5"));
+    assert!(text.contains("Total bytes recovered (all time): 3.0 TiB"));
     assert!(text.contains(
-        "Failure history: 19 unresolved paths; historical records, not verified current failures"
+        "Cleanup failures: 5 need attention; 0 unverified; 14 historical targets gone/empty"
     ));
     assert!(text.contains("status --verbose"));
     assert!(!text.contains("historic-project-"));
@@ -5214,8 +5245,10 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
     let verbose = invoke(&["--verbose"]);
     assert_eq!(verbose.status.code(), Some(0));
     let text = String::from_utf8(verbose.stdout).unwrap();
-    assert!(text.contains("Unresolved cleanup failures: 19"));
+    assert!(text.contains("Total bytes recovered (all time): 3.0 TiB"));
+    assert!(text.contains("Historical cleanup failures (without later measured success): 19"));
     assert!(text.contains("historic-project-18"));
+    assert!(text.contains("target observed absent"));
     assert!(text.contains("Do not create a marker"));
     assert!(text.contains("Protected roots:"));
     assert!(text.contains("Policy hash:"));
@@ -5232,7 +5265,27 @@ fn concise_status_separates_last_run_errors_from_history_and_preserves_json() {
             .len(),
         19
     );
+    let observations = report["data"]["cleanup_failure_observations"]
+        .as_array()
+        .unwrap();
+    for (state, count) in [
+        ("target_empty", 9),
+        ("target_missing", 5),
+        ("needs_attention", 5),
+    ] {
+        assert_eq!(
+            observations.iter().filter(|o| o["state"] == state).count(),
+            count
+        );
+    }
     assert_eq!(store.unresolved_cleanup_failures().unwrap().len(), 19);
+    assert_eq!(
+        store
+            .clean_events_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .len(),
+        20
+    );
 }
 
 #[test]

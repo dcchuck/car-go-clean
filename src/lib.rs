@@ -4,6 +4,7 @@ pub mod cleaner;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod failures;
 pub mod identity;
 pub mod lockfile;
 pub mod logging;

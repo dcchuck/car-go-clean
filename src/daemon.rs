@@ -556,6 +556,7 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
         let mut measurement_failures = 0;
         let mut cleanup_failures = 0;
 
+        let failures = self.store.unresolved_cleanup_failures()?;
         for prepared in &mut reviews {
             let review = &mut prepared.review;
             let path = review.path.clone();
@@ -593,6 +594,16 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                 })?;
             }
             if review.decision != CleanDecision::Cleanable {
+                continue;
+            }
+
+            if source == RunSource::Dynamic
+                && failures.iter().any(|failure| {
+                    std::path::Path::new(&failure.path) == path
+                        && crate::failures::retry_after(failure, self.clock.now()).is_some()
+                })
+            {
+                cleaner_skipped += 1;
                 continue;
             }
 
