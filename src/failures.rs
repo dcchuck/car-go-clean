@@ -116,6 +116,12 @@ fn inspect_with_hook(target: &Path, after_read: impl FnOnce()) -> Result<Failure
         }
     }
     after_read();
+    // Directory timestamps can coalesce multiple writes on Linux. Re-read
+    // emptiness directly, then retain the identity/metadata revalidation below.
+    // This remains an observation, not a guarantee against later writes.
+    if state == FailureState::TargetEmpty {
+        recheck_empty(target)?;
+    }
     for (path, before) in checked.iter().rev() {
         let after = fs::symlink_metadata(path)
             .map_err(|e| format!("path changed during inspection: {e}"))?;
@@ -137,6 +143,18 @@ fn inspect_with_hook(target: &Path, after_read: impl FnOnce()) -> Result<Failure
         return Err("missing path changed during inspection; not reconciled".into());
     }
     Ok(state)
+}
+
+fn recheck_empty(target: &Path) -> Result<(), String> {
+    let entry = fs::read_dir(target)
+        .map_err(|e| format!("cannot recheck empty target: {e}"))?
+        .next()
+        .transpose()
+        .map_err(|e| format!("cannot recheck target entry: {e}"))?;
+    if entry.is_some() {
+        return Err("target gained entries during inspection; not reconciled".into());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -258,6 +276,19 @@ mod tests {
             fs::create_dir(&target).unwrap();
         })
         .is_err());
+    }
+
+    #[test]
+    fn emptiness_recheck_uses_entries_without_relying_on_timestamps() {
+        let (_dir, project) = fixture();
+        let target = project.join("target");
+        fs::create_dir(&target).unwrap();
+        assert!(recheck_empty(&target).is_ok());
+        fs::write(target.join("zero-byte"), []).unwrap();
+        assert!(recheck_empty(&target).is_err());
+        fs::remove_file(target.join("zero-byte")).unwrap();
+        symlink("missing", target.join("dangling")).unwrap();
+        assert!(recheck_empty(&target).is_err());
     }
 
     #[test]
