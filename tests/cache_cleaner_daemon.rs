@@ -7691,3 +7691,125 @@ fn repeated_marker_failures_back_off_but_reviewed_retries_still_validate_safety(
     );
     assert_eq!(runner.calls.lock().unwrap().len(), 5);
 }
+
+#[cfg(unix)]
+#[test]
+fn protect_command_claim_after_review_is_seen_at_the_final_pre_spawn_check() {
+    use car_go_clean::activity::ProtectCommandInspector;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/debug/server"), &[0; 2048]);
+    let lease = root.path().join("lease");
+    let hook = root.path().join("protect");
+    write_file(
+        &hook,
+        format!(
+            "#!/bin/sh\n[ -e '{}' ] && exit 0\nexit 1\n",
+            lease.display()
+        )
+        .as_bytes(),
+    );
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = vec![hook.to_string_lossy().into_owned()];
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let reporter_lease = lease.clone();
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    )
+    // The attempt reporter runs after review and immediately before the final
+    // pre-spawn validator: an agent takes its lease in that window.
+    .with_target_reporter(move |_| fs::write(&reporter_lease, b"").unwrap());
+    daemon.scan_cycle().unwrap();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: false,
+                force: false,
+            },
+            &ProtectCommandInspector::new(&NoopProcessInspector, &command),
+        )
+        .unwrap();
+
+    assert!(lease.exists(), "the reporter should have taken the lease");
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert_eq!(result.cleaned, 0);
+    assert!(project.join("target/debug/server").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn include_active_still_overrides_a_fresh_protect_command_claim() {
+    use car_go_clean::activity::ProtectCommandInspector;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_file(&project.join("Cargo.toml"), b"[package]\n");
+    write_file(&project.join("target/debug/server"), &[0; 2048]);
+    let hook = root.path().join("protect");
+    write_file(&hook, b"#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = vec![hook.to_string_lossy().into_owned()];
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(db_dir.path().join("state.db")).unwrap();
+    store.migrate().unwrap();
+    let runner = FakeRunner {
+        delete_target: true,
+        ..FakeRunner::default()
+    };
+    let daemon = Daemon::new(
+        &store,
+        Cache::new(&store),
+        authoritative_scanner(ScannerOptions {
+            roots: vec![root.path().to_path_buf()],
+            project_dirs: vec![],
+            excludes: vec![],
+        }),
+        Cleaner::new("cargo", runner.clone(), Duration::from_secs(60)),
+        DaemonOptions {
+            target_quiet_period: Duration::ZERO,
+            ..DaemonOptions::default()
+        },
+    );
+    daemon.scan_cycle().unwrap();
+
+    let result = daemon
+        .run_cycle_with_safety(
+            SafetyOptions {
+                target_quiet_period: Duration::ZERO,
+                include_managed_cache: false,
+                include_active: true,
+                force: false,
+            },
+            &ProtectCommandInspector::new(&NoopProcessInspector, &command),
+        )
+        .unwrap();
+
+    assert_eq!(result.cleaned, 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}

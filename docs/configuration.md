@@ -116,8 +116,11 @@ the project path appended as the last argument:
   seconds also claims the project, so a broken command fails closed.
 
 The command can only remove projects from cleanup, never add them. It runs
-during review and again immediately before Cargo, like the process check, and
-`--include-active` and `--force` bypass it the same way. It is not part of the
+during review and again immediately before Cargo. Process activity is sampled
+at most every 30 seconds, but the final pre-spawn check always runs
+`protect_command` fresh for that one project, so a claim made after review is
+never missed. `--include-active` and `--force` bypass it as they bypass process
+activity. It is not part of the
 policy hash, so changing it does not invalidate the current generation.
 
 ## Legacy key and migration

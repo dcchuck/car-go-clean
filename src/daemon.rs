@@ -652,6 +652,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                             )?,
                             None => CleanDecision::Skipped(SkipReason::OutOfScope),
                         };
+                        // The activity sample above may be cached; a claim such as
+                        // protect_command is rechecked fresh, with the same overrides.
+                        if review.decision == CleanDecision::Cleanable
+                            && !safety.force
+                            && !safety.include_active
+                            && activity_sampler.fresh_claim(&path).is_some()
+                        {
+                            review.decision = CleanDecision::Skipped(SkipReason::ActiveProcess);
+                        }
                         Ok(review.decision == CleanDecision::Cleanable)
                     },
                 ) {
