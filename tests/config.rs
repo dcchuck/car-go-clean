@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -543,4 +543,42 @@ fn xdg_state_home_rejects_empty_and_relative_roots() {
         assert!(error.contains("XDG_STATE_HOME"), "{error}");
         assert!(error.contains("nonempty absolute path"), "{error}");
     }
+}
+
+#[test]
+fn protect_command_defaults_off_and_round_trips() {
+    assert!(Config::default().protect_command.is_empty());
+    assert!(!Config::default()
+        .to_toml()
+        .unwrap()
+        .contains("protect_command"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "protect_command = [\"/usr/local/bin/disk-lease\", \"check\"]\n",
+    )
+    .unwrap();
+
+    let cfg = load(&path).unwrap();
+
+    assert_eq!(cfg.protect_command, ["/usr/local/bin/disk-lease", "check"]);
+    fs::write(&path, cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(load(&path).unwrap().protect_command, cfg.protect_command);
+}
+
+#[test]
+fn protect_command_expands_home_and_requires_an_absolute_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+
+    fs::write(&path, "protect_command = [\"~/bin/guard\"]\n").unwrap();
+    let cfg = load(&path).unwrap();
+    assert!(Path::new(&cfg.protect_command[0]).is_absolute());
+    assert!(cfg.protect_command[0].ends_with("/bin/guard"));
+
+    fs::write(&path, "protect_command = [\"guard\"]\n").unwrap();
+    let error = load(&path).unwrap_err();
+    assert!(format!("{error:#}").contains("protect_command: program must be an absolute path"));
 }

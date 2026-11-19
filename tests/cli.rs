@@ -5323,3 +5323,52 @@ fn verbose_preserves_incomplete_status_and_invalid_config_json() {
     assert_eq!(verbose_json.status.code(), Some(1));
     assert_eq!(json.stdout, verbose_json.stdout);
 }
+
+#[cfg(unix)]
+#[test]
+fn protect_command_keeps_claimed_projects_out_of_review_and_cleanup() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, state, home, path) = review_fixture(&work, &["keep", "free"]);
+    let guard = work.path().join("guard");
+    write_executable(
+        &guard,
+        "#!/bin/sh\ncase \"$1\" in */keep) exit 0 ;; *) exit 1 ;; esac\n",
+    );
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!("protect_command = [\"{}\"]\n", guard.display()));
+    fs::write(&config, contents).unwrap();
+    write_executable(
+        &PathBuf::from(path.to_str().unwrap().split(':').next().unwrap()).join("cargo"),
+        "#!/bin/sh\nrm -rf target\n",
+    );
+    std::thread::sleep(Duration::from_millis(10));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--dry-run", "--all", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("Cleanable projects: 1"))
+        .stdout(contains("active_process=1"));
+
+    Command::cargo_bin("car-go-clean")
+        .unwrap()
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(contains("Run complete: cleaned=1"));
+
+    let root = work.path().join("root");
+    assert!(root.join("keep/target/blob.bin").exists());
+    assert!(!root.join("free/target").exists());
+}

@@ -1,4 +1,4 @@
-use crate::activity::ProcessInspector;
+use crate::activity::{ProcessInspector, ProtectCommandInspector, SysinfoProcessInspector};
 use crate::cache::Cache;
 use crate::cleaner::{default_cargo_candidates, resolve_cargo_bin, Cleaner, RealRunner};
 use crate::config::{
@@ -1083,6 +1083,7 @@ fn status(
             &policy,
             &safety,
             cfg.scan_interval,
+            &cfg.protect_command,
             "status --refresh",
         )?;
         if batch.coverage_incomplete {
@@ -1786,7 +1787,14 @@ fn projects(
         include_active: active,
         force: false,
     };
-    let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "projects")?;
+    let batch = project_reviews(
+        &store,
+        &policy,
+        &safety,
+        cfg.scan_interval,
+        &cfg.protect_command,
+        "projects",
+    )?;
     let status = review_batch_incomplete_status(&batch);
     let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
     let scan_errors = review_batch_scan_errors(&batch, &diagnostics);
@@ -2083,7 +2091,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
                 .collect(),
             plan.coverage_incomplete,
             reviewed_safety,
-            &crate::activity::SysinfoProcessInspector,
+            &activity_inspector(&cfg),
             RunSource::Reviewed,
         )?;
         let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
@@ -2114,7 +2122,14 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
 
     if dry_run {
         reconcile_review_state(&store, &cfg, &policy)?;
-        let batch = project_reviews(&store, &policy, &safety, cfg.scan_interval, "dry-run")?;
+        let batch = project_reviews(
+            &store,
+            &policy,
+            &safety,
+            cfg.scan_interval,
+            &cfg.protect_command,
+            "dry-run",
+        )?;
         status = status.merge(review_batch_incomplete_status(&batch));
         let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
         scan_errors.extend(review_batch_scan_errors(&batch, &diagnostics));
@@ -2194,7 +2209,7 @@ fn run_once(options: RunOptions) -> Result<CommandOutcome> {
                 );
             }
         });
-    let result = daemon.run_cycle_with_safety(safety, &crate::activity::SysinfoProcessInspector)?;
+    let result = daemon.run_cycle_with_safety(safety, &activity_inspector(&cfg))?;
     let diagnostics = cleanup_authority_diagnostics(&policy, &store, cfg.scan_interval)?;
     scan_errors.extend(diagnostics_scan_errors(&diagnostics));
     normalize_scan_errors(&mut scan_errors);
@@ -2277,6 +2292,7 @@ fn project_reviews(
     policy: &ScopePolicy,
     safety: &SafetyOptions,
     scan_interval: Duration,
+    protect_command: &[String],
     source: &str,
 ) -> Result<ReviewBatch> {
     let now = SystemTime::now();
@@ -2305,7 +2321,8 @@ fn project_reviews(
     let durable_generation_incomplete =
         store.current_generation_coverage_incomplete(policy.hash())?;
     let discovery_blocks = store.blocked_worktree_discovery_paths()?;
-    let activity = crate::activity::SysinfoProcessInspector.active_projects(&paths)?;
+    let activity = ProtectCommandInspector::new(&SysinfoProcessInspector, protect_command)
+        .active_projects(&paths)?;
 
     let reviews = observations
         .iter()
@@ -2724,7 +2741,8 @@ impl DaemonCycleFactory for ConfigCycleFactory {
                 scan_interval: cfg.scan_interval,
                 target_quiet_period: cfg.target_quiet_period,
             },
-        ))
+        )
+        .with_protect_command(cfg.protect_command))
     }
 }
 
@@ -2938,6 +2956,10 @@ fn daemon_for_clean<'a>(
             target_quiet_period: cfg.target_quiet_period,
         },
     )
+}
+
+fn activity_inspector(cfg: &Config) -> ProtectCommandInspector<'_, SysinfoProcessInspector> {
+    ProtectCommandInspector::new(&SysinfoProcessInspector, &cfg.protect_command)
 }
 
 fn scanner_for(cfg: &Config, policy: &ScopePolicy) -> Scanner {

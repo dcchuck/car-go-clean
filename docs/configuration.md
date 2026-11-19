@@ -25,6 +25,7 @@ clean_interval = "24h"
 scan_interval = "24h"
 target_quiet_period = "2h"
 log_level = "info"
+protect_command = []
 ```
 
 - `scan_dirs` defaults to `[$HOME]`; `project_dirs` defaults to an empty list.
@@ -34,6 +35,8 @@ log_level = "info"
   `250ms`, `2h`, `1d`, or `1 week`.
 - `log_level` defaults to `info` and accepts only `debug`, `info`, `warn`, or
   `error`.
+- `protect_command` defaults to empty (off). See [External protection
+  command](#external-protection-command).
 
 [humantime]: https://docs.rs/humantime/latest/humantime/fn.parse_duration.html
 
@@ -91,6 +94,31 @@ do not have every supported package manager, container runtime, or VM manager
 installed. A missing optional absolute exclusion is normal. An absolute
 exclusion that exists but cannot be canonicalized is an authority error and
 blocks that cycle.
+
+## External protection command
+
+`protect_command` lets another tool veto cleanup, for example a session
+manager that knows which worktrees an agent is still using:
+
+```toml
+protect_command = ["~/.local/bin/disk-lease", "check"]
+```
+
+The first element is the program and must be an absolute path after `~` and
+`$NAME` expansion; it runs directly, without a shell. Whenever car-go-clean
+samples process activity, it runs the command once per candidate project with
+the project path appended as the last argument:
+
+- exit `0` claims the project: it is treated as active and skipped as
+  `active_process`;
+- exit `1` leaves the decision to the other gates;
+- any other exit code, a signal, a failure to start, or running longer than 10
+  seconds also claims the project, so a broken command fails closed.
+
+The command can only remove projects from cleanup, never add them. It runs
+during review and again immediately before Cargo, like the process check, and
+`--include-active` and `--force` bypass it the same way. It is not part of the
+policy hash, so changing it does not invalidate the current generation.
 
 ## Legacy key and migration
 
