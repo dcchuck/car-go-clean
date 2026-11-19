@@ -7,10 +7,13 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 use sysinfo::System;
 
 pub const ACTIVITY_MAX_AGE: Duration = Duration::from_secs(30);
+pub const PROTECT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivitySignal {
@@ -21,6 +24,12 @@ pub struct ActivitySignal {
 
 pub trait ProcessInspector {
     fn active_projects(&self, projects: &[PathBuf]) -> Result<Vec<ActivitySignal>>;
+
+    /// A claim on one project that must be checked fresh at the final
+    /// pre-spawn boundary instead of being served from a cached sample.
+    fn fresh_claim(&self, _project: &Path) -> Option<ActivitySignal> {
+        None
+    }
 }
 
 pub struct ActivitySampler<'a, I: ProcessInspector + ?Sized> {
@@ -59,6 +68,11 @@ impl<'a, I: ProcessInspector + ?Sized> ActivitySampler<'a, I> {
         }
         Ok(&self.active)
     }
+
+    /// Bypasses the sample cache; see `ProcessInspector::fresh_claim`.
+    pub fn fresh_claim(&self, project: &Path) -> Option<ActivitySignal> {
+        self.inspector.fresh_claim(project)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -67,6 +81,84 @@ pub struct NoopProcessInspector;
 impl ProcessInspector for NoopProcessInspector {
     fn active_projects(&self, _projects: &[PathBuf]) -> Result<Vec<ActivitySignal>> {
         Ok(Vec::new())
+    }
+}
+
+/// Adds the claims of the configured `protect_command` to another inspector's
+/// activity. The command runs once per project with the project path appended:
+/// exit 0 claims the project, exit 1 leaves it alone, and anything else (a
+/// spawn failure, another exit code, a signal or a timeout) claims it, so a
+/// broken command fails closed. The command also runs fresh at the final
+/// pre-spawn check, so a claim made after review is never missed.
+pub struct ProtectCommandInspector<'a, I: ProcessInspector + ?Sized> {
+    inner: &'a I,
+    command: &'a [String],
+}
+
+impl<'a, I: ProcessInspector + ?Sized> ProtectCommandInspector<'a, I> {
+    pub fn new(inner: &'a I, command: &'a [String]) -> Self {
+        Self { inner, command }
+    }
+
+    fn claim(&self, project: &Path) -> Option<ActivitySignal> {
+        let (program, args) = self.command.split_first()?;
+        protect_command_claim(program, args, project).map(|reason| ActivitySignal {
+            pid: 0,
+            project_path: project.to_path_buf(),
+            reason,
+        })
+    }
+}
+
+impl<I: ProcessInspector + ?Sized> ProcessInspector for ProtectCommandInspector<'_, I> {
+    fn active_projects(&self, projects: &[PathBuf]) -> Result<Vec<ActivitySignal>> {
+        let mut signals = self.inner.active_projects(projects)?;
+        signals.extend(projects.iter().filter_map(|project| self.claim(project)));
+        Ok(signals)
+    }
+
+    fn fresh_claim(&self, project: &Path) -> Option<ActivitySignal> {
+        self.inner
+            .fresh_claim(project)
+            .or_else(|| self.claim(project))
+    }
+}
+
+pub fn protect_command_claim(program: &str, args: &[String], project: &Path) -> Option<String> {
+    let mut child = match Command::new(program)
+        .args(args)
+        .arg(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Some(format!("protect_command failed to start: {error}")),
+    };
+    let deadline = Instant::now() + PROTECT_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return match status.code() {
+                    Some(0) => Some("protect_command claimed project".to_string()),
+                    Some(1) => None,
+                    Some(code) => Some(format!("protect_command exited {code}")),
+                    None => Some("protect_command terminated by a signal".to_string()),
+                };
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some("protect_command timed out".to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!("protect_command failed: {error}"));
+            }
+        }
     }
 }
 

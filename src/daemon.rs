@@ -103,11 +103,21 @@ impl Default for DaemonOptions {
 pub struct DaemonCycleSnapshot {
     scanner: Scanner,
     options: DaemonOptions,
+    protect_command: Vec<String>,
 }
 
 impl DaemonCycleSnapshot {
     pub fn new(scanner: Scanner, options: DaemonOptions) -> Self {
-        Self { scanner, options }
+        Self {
+            scanner,
+            options,
+            protect_command: Vec::new(),
+        }
+    }
+
+    pub fn with_protect_command(mut self, command: Vec<String>) -> Self {
+        self.protect_command = command;
+        self
     }
 
     pub fn scanner(&self) -> &Scanner {
@@ -330,7 +340,11 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
             include_active: false,
             force: false,
         };
-        self.run_cycle_with_snapshot(&snapshot, opts, &crate::activity::SysinfoProcessInspector)?;
+        let inspector = crate::activity::ProtectCommandInspector::new(
+            &crate::activity::SysinfoProcessInspector,
+            &snapshot.protect_command,
+        );
+        self.run_cycle_with_snapshot(&snapshot, opts, &inspector)?;
         Ok(())
     }
 
@@ -638,6 +652,15 @@ impl<'a, R: CommandRunner> Daemon<'a, R> {
                             )?,
                             None => CleanDecision::Skipped(SkipReason::OutOfScope),
                         };
+                        // The activity sample above may be cached; a claim such as
+                        // protect_command is rechecked fresh, with the same overrides.
+                        if review.decision == CleanDecision::Cleanable
+                            && !safety.force
+                            && !safety.include_active
+                            && activity_sampler.fresh_claim(&path).is_some()
+                        {
+                            review.decision = CleanDecision::Skipped(SkipReason::ActiveProcess);
+                        }
                         Ok(review.decision == CleanDecision::Cleanable)
                     },
                 ) {

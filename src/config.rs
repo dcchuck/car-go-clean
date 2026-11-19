@@ -22,6 +22,7 @@ pub struct Config {
     pub scan_interval: Duration,
     pub target_quiet_period: Duration,
     pub log_level: String,
+    pub protect_command: Vec<String>,
     editable_default_excludes: Vec<String>,
     extra_excludes: Vec<String>,
     override_excludes: Option<Vec<String>>,
@@ -40,6 +41,7 @@ struct RawConfig {
     scan_interval: Option<String>,
     target_quiet_period: Option<String>,
     log_level: Option<String>,
+    protect_command: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +55,8 @@ struct ConfigOutput<'a> {
     scan_interval: String,
     target_quiet_period: String,
     log_level: &'a str,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    protect_command: &'a [String],
 }
 
 impl Default for Config {
@@ -70,6 +74,7 @@ impl Default for Config {
             scan_interval: default_scan_interval(),
             target_quiet_period: default_target_quiet_period(),
             log_level: default_log_level(),
+            protect_command: Vec::new(),
             editable_default_excludes: default_excludes(),
             extra_excludes: Vec::new(),
             override_excludes: None,
@@ -102,6 +107,7 @@ impl Config {
             scan_interval: humantime::format_duration(self.scan_interval).to_string(),
             target_quiet_period: humantime::format_duration(self.target_quiet_period).to_string(),
             log_level: &self.log_level,
+            protect_command: &self.protect_command,
         })
         .context("serialize effective configuration")
     }
@@ -127,6 +133,13 @@ impl Config {
         }
         require_absolute(&self.scan_dirs, "scan_dirs")?;
         require_absolute(&self.project_dirs, "project_dirs")?;
+        if let Some(program) = self.protect_command.first() {
+            if !Path::new(program).is_absolute() {
+                return Err(anyhow!(
+                    "protect_command: program must be an absolute path; got {program:?}"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -392,6 +405,14 @@ fn apply_overlay(raw: RawConfig) -> Result<Config> {
     }
     if let Some(value) = raw.log_level {
         cfg.log_level = value;
+    }
+    if let Some(mut command) = raw.protect_command {
+        if let Some(program) = command.first_mut() {
+            *program = expand_path(PathBuf::from(&*program), "protect_command")?
+                .to_string_lossy()
+                .into_owned();
+        }
+        cfg.protect_command = command;
     }
     if legacy {
         cfg.warnings.push(ConfigWarning::LegacyExcludes);
